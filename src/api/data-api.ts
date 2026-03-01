@@ -127,7 +127,9 @@ export async function getActivity(params: {
 
 export async function getValue(user: string): Promise<ValueData> {
   const raw = await dataApi.get<unknown>('/value', { user });
-  return ValueSchema.parse(raw);
+  // API returns an array — unwrap first element
+  const item = Array.isArray(raw) ? raw[0] : raw;
+  return ValueSchema.parse(item);
 }
 
 // ─── Traded ───
