@@ -410,7 +410,24 @@ export async function backfillTrader(proxyWallet: string): Promise<void> {
   } catch (err: any) {
     log.error(`Backfill failed: ${err.message}`);
 
-    // Increment retry counter and unlock
+    const status = err.response?.status;
+    const isClientError = status && status !== 429 && status >= 400 && status < 500;
+
+    if (isClientError) {
+      // Client errors (400, 403, 404, etc.) won't resolve on retry
+      await prisma.trader.update({
+        where: { proxyWallet },
+        data: {
+          backfillStatus: 'PERMANENTLY_FAILED',
+          backfillLockedAt: null,
+          backfillError: `HTTP ${status}: ${err.message?.slice(0, 480)}`,
+        },
+      });
+      log.error(`Permanently failed due to client error (HTTP ${status})`);
+      return;
+    }
+
+    // Server/network errors — increment retry counter
     await prisma.trader.update({
       where: { proxyWallet },
       data: {

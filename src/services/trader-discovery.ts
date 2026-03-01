@@ -27,6 +27,21 @@ export async function discoverFromLeaderboard(): Promise<{
     screenedOutTraders.map((t) => [t.proxyWallet, t.leaderboardPnl]),
   );
 
+  // Pre-load PERMANENTLY_FAILED traders for resurrection check.
+  // Only resurrect server/network errors — client errors (HTTP 4xx) are permanent.
+  const permFailedTraders = await prisma.trader.findMany({
+    where: {
+      backfillStatus: 'PERMANENTLY_FAILED',
+      backfillError: { not: null },
+      NOT: [
+        { backfillError: { startsWith: 'HTTP 4' } },
+        { backfillError: { contains: 'status code 4' } },
+      ],
+    },
+    select: { proxyWallet: true },
+  });
+  const permFailedWallets = new Set(permFailedTraders.map((t) => t.proxyWallet));
+
   for (const category of categories) {
     for (const timePeriod of timePeriods) {
       // Paginate up to 200 results per combo (4 pages of 50)
@@ -76,9 +91,17 @@ export async function discoverFromLeaderboard(): Promise<{
               leaderboardVol: entry.vol,
               leaderboardRank: rankNum,
               // Reset SCREENED_OUT traders with significantly improved PnL
+              // or resurrect server-error PERMANENTLY_FAILED traders
               ...(shouldRescreen
                 ? { backfillStatus: 'PENDING' as const, screenedAt: null }
-                : {}),
+                : permFailedWallets.has(entry.proxyWallet)
+                  ? {
+                      backfillStatus: 'PENDING' as const,
+                      backfillRetries: 0,
+                      backfillLockedAt: null,
+                      backfillError: null,
+                    }
+                  : {}),
             },
             select: { createdAt: true, updatedAt: true },
           });
@@ -92,6 +115,12 @@ export async function discoverFromLeaderboard(): Promise<{
             if (shouldRescreen) {
               logger.info(
                 `Re-evaluating ${entry.proxyWallet.slice(0, 10)}: PnL improved from ${oldPnl?.toFixed(0)} to ${entry.pnl.toFixed(0)}`,
+              );
+            }
+
+            if (permFailedWallets.has(entry.proxyWallet)) {
+              logger.info(
+                `Resurrecting ${entry.proxyWallet.slice(0, 10)}: server-error PERMANENTLY_FAILED trader found on leaderboard`,
               );
             }
           }
