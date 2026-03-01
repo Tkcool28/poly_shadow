@@ -147,7 +147,16 @@ export async function getAllTrades(user: string): Promise<TradeData[]> {
   let reachedCutoff = false;
 
   while (offset < TRADES_MAX_OFFSET) {
-    const batch = await getTrades({ user, limit: pageSize, offset });
+    let batch: TradeData[];
+    try {
+      batch = await getTrades({ user, limit: pageSize, offset });
+    } catch (err: any) {
+      if (offset > 0 && err.response?.status === 400) {
+        logger.warn(`Trades pagination hit API limit at offset ${offset} for ${user}. Returning ${allTrades.length} trades.`);
+        break;
+      }
+      throw err;
+    }
     if (batch.length === 0) break;
 
     for (const trade of batch) {
@@ -180,13 +189,22 @@ export async function getAllClosedPositions(user: string): Promise<ClosedPositio
   let reachedCutoff = false;
 
   while (offset < CLOSED_POSITIONS_MAX_OFFSET) {
-    const batch = await getClosedPositions({
-      user,
-      limit: pageSize,
-      offset,
-      sortBy: 'TIMESTAMP',
-      sortDirection: 'DESC',
-    });
+    let batch: ClosedPositionData[];
+    try {
+      batch = await getClosedPositions({
+        user,
+        limit: pageSize,
+        offset,
+        sortBy: 'TIMESTAMP',
+        sortDirection: 'DESC',
+      });
+    } catch (err: any) {
+      if (offset > 0 && err.response?.status === 400) {
+        logger.warn(`Closed positions pagination hit API limit at offset ${offset} for ${user}. Returning ${all.length} closed positions.`);
+        break;
+      }
+      throw err;
+    }
     if (batch.length === 0) break;
 
     for (const cp of batch) {
@@ -217,7 +235,16 @@ export async function getAllPositions(user: string): Promise<PositionData[]> {
   let offset = 0;
 
   while (offset < POSITIONS_MAX_OFFSET) {
-    const batch = await getPositions({ user, limit: pageSize, offset });
+    let batch: PositionData[];
+    try {
+      batch = await getPositions({ user, limit: pageSize, offset });
+    } catch (err: any) {
+      if (offset > 0 && err.response?.status === 400) {
+        logger.warn(`Positions pagination hit API limit at offset ${offset} for ${user}. Returning ${all.length} positions.`);
+        break;
+      }
+      throw err;
+    }
     all.push(...batch);
     if (batch.length === 0 || batch.length < pageSize) break;
     offset += batch.length;
