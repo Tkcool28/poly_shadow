@@ -6,6 +6,7 @@ import { isShuttingDown } from '../lib/shutdown';
 import { initialize as initExecutor } from '../services/trade-executor';
 import { processCopyTrade } from '../services/copy-trade-worker';
 import { startPortfolioRefresh, stopPortfolioRefresh } from '../services/portfolio-cache';
+import { rehydratePool, sweepPool } from '../services/order-pool';
 
 const JOB_NAME = 'copy-trader';
 const log = createJobLogger(JOB_NAME);
@@ -48,6 +49,13 @@ async function main() {
     await startPortfolioRefresh();
   } catch (err: any) {
     log.warn(`Portfolio cache initial refresh failed: ${err.message}`);
+  }
+
+  // Rehydrate order pool from DB (recovers POOLED records across restarts)
+  try {
+    await rehydratePool();
+  } catch (err: any) {
+    log.warn(`Pool rehydration failed: ${err.message}`);
   }
 
   // Main loop: drain DetectedTrade queue
@@ -98,6 +106,8 @@ async function main() {
           });
         }
       }
+      // Sweep pool: burn expired FIFO entries
+      await sweepPool();
     } catch (err: any) {
       result = 'error';
       errorMessage = err.message?.slice(0, 500);

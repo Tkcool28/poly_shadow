@@ -4,6 +4,7 @@ import { config } from '../config/env';
 import { executeMarketOrder as realExecute } from './trade-executor';
 import { executeMarketOrder as paperExecute } from './paper-executor';
 import type { ExecuteOrderResult } from './trade-executor';
+import { addToPool } from './order-pool';
 
 const log = createJobLogger('copy-trade-worker');
 
@@ -61,8 +62,8 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   let copyAmountUsd = cappedPercent * allocation.currentCapital;
   copyAmountUsd = Math.min(copyAmountUsd, config.MAX_POSITION_USD);
 
-  if (copyAmountUsd < 0.10) {
-    await createSkippedRecord(trade, 'amount too small', allocation.id, isPaper);
+  if (copyAmountUsd < config.POOL_MIN_AMOUNT_USD) {
+    await addToPool(trade, copyAmountUsd, { id: allocation.id, isPaper });
     return;
   }
 

@@ -56,6 +56,10 @@ const envSchema = z.object({
   PORTFOLIO_VALUE_REFRESH_MS: z.coerce.number().default(300000), // 5 min
   SLIPPAGE_BPS: z.coerce.number().default(200), // 2% default
 
+  // Order aggregation pool
+  POOL_MIN_AMOUNT_USD: z.coerce.number().default(0.10), // min to execute (matches current threshold)
+  POOL_BURN_TIMEOUT_MS: z.coerce.number().default(180000), // 3 min per-entry FIFO burn window
+
   // Paper trade fee simulation (Polymarket formula: C × feeRate × (p × (1-p))^exponent)
   PAPER_TRADE_FEE_RATE: z.coerce.number().default(0), // 0 = no fees (most markets)
   PAPER_TRADE_FEE_EXPONENT: z.coerce.number().default(1), // 1 = sports, 2 = crypto

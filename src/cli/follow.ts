@@ -233,7 +233,7 @@ export async function updateFollow(identifier: string, newCapital: number): Prom
 }
 
 async function recalcDeployedCapital(allocationId: string, isPaper: boolean): Promise<number> {
-  const [buySum, sellSum] = await Promise.all([
+  const [buySum, sellSum, pooledBuySum] = await Promise.all([
     prisma.copyTrade.aggregate({
       where: { followAllocationId: allocationId, side: 'BUY', status: 'FILLED', isPaper },
       _sum: { requestedAmount: true },
@@ -242,9 +242,14 @@ async function recalcDeployedCapital(allocationId: string, isPaper: boolean): Pr
       where: { followAllocationId: allocationId, side: 'SELL', status: 'FILLED', isPaper },
       _sum: { requestedAmount: true },
     }),
+    prisma.copyTrade.aggregate({
+      where: { followAllocationId: allocationId, side: 'BUY', status: 'POOLED', isPaper },
+      _sum: { requestedAmount: true },
+    }),
   ]);
 
   const buys = buySum._sum.requestedAmount ?? 0;
   const sells = sellSum._sum.requestedAmount ?? 0;
-  return Math.max(buys - sells, 0);
+  const pooledBuys = pooledBuySum._sum.requestedAmount ?? 0;
+  return Math.max(buys - sells + pooledBuys, 0);
 }
