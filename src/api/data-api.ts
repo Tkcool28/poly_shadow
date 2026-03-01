@@ -8,6 +8,7 @@ import {
   TRADES_MAX_OFFSET,
   CLOSED_POSITIONS_MAX_OFFSET,
   POSITIONS_MAX_OFFSET,
+  BACKFILL_HISTORY_DAYS,
 } from '../config/constants';
 import {
   LeaderboardEntrySchema,
@@ -98,6 +99,8 @@ export async function getClosedPositions(params: {
   market?: string;
   limit?: number;
   offset?: number;
+  sortBy?: string;
+  sortDirection?: string;
 }): Promise<ClosedPositionData[]> {
   const raw = await dataApi.get<unknown[]>('/closed-positions', params);
   if (!Array.isArray(raw)) return [];
@@ -139,16 +142,30 @@ export async function getTraded(user: string): Promise<TradedData> {
 export async function getAllTrades(user: string): Promise<TradeData[]> {
   const allTrades: TradeData[] = [];
   const pageSize = TRADES_PAGE_SIZE;
+  const cutoffTimestamp = Math.floor(Date.now() / 1000) - BACKFILL_HISTORY_DAYS * 86400;
   let offset = 0;
+  let reachedCutoff = false;
 
   while (offset < TRADES_MAX_OFFSET) {
     const batch = await getTrades({ user, limit: pageSize, offset });
-    allTrades.push(...batch);
-    if (batch.length === 0 || batch.length < pageSize) break;
+    if (batch.length === 0) break;
+
+    for (const trade of batch) {
+      if (trade.timestamp >= cutoffTimestamp) {
+        allTrades.push(trade);
+      } else {
+        reachedCutoff = true;
+        break;
+      }
+    }
+
+    if (reachedCutoff || batch.length < pageSize) break;
     offset += batch.length;
   }
 
-  if (offset >= TRADES_MAX_OFFSET) {
+  if (reachedCutoff) {
+    logger.info(`Trades cutoff reached for ${user}: ${allTrades.length} trades within ${BACKFILL_HISTORY_DAYS} days`);
+  } else if (offset >= TRADES_MAX_OFFSET) {
     logger.warn(`Reached max offset ${TRADES_MAX_OFFSET} for trades of ${user}. Fetched ${allTrades.length} trades; older trades may be missing.`);
   }
 
@@ -158,16 +175,36 @@ export async function getAllTrades(user: string): Promise<TradeData[]> {
 export async function getAllClosedPositions(user: string): Promise<ClosedPositionData[]> {
   const all: ClosedPositionData[] = [];
   const pageSize = CLOSED_POSITIONS_PAGE_SIZE;
+  const cutoffTimestamp = Math.floor(Date.now() / 1000) - BACKFILL_HISTORY_DAYS * 86400;
   let offset = 0;
+  let reachedCutoff = false;
 
   while (offset < CLOSED_POSITIONS_MAX_OFFSET) {
-    const batch = await getClosedPositions({ user, limit: pageSize, offset });
-    all.push(...batch);
-    if (batch.length === 0 || batch.length < pageSize) break;
+    const batch = await getClosedPositions({
+      user,
+      limit: pageSize,
+      offset,
+      sortBy: 'TIMESTAMP',
+      sortDirection: 'DESC',
+    });
+    if (batch.length === 0) break;
+
+    for (const cp of batch) {
+      if (cp.timestamp >= cutoffTimestamp) {
+        all.push(cp);
+      } else {
+        reachedCutoff = true;
+        break;
+      }
+    }
+
+    if (reachedCutoff || batch.length < pageSize) break;
     offset += batch.length;
   }
 
-  if (offset >= CLOSED_POSITIONS_MAX_OFFSET) {
+  if (reachedCutoff) {
+    logger.info(`Closed positions cutoff reached for ${user}: ${all.length} within ${BACKFILL_HISTORY_DAYS} days`);
+  } else if (offset >= CLOSED_POSITIONS_MAX_OFFSET) {
     logger.warn(`Reached max offset ${CLOSED_POSITIONS_MAX_OFFSET} for closed positions of ${user}. Fetched ${all.length}; some may be missing.`);
   }
 
