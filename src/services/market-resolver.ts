@@ -25,47 +25,66 @@ export async function resolveMarkets(conditionIds: string[]): Promise<void> {
 
   const markets = await getMarketsByConditionIds(missing);
 
-  let upserted = 0;
-  for (const market of markets) {
-    try {
-      await prisma.market.upsert({
-        where: { conditionId: market.conditionId },
-        create: {
-          id: market.id,
-          conditionId: market.conditionId,
-          question: market.question,
-          slug: market.slug,
-          category: market.category ?? null,
-          outcomes: market.outcomes,
-          outcomePrices: market.outcomePrices ?? null,
-          endDate: market.endDate ? new Date(market.endDate) : null,
-          closed: market.closed,
-          active: market.active,
-          volume: market.volume ?? null,
-          liquidity: market.liquidity ?? null,
-          image: market.image ?? null,
-          icon: market.icon ?? null,
-          eventSlug: market.eventSlug ?? null,
-        },
-        update: {
-          question: market.question,
-          outcomePrices: market.outcomePrices ?? null,
-          closed: market.closed,
-          active: market.active,
-          volume: market.volume ?? null,
-          liquidity: market.liquidity ?? null,
-        },
-      });
-      upserted++;
-    } catch (err: any) {
-      logger.warn(`Failed to upsert market ${market.conditionId}: ${err.message}`);
+  if (markets.length === 0) {
+    logger.warn(`${missing.length} markets could not be resolved from Gamma API`);
+    return;
+  }
+
+  // Batch insert new markets, skip existing
+  const marketCreateData = markets.map((market) => ({
+    id: String(market.id),
+    conditionId: market.conditionId,
+    question: market.question,
+    slug: market.slug,
+    category: market.category ?? null,
+    outcomes: market.outcomes,
+    outcomePrices: market.outcomePrices ?? null,
+    endDate: market.endDate ? new Date(market.endDate) : null,
+    closed: market.closed,
+    active: market.active,
+    volume: market.volume ?? null,
+    liquidity: market.liquidity ?? null,
+    image: market.image ?? null,
+    icon: market.icon ?? null,
+    eventSlug: market.eventSlug ?? null,
+  }));
+
+  const { count: inserted } = await prisma.market.createMany({
+    data: marketCreateData,
+    skipDuplicates: true,
+  });
+
+  // Batch-update volatile fields on existing markets via $transaction
+  if (markets.length > inserted) {
+    const CHUNK_SIZE = 200;
+    for (let i = 0; i < markets.length; i += CHUNK_SIZE) {
+      const chunk = markets.slice(i, i + CHUNK_SIZE);
+      try {
+        await prisma.$transaction(
+          chunk.map((market) =>
+            prisma.market.updateMany({
+              where: { conditionId: market.conditionId },
+              data: {
+                question: market.question,
+                outcomePrices: market.outcomePrices ?? null,
+                closed: market.closed,
+                active: market.active,
+                volume: market.volume ?? null,
+                liquidity: market.liquidity ?? null,
+              },
+            })
+          )
+        );
+      } catch (err: any) {
+        logger.warn(`Market batch update failed: ${err.message}`);
+      }
     }
   }
 
-  const stillMissing = missing.length - upserted;
+  const stillMissing = missing.length - markets.length;
   if (stillMissing > 0) {
     logger.warn(`${stillMissing} markets could not be resolved from Gamma API`);
   }
 
-  logger.info(`Resolved ${upserted} markets`);
+  logger.info(`Resolved ${markets.length} markets (${inserted} new)`);
 }

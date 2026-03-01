@@ -35,23 +35,26 @@ export async function getMarkets(params: {
 
 /**
  * Fetch markets by condition IDs. The Gamma API only supports single
- * condition_ids lookups, so we query one at a time with rate limiting.
+ * condition_ids lookups, so we query one at a time. All lookups are
+ * submitted concurrently — Bottleneck's maxConcurrent (5) and reservoir
+ * (300/10s) on gammaApiMarkets handle throttling automatically.
  */
 export async function getMarketsByConditionIds(conditionIds: string[]): Promise<GammaMarketData[]> {
   if (conditionIds.length === 0) return [];
 
-  const allMarkets: GammaMarketData[] = [];
+  const results = await Promise.allSettled(
+    conditionIds.map((conditionId) =>
+      getMarkets({ condition_ids: conditionId, limit: 1 })
+    )
+  );
 
-  for (const conditionId of conditionIds) {
-    try {
-      const markets = await getMarkets({
-        condition_ids: conditionId,
-        limit: 1,
-      });
-      allMarkets.push(...markets);
-    } catch (err: any) {
-      // Skip individual failures
-      logger.debug(`Failed to resolve market ${conditionId.slice(0, 16)}: ${err.message}`);
+  const allMarkets: GammaMarketData[] = [];
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i];
+    if (result.status === 'fulfilled') {
+      allMarkets.push(...result.value);
+    } else {
+      logger.debug(`Failed to resolve market ${conditionIds[i].slice(0, 16)}: ${result.reason?.message}`);
     }
   }
 

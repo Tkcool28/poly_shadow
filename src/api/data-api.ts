@@ -1,6 +1,7 @@
 import { z } from 'zod/v4';
 import { dataApi } from '../lib/api-client';
 import { logger } from '../lib/logger';
+import { CLOSED_POSITIONS_PAGE_SIZE } from '../config/constants';
 import {
   LeaderboardEntrySchema,
   TradeSchema,
@@ -150,7 +151,7 @@ export async function getAllTrades(user: string, maxOffset = 10000): Promise<Tra
 
 export async function getAllClosedPositions(user: string): Promise<ClosedPositionData[]> {
   const all: ClosedPositionData[] = [];
-  const pageSize = 50;
+  const pageSize = CLOSED_POSITIONS_PAGE_SIZE;
   let offset = 0;
   const maxOffset = 100000;
 
