@@ -1,7 +1,14 @@
 import { z } from 'zod/v4';
 import { dataApi } from '../lib/api-client';
 import { logger } from '../lib/logger';
-import { CLOSED_POSITIONS_PAGE_SIZE } from '../config/constants';
+import {
+  TRADES_PAGE_SIZE,
+  CLOSED_POSITIONS_PAGE_SIZE,
+  POSITIONS_PAGE_SIZE,
+  TRADES_MAX_OFFSET,
+  CLOSED_POSITIONS_MAX_OFFSET,
+  POSITIONS_MAX_OFFSET,
+} from '../config/constants';
 import {
   LeaderboardEntrySchema,
   TradeSchema,
@@ -129,21 +136,20 @@ export async function getTraded(user: string): Promise<TradedData> {
 
 // ─── Pagination Helpers ───
 
-export async function getAllTrades(user: string, maxOffset = 10000): Promise<TradeData[]> {
+export async function getAllTrades(user: string): Promise<TradeData[]> {
   const allTrades: TradeData[] = [];
-  const pageSize = 10000;
+  const pageSize = TRADES_PAGE_SIZE;
   let offset = 0;
 
-  while (offset < maxOffset) {
+  while (offset < TRADES_MAX_OFFSET) {
     const batch = await getTrades({ user, limit: pageSize, offset });
     allTrades.push(...batch);
+    if (batch.length === 0 || batch.length < pageSize) break;
+    offset += batch.length;
+  }
 
-    if (batch.length < pageSize) break;
-    offset += pageSize;
-
-    if (offset >= maxOffset) {
-      logger.warn(`Reached max offset ${maxOffset} for trades of ${user}. Some older trades may be missing.`);
-    }
+  if (offset >= TRADES_MAX_OFFSET) {
+    logger.warn(`Reached max offset ${TRADES_MAX_OFFSET} for trades of ${user}. Fetched ${allTrades.length} trades; older trades may be missing.`);
   }
 
   return allTrades;
@@ -153,14 +159,35 @@ export async function getAllClosedPositions(user: string): Promise<ClosedPositio
   const all: ClosedPositionData[] = [];
   const pageSize = CLOSED_POSITIONS_PAGE_SIZE;
   let offset = 0;
-  const maxOffset = 100000;
 
-  while (offset < maxOffset) {
+  while (offset < CLOSED_POSITIONS_MAX_OFFSET) {
     const batch = await getClosedPositions({ user, limit: pageSize, offset });
     all.push(...batch);
+    if (batch.length === 0 || batch.length < pageSize) break;
+    offset += batch.length;
+  }
 
-    if (batch.length < pageSize) break;
-    offset += pageSize;
+  if (offset >= CLOSED_POSITIONS_MAX_OFFSET) {
+    logger.warn(`Reached max offset ${CLOSED_POSITIONS_MAX_OFFSET} for closed positions of ${user}. Fetched ${all.length}; some may be missing.`);
+  }
+
+  return all;
+}
+
+export async function getAllPositions(user: string): Promise<PositionData[]> {
+  const all: PositionData[] = [];
+  const pageSize = POSITIONS_PAGE_SIZE;
+  let offset = 0;
+
+  while (offset < POSITIONS_MAX_OFFSET) {
+    const batch = await getPositions({ user, limit: pageSize, offset });
+    all.push(...batch);
+    if (batch.length === 0 || batch.length < pageSize) break;
+    offset += batch.length;
+  }
+
+  if (offset >= POSITIONS_MAX_OFFSET) {
+    logger.warn(`Reached max offset ${POSITIONS_MAX_OFFSET} for positions of ${user}. Fetched ${all.length}; some may be missing.`);
   }
 
   return all;
@@ -175,9 +202,8 @@ export async function getAllActivity(user: string): Promise<ActivityData[]> {
   while (offset < maxOffset) {
     const batch = await getActivity({ user, limit: pageSize, offset });
     all.push(...batch);
-
-    if (batch.length < pageSize) break;
-    offset += pageSize;
+    if (batch.length === 0 || batch.length < pageSize) break;
+    offset += batch.length;
   }
 
   return all;

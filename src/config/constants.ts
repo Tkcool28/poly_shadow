@@ -102,9 +102,12 @@ export const PRESCREEN_POSITIONS_LIMIT = 200;
 // Backfill
 export const MAX_BACKFILL_RETRIES = 3;
 export const BACKFILL_LOCK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-export const TRADES_PAGE_SIZE = 10000;
-export const CLOSED_POSITIONS_PAGE_SIZE = 500;
+export const TRADES_PAGE_SIZE = 500;
+export const CLOSED_POSITIONS_PAGE_SIZE = 50;
 export const POSITIONS_PAGE_SIZE = 500;
+export const TRADES_MAX_OFFSET = 10_000;
+export const CLOSED_POSITIONS_MAX_OFFSET = 100_000;
+export const POSITIONS_MAX_OFFSET = 100_000;
 
 // Proxy
 export const PROXY_MAX_CONSECUTIVE_ERRORS = 3;

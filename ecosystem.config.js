@@ -15,6 +15,7 @@ module.exports = {
       name: 'history-backfiller',
       script: './node_modules/.bin/tsx',
       args: 'src/jobs/history-backfiller.ts',
+      node_args: '--max-old-space-size=8192',
       autorestart: true,
       watch: false,
       max_restarts: 10,

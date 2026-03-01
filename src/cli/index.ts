@@ -48,4 +48,15 @@ program
     await prisma.$disconnect();
   });
 
+program
+  .command('re-backfill')
+  .description('Reset traders to PENDING for re-backfill')
+  .option('-w, --wallet <address>', 'Re-backfill a specific wallet')
+  .option('-a, --all', 'Re-backfill all COMPLETED and FAILED traders')
+  .action(async (opts) => {
+    const { reBackfill } = await import('./re-backfill.js');
+    await reBackfill({ wallet: opts.wallet, all: opts.all });
+    await prisma.$disconnect();
+  });
+
 program.parse();

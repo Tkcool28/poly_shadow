@@ -2,32 +2,43 @@ import { prisma } from '../lib/prisma';
 import {
   getAllTrades,
   getAllClosedPositions,
-  getPositions,
+  getAllPositions,
 } from '../api/data-api';
 import { resolveMarkets } from './market-resolver';
 import { logger } from '../lib/logger';
 import {
   MAX_BACKFILL_RETRIES,
   BACKFILL_LOCK_TIMEOUT_MS,
-  POSITIONS_PAGE_SIZE,
 } from '../config/constants';
 
 /**
  * Atomically claim a trader for backfill using lock-based concurrency.
  * Returns traders that are PENDING/FAILED and not locked by another process.
+ * Also recovers IN_PROGRESS traders with expired locks (e.g. from OOM crashes).
  */
 export async function claimTradersForBackfill(batchSize: number): Promise<string[]> {
   const now = new Date();
   const lockExpiry = new Date(now.getTime() - BACKFILL_LOCK_TIMEOUT_MS);
 
-  // Find unlocked traders that need backfill
+  // Find unlocked traders that need backfill, including IN_PROGRESS with stale locks
   const traders = await prisma.trader.findMany({
     where: {
-      backfillStatus: { in: ['PENDING', 'FAILED'] },
-      backfillRetries: { lt: MAX_BACKFILL_RETRIES },
       OR: [
-        { backfillLockedAt: null },
-        { backfillLockedAt: { lt: lockExpiry } }, // stale lock recovery
+        // Normal: PENDING/FAILED traders with no lock or expired lock
+        {
+          backfillStatus: { in: ['PENDING', 'FAILED'] },
+          backfillRetries: { lt: MAX_BACKFILL_RETRIES },
+          OR: [
+            { backfillLockedAt: null },
+            { backfillLockedAt: { lt: lockExpiry } },
+          ],
+        },
+        // Recovery: IN_PROGRESS traders whose lock expired (crash recovery)
+        {
+          backfillStatus: 'IN_PROGRESS',
+          backfillRetries: { lt: MAX_BACKFILL_RETRIES },
+          backfillLockedAt: { lt: lockExpiry },
+        },
       ],
     },
     select: { proxyWallet: true },
@@ -37,11 +48,12 @@ export async function claimTradersForBackfill(batchSize: number): Promise<string
 
   const wallets: string[] = [];
 
-  // Atomically lock each trader
+  // Atomically lock each trader (only if lock is still unclaimed or expired)
   for (const trader of traders) {
     const result = await prisma.trader.updateMany({
       where: {
         proxyWallet: trader.proxyWallet,
+        backfillRetries: { lt: MAX_BACKFILL_RETRIES },
         OR: [
           { backfillLockedAt: null },
           { backfillLockedAt: { lt: lockExpiry } },
@@ -81,7 +93,7 @@ export async function backfillTrader(proxyWallet: string): Promise<void> {
     const [tradesRes, closedRes, positionsRes] = await Promise.allSettled([
       getAllTrades(proxyWallet),
       getAllClosedPositions(proxyWallet),
-      getPositions({ user: proxyWallet, limit: POSITIONS_PAGE_SIZE }),
+      getAllPositions(proxyWallet),
     ]);
 
     // Trades, closed positions, positions are critical — re-throw on failure
