@@ -5,6 +5,7 @@ import { config } from '../config/env';
 import { isShuttingDown } from '../lib/shutdown';
 import { initialize as initExecutor } from '../services/trade-executor';
 import { processCopyTrade } from '../services/copy-trade-worker';
+import { startPortfolioRefresh, stopPortfolioRefresh } from '../services/portfolio-cache';
 
 const JOB_NAME = 'copy-trader';
 const log = createJobLogger(JOB_NAME);
@@ -17,6 +18,7 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     log.info(`Received ${signal}, shutting down...`);
+    stopPortfolioRefresh();
     await prisma.$disconnect();
     process.exit(0);
   };
@@ -43,6 +45,13 @@ async function main() {
     process.exit(1);
   }
 
+  // Start portfolio value cache
+  try {
+    await startPortfolioRefresh();
+  } catch (err: any) {
+    log.warn(`Portfolio cache initial refresh failed: ${err.message}`);
+  }
+
   // Main loop: drain DetectedTrade queue
   while (!shuttingDown && !isShuttingDown()) {
     const start = Date.now();
@@ -51,13 +60,29 @@ async function main() {
     let errorMessage: string | undefined;
 
     try {
+      // Get active followed wallets
+      const activeWallets = (await prisma.followAllocation.findMany({
+        where: { isActive: true },
+        select: { proxyWallet: true },
+      })).map(a => a.proxyWallet);
+
+      if (activeWallets.length === 0) {
+        // No allocations configured — nothing to do this cycle
+        const duration = Date.now() - start;
+        await updateHealth(duration, 'success', 0);
+        if (!shuttingDown && !isShuttingDown()) {
+          await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+        }
+        continue;
+      }
+
       // Fetch unprocessed detected trades (no linked CopyTrade, within last 5 min)
       const staleCutoff = new Date(Date.now() - 5 * 60 * 1000);
       const pending = await prisma.detectedTrade.findMany({
         where: {
           copyTrade: null,
-          compositeScore: { gte: config.MIN_COMPOSITE_SCORE },
           detectedAt: { gte: staleCutoff },
+          proxyWallet: { in: activeWallets },
         },
         orderBy: { detectedAt: 'asc' },
         take: 10,
@@ -83,31 +108,40 @@ async function main() {
 
     // Update system health (silent catch)
     const duration = Date.now() - start;
-    try {
-      await prisma.systemHealth.upsert({
-        where: { jobName: JOB_NAME },
-        create: {
-          jobName: JOB_NAME,
-          lastRunAt: new Date(),
-          lastRunDuration: duration,
-          lastRunResult: result,
-          processedCount,
-          errorMessage: errorMessage ?? null,
-        },
-        update: {
-          lastRunAt: new Date(),
-          lastRunDuration: duration,
-          lastRunResult: result,
-          processedCount,
-          errorMessage: errorMessage ?? null,
-        },
-      });
-    } catch {}
+    await updateHealth(duration, result, processedCount, errorMessage);
 
     if (!shuttingDown && !isShuttingDown()) {
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
     }
   }
+}
+
+async function updateHealth(
+  duration: number,
+  result: string,
+  processedCount: number,
+  errorMessage?: string,
+) {
+  try {
+    await prisma.systemHealth.upsert({
+      where: { jobName: JOB_NAME },
+      create: {
+        jobName: JOB_NAME,
+        lastRunAt: new Date(),
+        lastRunDuration: duration,
+        lastRunResult: result,
+        processedCount,
+        errorMessage: errorMessage ?? null,
+      },
+      update: {
+        lastRunAt: new Date(),
+        lastRunDuration: duration,
+        lastRunResult: result,
+        processedCount,
+        errorMessage: errorMessage ?? null,
+      },
+    });
+  } catch {}
 }
 
 main();

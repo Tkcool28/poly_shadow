@@ -197,7 +197,23 @@ async function updateMonitoredTraders(topN: number) {
       });
     }
 
-    logger.info(`Updated monitored traders: ${topScores.length} traders marked for monitoring`);
+    // Protect manually followed traders — always keep them monitored
+    const activeFollows = await tx.followAllocation.findMany({
+      where: { isActive: true },
+      select: { proxyWallet: true },
+    });
+    if (activeFollows.length > 0) {
+      await tx.trader.updateMany({
+        where: { proxyWallet: { in: activeFollows.map(f => f.proxyWallet) } },
+        data: { isMonitored: true },
+      });
+    }
+
+    const uniqueWallets = new Set([
+      ...topScores.map(s => s.proxyWallet),
+      ...activeFollows.map(f => f.proxyWallet),
+    ]);
+    logger.info(`Updated monitored traders: ${topScores.length} by score + ${activeFollows.length} by follow allocation = ${uniqueWallets.size} unique`);
   });
 }
 

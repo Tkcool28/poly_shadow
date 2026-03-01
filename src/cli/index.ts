@@ -68,4 +68,52 @@ program
     await prisma.$disconnect();
   });
 
+program
+  .command('follow <username> <capital>')
+  .description('Follow a trader with a capital allocation (USD)')
+  .action(async (username: string, capital: string) => {
+    const { followTrader, parseCapital } = await import('./follow.js');
+    const amount = parseCapital(capital);
+    if (amount === null) {
+      console.error('Capital must be a valid positive number');
+      await prisma.$disconnect();
+      return;
+    }
+    await followTrader(username, amount);
+    await prisma.$disconnect();
+  });
+
+program
+  .command('unfollow <username>')
+  .description('Stop following a trader (pauses allocation)')
+  .action(async (username: string) => {
+    const { unfollowTrader } = await import('./follow.js');
+    await unfollowTrader(username);
+    await prisma.$disconnect();
+  });
+
+program
+  .command('follows')
+  .description('List all followed traders and their allocations')
+  .action(async () => {
+    const { listFollows } = await import('./follow.js');
+    await listFollows();
+    await prisma.$disconnect();
+  });
+
+program
+  .command('update-follow <username> <capital>')
+  .description('Update a trader\'s capital allocation (USD)')
+  .action(async (username: string, capital: string) => {
+    const { updateFollow, parseCapital } = await import('./follow.js');
+    const amount = parseCapital(capital);
+    if (amount === null) {
+      console.error('Capital must be a valid positive number');
+      await prisma.$disconnect();
+      return;
+    }
+    await updateFollow(username, amount);
+    await prisma.$disconnect();
+  });
+
 program.parse();

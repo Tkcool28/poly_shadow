@@ -41,13 +41,14 @@ model Trader {
   screenedAt          DateTime?
 
   // Relationships
-  trades          Trade[]
-  positions       Position[]
-  closedPositions ClosedPosition[]
-  activities      Activity[]
-  scores          TraderScore[]
-  scoreHistory    TraderScoreHistory[]
-  categoryScores  CategoryScore[]
+  trades           Trade[]
+  positions        Position[]
+  closedPositions  ClosedPosition[]
+  activities       Activity[]
+  scores           TraderScore[]
+  scoreHistory     TraderScoreHistory[]
+  categoryScores   CategoryScore[]
+  followAllocation FollowAllocation?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -292,6 +293,32 @@ model CategoryScore {
   @@index([category])
 }
 
+// ─── FollowAllocation (per-trader capital allocation) ───
+
+model FollowAllocation {
+  id                   String    @id @default(cuid())
+  proxyWallet          String    @unique
+  trader               Trader    @relation(fields: [proxyWallet], references: [proxyWallet])
+
+  // Capital management (all USD)
+  initialCapital       Float     // User-set starting budget
+  currentCapital       Float     // Available capital (adjusted by realized P&L)
+  deployedCapital      Float     @default(0) // Currently in open positions
+
+  // Cached trader portfolio value (from getValue API)
+  traderPortfolioValue Float?
+  portfolioValueAt     DateTime?
+
+  // State
+  isActive             Boolean   @default(true)
+
+  copyTrades           CopyTrade[]
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@index([isActive])
+}
+
 // ─── DetectedTrade (logged by trade monitor) ───
 
 model DetectedTrade {
@@ -333,15 +360,18 @@ model CopyTrade {
   filledPrice     Float?
   filledSize      Float?
   slippageBps     Float?
-  status          String    // PENDING, FILLED, FAILED, SKIPPED
-  failReason      String?
-  latencyMs       Int?
-  createdAt       DateTime  @default(now())
-  filledAt        DateTime?
+  status             String    // PENDING, FILLED, FAILED, SKIPPED
+  failReason         String?
+  latencyMs          Int?
+  followAllocationId String?
+  followAllocation   FollowAllocation? @relation(fields: [followAllocationId], references: [id])
+  createdAt          DateTime  @default(now())
+  filledAt           DateTime?
 
   @@index([status])
   @@index([createdAt(sort: Desc)])
   @@index([tokenId])
+  @@index([followAllocationId])
 }
 
 // ─── SystemHealth ───
