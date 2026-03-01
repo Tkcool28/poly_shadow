@@ -1,0 +1,332 @@
+generator client {
+  provider = "prisma-client"
+  output   = "./generated/prisma/client"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Trader (discovered wallet) ───
+
+model Trader {
+  id              String         @id @default(cuid())
+  proxyWallet     String         @unique
+  userName        String?
+  profileImage    String?
+  xUsername       String?
+  verifiedBadge   Boolean        @default(false)
+  source          TraderSource   @default(LEADERBOARD)
+  isMonitored     Boolean        @default(false)
+
+  // Backfill state
+  backfillStatus    BackfillStatus @default(PENDING)
+  backfillLockedAt  DateTime?
+  backfillStarted   DateTime?
+  backfillCompleted DateTime?
+  backfillRetries   Int            @default(0)
+  backfillError     String?
+  lastTradeSync     DateTime?
+  lastPositionSync  DateTime?
+
+  // Leaderboard snapshot
+  leaderboardPnl  Float?
+  leaderboardVol  Float?
+  leaderboardRank Int?
+
+  // Pre-screen results
+  screenPositionCount Int?
+  screenWinRate       Float?
+  screenRoi           Float?
+  screenedAt          DateTime?
+
+  // Relationships
+  trades          Trade[]
+  positions       Position[]
+  closedPositions ClosedPosition[]
+  activities      Activity[]
+  scores          TraderScore[]
+  scoreHistory    TraderScoreHistory[]
+  categoryScores  CategoryScore[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([backfillStatus])
+  @@index([backfillStatus, screenedAt])
+  @@index([isMonitored])
+  @@index([leaderboardPnl(sort: Desc)])
+}
+
+enum TraderSource {
+  LEADERBOARD
+  MANUAL
+}
+
+enum BackfillStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  PERMANENTLY_FAILED
+  SCREENED_OUT
+}
+
+// ─── Market (cached from Gamma API) ───
+
+model Market {
+  id            String  @id
+  conditionId   String  @unique
+  question      String
+  slug          String
+  category      String?
+  outcomes      String  // JSON array e.g. '["Yes","No"]'
+  outcomePrices String? // JSON array of current prices
+  endDate       DateTime?
+  closed        Boolean @default(false)
+  active        Boolean @default(true)
+  volume        Float?
+  liquidity     Float?
+  image         String?
+  icon          String?
+  eventSlug     String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([category])
+  @@index([slug])
+}
+
+// ─── Trade ───
+
+model Trade {
+  id              String @id @default(cuid())
+  proxyWallet     String
+  side            String // BUY or SELL
+  asset           String
+  conditionId     String
+  size            Float
+  price           Float
+  timestamp       Int
+  outcome         String
+  outcomeIndex    Int
+  transactionHash String
+  title           String?
+  eventSlug       String?
+  usdValue        Float? // size * price
+
+  trader Trader @relation(fields: [proxyWallet], references: [proxyWallet])
+
+  createdAt DateTime @default(now())
+
+  @@unique([transactionHash, proxyWallet, asset, side, size, price])
+  @@index([proxyWallet, timestamp(sort: Desc)])
+  @@index([conditionId])
+  @@index([timestamp(sort: Desc)])
+}
+
+// ─── Position (latest snapshot, upserted) ───
+
+model Position {
+  id           String @id @default(cuid())
+  proxyWallet  String
+  asset        String
+  conditionId  String
+  size         Float
+  avgPrice     Float
+  initialValue Float?
+  currentValue Float?
+  cashPnl      Float?
+  percentPnl   Float?
+  realizedPnl  Float?
+  curPrice     Float?
+  outcome      String
+  outcomeIndex Int
+  title        String?
+  eventSlug    String?
+  endDate      DateTime?
+  snapshotAt   DateTime @default(now())
+
+  trader Trader @relation(fields: [proxyWallet], references: [proxyWallet])
+
+  @@unique([proxyWallet, asset])
+  @@index([proxyWallet])
+  @@index([conditionId])
+}
+
+// ─── ClosedPosition ───
+
+model ClosedPosition {
+  id           String @id @default(cuid())
+  proxyWallet  String
+  asset        String
+  conditionId  String
+  avgPrice     Float
+  totalBought  Float
+  realizedPnl  Float
+  curPrice     Float
+  timestamp    Int
+  outcome      String
+  outcomeIndex Int?
+  title        String?
+  eventSlug    String?
+  endDate      DateTime?
+
+  trader Trader @relation(fields: [proxyWallet], references: [proxyWallet])
+
+  @@unique([proxyWallet, asset, conditionId])
+  @@index([proxyWallet])
+  @@index([conditionId])
+}
+
+// ─── Activity ───
+
+model Activity {
+  id              String @id @default(cuid())
+  proxyWallet     String
+  timestamp       Int
+  conditionId     String
+  type            String // TRADE, SPLIT, MERGE, REDEEM, REWARD, etc.
+  size            Float
+  usdcSize        Float
+  transactionHash String
+  price           Float?
+  asset           String?
+  side            String?
+  outcomeIndex    Int?
+  title           String?
+  eventSlug       String?
+
+  trader Trader @relation(fields: [proxyWallet], references: [proxyWallet])
+
+  @@unique([transactionHash, proxyWallet, conditionId, type, timestamp])
+  @@index([proxyWallet, timestamp(sort: Desc)])
+  @@index([type])
+}
+
+// ─── TraderScore (latest per trader) ───
+
+model TraderScore {
+  id          String @id @default(cuid())
+  proxyWallet String @unique
+
+  // Profitability
+  totalPnl          Float
+  realizedPnl       Float
+  unrealizedPnl     Float
+  roi               Float
+  avgProfitPerTrade Float
+
+  // Consistency
+  winRate       Float
+  maxWinStreak  Int
+  maxLossStreak Int
+  returnStdDev  Float
+  maxDrawdown   Float
+
+  // Activity
+  totalTrades     Int
+  totalMarkets    Int
+  avgPositionSize Float
+  avgHoldDuration Float?
+  tradeFrequency  Float
+  activeDays      Int
+
+  // Risk
+  avgRelativePositionSize Float
+  concentrationScore      Float
+
+  // Recency
+  recentPnl30d     Float
+  recentWinRate30d Float
+  trendDirection   Float
+
+  // Composite
+  compositeScore Float
+  rank           Int?
+
+  trader Trader @relation(fields: [proxyWallet], references: [proxyWallet])
+
+  calculatedAt DateTime @default(now())
+
+  @@index([compositeScore(sort: Desc)])
+  @@index([calculatedAt(sort: Desc)])
+}
+
+// ─── TraderScoreHistory (append-only, capped at 30 per trader) ───
+
+model TraderScoreHistory {
+  id             String @id @default(cuid())
+  proxyWallet    String
+  compositeScore Float
+  totalPnl       Float
+  winRate        Float
+  rank           Int?
+
+  trader Trader @relation(fields: [proxyWallet], references: [proxyWallet])
+
+  calculatedAt DateTime @default(now())
+
+  @@index([proxyWallet, calculatedAt(sort: Desc)])
+}
+
+// ─── CategoryScore ───
+
+model CategoryScore {
+  id                  String @id @default(cuid())
+  proxyWallet         String
+  category            String
+  pnl                 Float
+  winRate             Float
+  totalTrades         Int
+  avgReturn           Float
+  specializationScore Float
+
+  trader Trader @relation(fields: [proxyWallet], references: [proxyWallet])
+
+  calculatedAt DateTime @default(now())
+
+  @@unique([proxyWallet, category, calculatedAt])
+  @@index([proxyWallet])
+  @@index([category])
+}
+
+// ─── DetectedTrade (logged by trade monitor) ───
+
+model DetectedTrade {
+  id              String @id @default(cuid())
+  proxyWallet     String
+  userName        String?
+  side            String
+  conditionId     String
+  asset           String
+  size            Float
+  price           Float
+  outcome         String
+  title           String?
+  eventSlug       String?
+  transactionHash String
+  timestamp       Int
+  compositeScore  Float?
+
+  detectedAt DateTime @default(now())
+
+  @@unique([transactionHash, proxyWallet, asset])
+  @@index([detectedAt(sort: Desc)])
+  @@index([proxyWallet])
+}
+
+// ─── SystemHealth ───
+
+model SystemHealth {
+  id             String @id @default(cuid())
+  jobName        String @unique
+  lastRunAt      DateTime
+  lastRunDuration Int // milliseconds
+  lastRunResult  String // success, partial, error
+  processedCount Int    @default(0)
+  errorMessage   String?
+
+  updatedAt DateTime @updatedAt
+}
