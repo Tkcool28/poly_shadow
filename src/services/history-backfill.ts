@@ -2,7 +2,6 @@ import { prisma } from '../lib/prisma';
 import {
   getAllTrades,
   getAllClosedPositions,
-  getAllActivity,
   getPositions,
 } from '../api/data-api';
 import { resolveMarkets } from './market-resolver';
@@ -77,13 +76,12 @@ export async function backfillTrader(proxyWallet: string): Promise<void> {
     log.info('Starting backfill');
 
     // 1-4. Fetch all data in parallel (different rate limiter pools)
-    log.info('Fetching trades, positions, closed positions, and activity in parallel...');
+    log.info('Fetching trades, positions, and closed positions in parallel...');
 
-    const [tradesRes, closedRes, positionsRes, activityRes] = await Promise.allSettled([
+    const [tradesRes, closedRes, positionsRes] = await Promise.allSettled([
       getAllTrades(proxyWallet),
       getAllClosedPositions(proxyWallet),
       getPositions({ user: proxyWallet, limit: POSITIONS_PAGE_SIZE }),
-      getAllActivity(proxyWallet),
     ]);
 
     // Trades, closed positions, positions are critical — re-throw on failure
@@ -102,13 +100,7 @@ export async function backfillTrader(proxyWallet: string): Promise<void> {
     }
     const positions = positionsRes.value;
 
-    // Activity is non-fatal (some wallets return 400)
-    const activities = activityRes.status === 'fulfilled' ? activityRes.value : [];
-    if (activityRes.status === 'rejected') {
-      log.warn(`Activity fetch failed (non-fatal): ${activityRes.reason?.message}`);
-    }
-
-    log.info(`Fetched: ${trades.length} trades, ${closedPositions.length} closed, ${positions.length} open, ${activities.length} activities`);
+    log.info(`Fetched: ${trades.length} trades, ${closedPositions.length} closed, ${positions.length} open`);
 
     // 5. Resolve market metadata for all unique conditionIds
     const conditionIds = new Set<string>();
@@ -381,86 +373,7 @@ export async function backfillTrader(proxyWallet: string): Promise<void> {
       }
     }
 
-    // 9. Store activities (batched upserts via $transaction)
-    log.info('Storing activities...');
-    let activityCount = 0;
-    for (let i = 0; i < activities.length; i += TRADE_BATCH_CHUNK) {
-      const chunk = activities.slice(i, i + TRADE_BATCH_CHUNK);
-      try {
-        await prisma.$transaction(
-          chunk.map((a) =>
-            prisma.activity.upsert({
-              where: {
-                transactionHash_proxyWallet_conditionId_type_timestamp: {
-                  transactionHash: a.transactionHash,
-                  proxyWallet: a.proxyWallet,
-                  conditionId: a.conditionId,
-                  type: a.type,
-                  timestamp: a.timestamp,
-                },
-              },
-              create: {
-                proxyWallet: a.proxyWallet,
-                timestamp: a.timestamp,
-                conditionId: a.conditionId,
-                type: a.type,
-                size: a.size,
-                usdcSize: a.usdcSize,
-                transactionHash: a.transactionHash,
-                price: a.price ?? null,
-                asset: a.asset ?? null,
-                side: a.side ?? null,
-                outcomeIndex: a.outcomeIndex ?? null,
-                title: a.title ?? null,
-                eventSlug: a.eventSlug ?? null,
-              },
-              update: {},
-            })
-          )
-        );
-        activityCount += chunk.length;
-      } catch (err: any) {
-        log.warn(`Activity batch failed, falling back to individual upserts: ${err.message}`);
-        for (const a of chunk) {
-          try {
-            await prisma.activity.upsert({
-              where: {
-                transactionHash_proxyWallet_conditionId_type_timestamp: {
-                  transactionHash: a.transactionHash,
-                  proxyWallet: a.proxyWallet,
-                  conditionId: a.conditionId,
-                  type: a.type,
-                  timestamp: a.timestamp,
-                },
-              },
-              create: {
-                proxyWallet: a.proxyWallet,
-                timestamp: a.timestamp,
-                conditionId: a.conditionId,
-                type: a.type,
-                size: a.size,
-                usdcSize: a.usdcSize,
-                transactionHash: a.transactionHash,
-                price: a.price ?? null,
-                asset: a.asset ?? null,
-                side: a.side ?? null,
-                outcomeIndex: a.outcomeIndex ?? null,
-                title: a.title ?? null,
-                eventSlug: a.eventSlug ?? null,
-              },
-              update: {},
-            });
-            activityCount++;
-          } catch (innerErr: any) {
-            if (!innerErr.message?.includes('Unique constraint')) {
-              log.warn(`Failed to upsert activity: ${innerErr.message}`);
-            }
-          }
-        }
-      }
-    }
-
-    // 10. Mark backfill as completed
+    // 9. Mark backfill as completed
     const latestTradeTs = trades.length > 0
       ? new Date(Math.max(...trades.map((t) => t.timestamp)) * 1000)
       : null;
@@ -481,7 +394,6 @@ export async function backfillTrader(proxyWallet: string): Promise<void> {
       trades: tradeCount,
       closedPositions: closedPositions.length,
       positions: positions.length,
-      activities: activityCount,
     });
   } catch (err: any) {
     log.error(`Backfill failed: ${err.message}`);
