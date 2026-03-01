@@ -312,9 +312,36 @@ model DetectedTrade {
 
   detectedAt DateTime @default(now())
 
+  copyTrade CopyTrade?
+
   @@unique([transactionHash, proxyWallet, asset])
   @@index([detectedAt(sort: Desc)])
   @@index([proxyWallet])
+}
+
+// ─── CopyTrade (executed copy of a detected trade) ───
+
+model CopyTrade {
+  id              String    @id @default(cuid())
+  detectedTradeId String    @unique
+  detectedTrade   DetectedTrade @relation(fields: [detectedTradeId], references: [id])
+  orderId         String?
+  tokenId         String
+  side            String
+  requestedAmount Float
+  requestedPrice  Float
+  filledPrice     Float?
+  filledSize      Float?
+  slippageBps     Float?
+  status          String    // PENDING, FILLED, FAILED, SKIPPED
+  failReason      String?
+  latencyMs       Int?
+  createdAt       DateTime  @default(now())
+  filledAt        DateTime?
+
+  @@index([status])
+  @@index([createdAt(sort: Desc)])
+  @@index([tokenId])
 }
 
 // ─── SystemHealth ───

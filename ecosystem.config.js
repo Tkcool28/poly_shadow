@@ -47,5 +47,17 @@ module.exports = {
         NODE_ENV: 'production',
       },
     },
+    {
+      name: 'copy-trader',
+      script: './node_modules/.bin/tsx',
+      args: 'src/jobs/copy-trader.ts',
+      autorestart: true,
+      watch: false,
+      max_restarts: 10,
+      restart_delay: 5000,
+      env: {
+        NODE_ENV: 'production',
+      },
+    },
   ],
 };

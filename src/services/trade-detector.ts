@@ -1,6 +1,108 @@
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { getTrades } from '../api/data-api';
+import type { RtdsTradePayload } from './ws-trade-stream';
+
+// ─── In-memory caches for WebSocket real-time path ───
+
+let monitoredWallets: Set<string> = new Set();
+let scoreCache: Map<string, number> = new Map(); // proxyWallet → compositeScore
+let userNameCache: Map<string, string | null> = new Map();
+let cacheRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
+export async function refreshMonitoredWallets(): Promise<void> {
+  const traders = await prisma.trader.findMany({
+    where: { isMonitored: true },
+    select: {
+      proxyWallet: true,
+      userName: true,
+      scores: { select: { compositeScore: true }, take: 1 },
+    },
+  });
+
+  const wallets = new Set<string>();
+  const scores = new Map<string, number>();
+  const names = new Map<string, string | null>();
+
+  for (const t of traders) {
+    wallets.add(t.proxyWallet);
+    names.set(t.proxyWallet, t.userName);
+    if (t.scores[0]) {
+      scores.set(t.proxyWallet, t.scores[0].compositeScore);
+    }
+  }
+
+  monitoredWallets = wallets;
+  scoreCache = scores;
+  userNameCache = names;
+  logger.debug(`Refreshed monitored wallets cache: ${wallets.size} wallets`);
+}
+
+export async function startCacheRefresh(intervalMs = 60000): Promise<void> {
+  if (cacheRefreshTimer) return;
+  await refreshMonitoredWallets();
+  cacheRefreshTimer = setInterval(() => refreshMonitoredWallets(), intervalMs);
+}
+
+export function stopCacheRefresh(): void {
+  if (cacheRefreshTimer) {
+    clearInterval(cacheRefreshTimer);
+    cacheRefreshTimer = null;
+  }
+}
+
+/**
+ * Handle a real-time trade from the RTDS WebSocket.
+ * Returns true if the trade was inserted (new detection), false if skipped/duplicate.
+ */
+export async function handleRealtimeTrade(payload: RtdsTradePayload): Promise<boolean> {
+  if (!monitoredWallets.has(payload.proxyWallet)) return false;
+
+  const compositeScore = scoreCache.get(payload.proxyWallet) ?? null;
+  const userName = userNameCache.get(payload.proxyWallet) ?? payload.name ?? null;
+
+  try {
+    await prisma.detectedTrade.create({
+      data: {
+        proxyWallet: payload.proxyWallet,
+        userName,
+        side: payload.side,
+        conditionId: payload.conditionId,
+        asset: payload.asset,
+        size: parseFloat(payload.size),
+        price: parseFloat(payload.price),
+        outcome: payload.outcome,
+        title: payload.title ?? null,
+        eventSlug: payload.eventSlug ?? null,
+        transactionHash: payload.transactionHash,
+        timestamp: payload.timestamp,
+        compositeScore,
+      },
+    });
+
+    const usdValue = (parseFloat(payload.size) * parseFloat(payload.price)).toFixed(2);
+    const latencyMs = Date.now() - payload.timestamp * 1000;
+    logger.info(`NEW TRADE DETECTED (WS)`, {
+      trader: payload.proxyWallet.slice(0, 10),
+      userName,
+      side: payload.side,
+      outcome: payload.outcome,
+      title: payload.title?.slice(0, 50),
+      usdValue: `$${usdValue}`,
+      price: parseFloat(payload.price),
+      compositeScore,
+      latencyMs,
+    });
+
+    return true;
+  } catch (err: any) {
+    // Skip duplicate constraint violations
+    if (err.code === 'P2002') return false;
+    throw err;
+  }
+}
+
+// ─── Polling-based detection (existing) ───
 
 export async function detectNewTrades(): Promise<number> {
   // Get monitored traders

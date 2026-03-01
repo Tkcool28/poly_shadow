@@ -59,4 +59,13 @@ program
     await prisma.$disconnect();
   });
 
+program
+  .command('setup-wallet')
+  .description('Derive CLOB API credentials and show wallet setup instructions')
+  .action(async () => {
+    const { setupWallet } = await import('./setup-wallet.js');
+    await setupWallet();
+    await prisma.$disconnect();
+  });
+
 program.parse();

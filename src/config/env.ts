@@ -27,6 +27,34 @@ const envSchema = z.object({
   PRESCREEN_MIN_POSITIONS: z.coerce.number().default(10),
   PRESCREEN_MIN_WIN_RATE: z.coerce.number().default(0.45),
   PRESCREEN_CONCURRENCY: z.coerce.number().default(10),
+
+  // WebSocket
+  WS_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+  WS_RECONNECT_MAX_MS: z.coerce.number().default(30000),
+  WS_FALLBACK_POLL_MS: z.coerce.number().default(300000), // 5 min
+
+  // Copy-trade wallet credentials (required when COPY_TRADE_ENABLED=true)
+  PRIVATE_KEY: z.string().optional(),
+  CLOB_API_KEY: z.string().optional(),
+  CLOB_API_SECRET: z.string().optional(),
+  CLOB_API_PASSPHRASE: z.string().optional(),
+  FUNDER_ADDRESS: z.string().optional(),
+  SIGNATURE_TYPE: z.coerce.number().default(2), // 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE
+
+  // Copy-trade risk controls
+  COPY_TRADE_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+  POSITION_SIZE_MULTIPLIER: z.coerce.number().default(0.1),
+  MAX_POSITION_USD: z.coerce.number().default(50),
+  MAX_DAILY_LOSS_USD: z.coerce.number().default(200),
+  MAX_OPEN_POSITIONS: z.coerce.number().default(20),
+  MIN_COMPOSITE_SCORE: z.coerce.number().default(0.7),
+  SLIPPAGE_BPS: z.coerce.number().default(200), // 2% default
 });
 
 const parsed = envSchema.safeParse(process.env);
