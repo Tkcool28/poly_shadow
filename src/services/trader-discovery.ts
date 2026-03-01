@@ -42,91 +42,95 @@ export async function discoverFromLeaderboard(): Promise<{
   });
   const permFailedWallets = new Set(permFailedTraders.map((t) => t.proxyWallet));
 
+  const orderByOptions = ['PNL', 'VOL'];
+
   for (const category of categories) {
     for (const timePeriod of timePeriods) {
-      // Paginate up to 200 results per combo (4 pages of 50)
-      const maxOffset = 200;
-      for (let offset = 0; offset < maxOffset; offset += limit) {
-        const entries = await getLeaderboard({
-          category,
-          timePeriod,
-          orderBy: 'PNL',
-          limit,
-          offset,
-        });
-
-        if (entries.length === 0) break;
-
-        for (const entry of entries) {
-          if (seenWallets.has(entry.proxyWallet)) continue;
-          seenWallets.add(entry.proxyWallet);
-
-          const rankNum = parseInt(entry.rank, 10) || null;
-
-          // Check re-evaluation BEFORE upsert overwrites leaderboardPnl
-          const oldPnl = screenedOutPnl.get(entry.proxyWallet);
-          const shouldRescreen =
-            oldPnl !== undefined &&
-            oldPnl !== null &&
-            entry.pnl > oldPnl * 1.5;
-
-          const result = await prisma.trader.upsert({
-            where: { proxyWallet: entry.proxyWallet },
-            create: {
-              proxyWallet: entry.proxyWallet,
-              userName: entry.userName,
-              xUsername: entry.xUsername || null,
-              verifiedBadge: entry.verifiedBadge,
-              profileImage: entry.profileImage || null,
-              source: 'LEADERBOARD',
-              backfillStatus: 'PENDING',
-              leaderboardPnl: entry.pnl,
-              leaderboardVol: entry.vol,
-              leaderboardRank: rankNum,
-            },
-            update: {
-              userName: entry.userName,
-              verifiedBadge: entry.verifiedBadge,
-              leaderboardPnl: entry.pnl,
-              leaderboardVol: entry.vol,
-              leaderboardRank: rankNum,
-              // Reset SCREENED_OUT traders with significantly improved PnL
-              // or resurrect server-error PERMANENTLY_FAILED traders
-              ...(shouldRescreen
-                ? { backfillStatus: 'PENDING' as const, screenedAt: null }
-                : permFailedWallets.has(entry.proxyWallet)
-                  ? {
-                      backfillStatus: 'PENDING' as const,
-                      backfillRetries: 0,
-                      backfillLockedAt: null,
-                      backfillError: null,
-                    }
-                  : {}),
-            },
-            select: { createdAt: true, updatedAt: true },
+      for (const orderBy of orderByOptions) {
+        // Paginate up to 600 results per combo (12 pages of 50)
+        const maxOffset = 600;
+        for (let offset = 0; offset < maxOffset; offset += limit) {
+          const entries = await getLeaderboard({
+            category,
+            timePeriod,
+            orderBy,
+            limit,
+            offset,
           });
 
-          // If createdAt equals updatedAt (within 1s), it's a new record
-          if (Math.abs(result.createdAt.getTime() - result.updatedAt.getTime()) < 1000) {
-            newTraders++;
-          } else {
-            updatedTraders++;
+          if (entries.length === 0) break;
 
-            if (shouldRescreen) {
-              logger.info(
-                `Re-evaluating ${entry.proxyWallet.slice(0, 10)}: PnL improved from ${oldPnl?.toFixed(0)} to ${entry.pnl.toFixed(0)}`,
-              );
-            }
+          for (const entry of entries) {
+            if (seenWallets.has(entry.proxyWallet)) continue;
+            seenWallets.add(entry.proxyWallet);
 
-            if (permFailedWallets.has(entry.proxyWallet)) {
-              logger.info(
-                `Resurrecting ${entry.proxyWallet.slice(0, 10)}: server-error PERMANENTLY_FAILED trader found on leaderboard`,
-              );
+            const rankNum = parseInt(entry.rank, 10) || null;
+
+            // Check re-evaluation BEFORE upsert overwrites leaderboardPnl
+            const oldPnl = screenedOutPnl.get(entry.proxyWallet);
+            const shouldRescreen =
+              oldPnl !== undefined &&
+              oldPnl !== null &&
+              entry.pnl > oldPnl * 1.5;
+
+            const result = await prisma.trader.upsert({
+              where: { proxyWallet: entry.proxyWallet },
+              create: {
+                proxyWallet: entry.proxyWallet,
+                userName: entry.userName,
+                xUsername: entry.xUsername || null,
+                verifiedBadge: entry.verifiedBadge,
+                profileImage: entry.profileImage || null,
+                source: 'LEADERBOARD',
+                backfillStatus: 'PENDING',
+                leaderboardPnl: entry.pnl,
+                leaderboardVol: entry.vol,
+                leaderboardRank: rankNum,
+              },
+              update: {
+                userName: entry.userName,
+                verifiedBadge: entry.verifiedBadge,
+                leaderboardPnl: entry.pnl,
+                leaderboardVol: entry.vol,
+                leaderboardRank: rankNum,
+                // Reset SCREENED_OUT traders with significantly improved PnL
+                // or resurrect server-error PERMANENTLY_FAILED traders
+                ...(shouldRescreen
+                  ? { backfillStatus: 'PENDING' as const, screenedAt: null }
+                  : permFailedWallets.has(entry.proxyWallet)
+                    ? {
+                        backfillStatus: 'PENDING' as const,
+                        backfillRetries: 0,
+                        backfillLockedAt: null,
+                        backfillError: null,
+                      }
+                    : {}),
+              },
+              select: { createdAt: true, updatedAt: true },
+            });
+
+            // If createdAt equals updatedAt (within 1s), it's a new record
+            if (Math.abs(result.createdAt.getTime() - result.updatedAt.getTime()) < 1000) {
+              newTraders++;
+            } else {
+              updatedTraders++;
+
+              if (shouldRescreen) {
+                logger.info(
+                  `Re-evaluating ${entry.proxyWallet.slice(0, 10)}: PnL improved from ${oldPnl?.toFixed(0)} to ${entry.pnl.toFixed(0)}`,
+                );
+              }
+
+              if (permFailedWallets.has(entry.proxyWallet)) {
+                logger.info(
+                  `Resurrecting ${entry.proxyWallet.slice(0, 10)}: server-error PERMANENTLY_FAILED trader found on leaderboard`,
+                );
+              }
             }
           }
-        }
 
-        if (entries.length < limit) break;
+          if (entries.length < limit) break;
+        }
       }
     }
   }
