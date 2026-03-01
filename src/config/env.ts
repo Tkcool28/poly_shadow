@@ -55,6 +55,10 @@ const envSchema = z.object({
   MAX_TRADE_PERCENT: z.coerce.number().default(0.50), // Max 50% of allocation per trade
   PORTFOLIO_VALUE_REFRESH_MS: z.coerce.number().default(300000), // 5 min
   SLIPPAGE_BPS: z.coerce.number().default(200), // 2% default
+
+  // Paper trade fee simulation (Polymarket formula: C × feeRate × (p × (1-p))^exponent)
+  PAPER_TRADE_FEE_RATE: z.coerce.number().default(0), // 0 = no fees (most markets)
+  PAPER_TRADE_FEE_EXPONENT: z.coerce.number().default(1), // 1 = sports, 2 = crypto
 });
 
 const parsed = envSchema.safeParse(process.env);

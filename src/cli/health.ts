@@ -104,9 +104,17 @@ export async function showHealth() {
     }
   }
 
+  // Copy trade stats
+  const [liveCopyTrades, paperCopyTrades] = await Promise.all([
+    prisma.copyTrade.count({ where: { isPaper: false } }),
+    prisma.copyTrade.count({ where: { isPaper: true } }),
+  ]);
+
   // Data stats
   console.log('\nData:');
   console.log(`  Trades stored: ${totalTrades.toLocaleString()}`);
   console.log(`  Markets cached: ${totalMarkets}`);
   console.log(`  Detected trades: ${detectedTrades}`);
+  console.log(`  Copy trades (live): ${liveCopyTrades}`);
+  console.log(`  Copy trades (paper): ${paperCopyTrades}`);
 }

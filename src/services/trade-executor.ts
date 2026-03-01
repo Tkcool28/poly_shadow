@@ -21,6 +21,7 @@ export interface ExecuteOrderResult {
   filledSize: number | null;
   failReason: string | null;
   transactionHashes: string[];
+  estimatedFee?: number; // paper trades only: estimated fee in USD
 }
 
 // Market metadata cache (tickSize + negRisk don't change per market)

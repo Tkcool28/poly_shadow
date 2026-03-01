@@ -30,19 +30,17 @@ async function main() {
     return;
   }
 
-  // Validate required credentials
-  if (!config.PRIVATE_KEY || !config.CLOB_API_KEY || !config.CLOB_API_SECRET || !config.CLOB_API_PASSPHRASE || !config.FUNDER_ADDRESS) {
-    log.error('Missing required credentials. Set PRIVATE_KEY, CLOB_API_KEY, CLOB_API_SECRET, CLOB_API_PASSPHRASE, FUNDER_ADDRESS');
-    process.exit(1);
-  }
-
-  // Initialize CLOB client
-  try {
-    await initExecutor();
-    log.info('Copy-trader daemon started');
-  } catch (err: any) {
-    log.error(`Failed to initialize trade executor: ${err.message}`);
-    process.exit(1);
+  // Initialize CLOB client (only needed for live allocations)
+  if (config.PRIVATE_KEY && config.CLOB_API_KEY && config.CLOB_API_SECRET
+      && config.CLOB_API_PASSPHRASE && config.FUNDER_ADDRESS) {
+    try {
+      await initExecutor();
+      log.info('Copy-trader daemon started (live + paper trading available)');
+    } catch (err: any) {
+      log.warn(`CLOB executor init failed: ${err.message}. Only paper trading available.`);
+    }
+  } else {
+    log.info('No CLOB credentials configured — only paper trading available');
   }
 
   // Start portfolio value cache

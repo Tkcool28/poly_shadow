@@ -311,6 +311,7 @@ model FollowAllocation {
 
   // State
   isActive             Boolean   @default(true)
+  isPaper              Boolean   @default(false) // true = paper trading, no real orders
 
   copyTrades           CopyTrade[]
   createdAt            DateTime  @default(now())
@@ -363,6 +364,8 @@ model CopyTrade {
   status             String    // PENDING, FILLED, FAILED, SKIPPED
   failReason         String?
   latencyMs          Int?
+  isPaper            Boolean   @default(false) // derived from allocation at creation
+  estimatedFee       Float?                    // paper trades: estimated Polymarket fee in USD
   followAllocationId String?
   followAllocation   FollowAllocation? @relation(fields: [followAllocationId], references: [id])
   createdAt          DateTime  @default(now())
@@ -372,6 +375,7 @@ model CopyTrade {
   @@index([createdAt(sort: Desc)])
   @@index([tokenId])
   @@index([followAllocationId])
+  @@index([isPaper])
 }
 
 // ─── SystemHealth ───

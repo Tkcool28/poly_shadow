@@ -76,7 +76,8 @@ program
 program
   .command('follow <username> <capital>')
   .description('Follow a trader with a capital allocation (USD)')
-  .action(async (username: string, capital: string) => {
+  .option('--paper', 'Use paper trading mode (no real orders)')
+  .action(async (username: string, capital: string, opts: { paper?: boolean }) => {
     const { followTrader, parseCapital } = await import('./follow.js');
     const amount = parseCapital(capital);
     if (amount === null) {
@@ -84,7 +85,7 @@ program
       await prisma.$disconnect();
       return;
     }
-    await followTrader(username, amount);
+    await followTrader(username, amount, opts.paper ?? false);
     await prisma.$disconnect();
   });
 

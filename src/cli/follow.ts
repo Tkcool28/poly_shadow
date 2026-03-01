@@ -21,7 +21,7 @@ export function parseCapital(value: string): number | null {
   return n;
 }
 
-export async function followTrader(identifier: string, capital: number): Promise<void> {
+export async function followTrader(identifier: string, capital: number, isPaper = false): Promise<void> {
   if (!Number.isFinite(capital) || capital <= 0) {
     console.error('Capital must be a positive number');
     return;
@@ -34,6 +34,7 @@ export async function followTrader(identifier: string, capital: number): Promise
   }
 
   const displayName = trader.userName ?? trader.proxyWallet.slice(0, 10);
+  const modeLabel = isPaper ? 'PAPER' : 'LIVE';
 
   // Upsert FollowAllocation
   const existing = await prisma.followAllocation.findUnique({
@@ -41,8 +42,16 @@ export async function followTrader(identifier: string, capital: number): Promise
   });
 
   if (existing) {
+    // Block mode switch — must unfollow first to change paper/live
+    if (existing.isPaper !== isPaper) {
+      const currentMode = existing.isPaper ? 'PAPER' : 'LIVE';
+      const requestedMode = isPaper ? 'PAPER' : 'LIVE';
+      console.error(`Error: ${displayName} is currently followed as ${currentMode}. Unfollow first to switch to ${requestedMode}.`);
+      return;
+    }
+
     // Re-follow or re-activate: reset capital, recalculate deployedCapital from open positions
-    const deployedCapital = await recalcDeployedCapital(existing.id);
+    const deployedCapital = await recalcDeployedCapital(existing.id, isPaper);
 
     await prisma.followAllocation.update({
       where: { proxyWallet: trader.proxyWallet },
@@ -55,7 +64,8 @@ export async function followTrader(identifier: string, capital: number): Promise
     });
 
     const verb = existing.isActive ? 'Updated follow for' : 'Re-activated follow for';
-    console.log(`${verb} ${displayName}`);
+    console.log(`${verb} ${displayName} [${modeLabel}]`);
+    console.log(`  Mode: ${modeLabel}`);
     console.log(`  Initial capital: $${capital.toFixed(2)}`);
     console.log(`  Deployed (open positions): $${deployedCapital.toFixed(2)}`);
     console.log(`  Available capital: $${(capital - deployedCapital).toFixed(2)}`);
@@ -68,10 +78,12 @@ export async function followTrader(identifier: string, capital: number): Promise
         currentCapital: capital,
         deployedCapital: 0,
         isActive: true,
+        isPaper,
       },
     });
 
-    console.log(`Now following ${displayName} with $${capital.toFixed(2)}`);
+    console.log(`Now following ${displayName} with $${capital.toFixed(2)} [${modeLabel}]`);
+    console.log(`  Mode: ${modeLabel}`);
   }
 
   // Ensure trader is monitored for WS detection
@@ -116,7 +128,9 @@ export async function unfollowTrader(identifier: string): Promise<void> {
   const pnl = allocation.currentCapital + allocation.deployedCapital - allocation.initialCapital;
   const pnlSign = pnl >= 0 ? '+' : '';
 
-  console.log(`Unfollowed ${trader.userName ?? trader.proxyWallet.slice(0, 10)}`);
+  const modeLabel = allocation.isPaper ? 'PAPER' : 'LIVE';
+  console.log(`Unfollowed ${trader.userName ?? trader.proxyWallet.slice(0, 10)} [${modeLabel}]`);
+  console.log(`  Mode: ${modeLabel}`);
   console.log(`  Initial capital:  $${allocation.initialCapital.toFixed(2)}`);
   console.log(`  Current capital:  $${allocation.currentCapital.toFixed(2)}`);
   console.log(`  Deployed capital: $${allocation.deployedCapital.toFixed(2)}`);
@@ -138,6 +152,7 @@ export async function listFollows(): Promise<void> {
 
   const header = [
     'Username'.padEnd(15),
+    'Mode'.padEnd(7),
     'Status'.padEnd(8),
     'Initial'.padStart(10),
     'Current'.padStart(10),
@@ -152,6 +167,7 @@ export async function listFollows(): Promise<void> {
 
   for (const alloc of allocations) {
     const name = (alloc.trader.userName ?? alloc.trader.proxyWallet.slice(0, 10)).slice(0, 15);
+    const mode = alloc.isPaper ? 'PAPER' : 'LIVE';
     const status = alloc.isActive ? 'ACTIVE' : 'PAUSED';
     const pnl = alloc.currentCapital + alloc.deployedCapital - alloc.initialCapital;
     const pnlStr = (pnl >= 0 ? '+' : '') + pnl.toFixed(2);
@@ -161,6 +177,7 @@ export async function listFollows(): Promise<void> {
 
     const row = [
       name.padEnd(15),
+      mode.padEnd(7),
       status.padEnd(8),
       `$${alloc.initialCapital.toFixed(2)}`.padStart(10),
       `$${alloc.currentCapital.toFixed(2)}`.padStart(10),
@@ -207,20 +224,22 @@ export async function updateFollow(identifier: string, newCapital: number): Prom
     },
   });
 
-  console.log(`Updated allocation for ${trader.userName ?? trader.proxyWallet.slice(0, 10)}`);
+  const modeLabel = allocation.isPaper ? 'PAPER' : 'LIVE';
+  console.log(`Updated allocation for ${trader.userName ?? trader.proxyWallet.slice(0, 10)} [${modeLabel}]`);
+  console.log(`  Mode: ${modeLabel}`);
   console.log(`  Initial capital: $${allocation.initialCapital.toFixed(2)} → $${newCapital.toFixed(2)}`);
   console.log(`  Current capital: $${allocation.currentCapital.toFixed(2)} → $${newCurrentCapital.toFixed(2)}`);
   console.log(`  Deployed capital: $${allocation.deployedCapital.toFixed(2)} (unchanged)`);
 }
 
-async function recalcDeployedCapital(allocationId: string): Promise<number> {
+async function recalcDeployedCapital(allocationId: string, isPaper: boolean): Promise<number> {
   const [buySum, sellSum] = await Promise.all([
     prisma.copyTrade.aggregate({
-      where: { followAllocationId: allocationId, side: 'BUY', status: 'FILLED' },
+      where: { followAllocationId: allocationId, side: 'BUY', status: 'FILLED', isPaper },
       _sum: { requestedAmount: true },
     }),
     prisma.copyTrade.aggregate({
-      where: { followAllocationId: allocationId, side: 'SELL', status: 'FILLED' },
+      where: { followAllocationId: allocationId, side: 'SELL', status: 'FILLED', isPaper },
       _sum: { requestedAmount: true },
     }),
   ]);

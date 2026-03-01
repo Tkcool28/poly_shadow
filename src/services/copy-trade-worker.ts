@@ -1,7 +1,8 @@
 import { prisma } from '../lib/prisma';
 import { createJobLogger } from '../lib/logger';
 import { config } from '../config/env';
-import { executeMarketOrder } from './trade-executor';
+import { executeMarketOrder as realExecute } from './trade-executor';
+import { executeMarketOrder as paperExecute } from './paper-executor';
 import type { ExecuteOrderResult } from './trade-executor';
 
 const log = createJobLogger('copy-trade-worker');
@@ -39,13 +40,15 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     where: { proxyWallet: trade.proxyWallet },
   });
   if (!allocation || !allocation.isActive) {
-    await createSkippedRecord(trade, 'no active follow allocation', null);
+    await createSkippedRecord(trade, 'no active follow allocation', null, false);
     return;
   }
 
+  const isPaper = allocation.isPaper;
+
   // Check cached trader portfolio value
   if (!allocation.traderPortfolioValue || allocation.traderPortfolioValue <= 0) {
-    await createSkippedRecord(trade, 'trader portfolio value unknown', allocation.id);
+    await createSkippedRecord(trade, 'trader portfolio value unknown', allocation.id, isPaper);
     return;
   }
 
@@ -59,12 +62,12 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   copyAmountUsd = Math.min(copyAmountUsd, config.MAX_POSITION_USD);
 
   if (copyAmountUsd < 0.10) {
-    await createSkippedRecord(trade, 'amount too small', allocation.id);
+    await createSkippedRecord(trade, 'amount too small', allocation.id, isPaper);
     return;
   }
 
   if (trade.side === 'BUY' && copyAmountUsd > allocation.currentCapital) {
-    await createSkippedRecord(trade, 'insufficient allocated capital', allocation.id);
+    await createSkippedRecord(trade, 'insufficient allocated capital', allocation.id, isPaper);
     return;
   }
 
@@ -86,21 +89,22 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     const spent = todayBuySpend._sum.requestedAmount ?? 0;
     const dailyLimit = allocation.initialCapital * 0.20;
     if (spent + copyAmountUsd > dailyLimit) {
-      await createSkippedRecord(trade, 'per-allocation daily limit reached', allocation.id);
+      await createSkippedRecord(trade, 'per-allocation daily limit reached', allocation.id, isPaper);
       return;
     }
 
-    // Global daily backstop (across all allocations)
+    // Global daily backstop (across all allocations, scoped by paper/live)
     const globalSpend = await prisma.copyTrade.aggregate({
       where: {
         status: 'FILLED',
         side: 'BUY',
         createdAt: { gte: todayStart },
+        isPaper,
       },
       _sum: { requestedAmount: true },
     });
     if ((globalSpend._sum.requestedAmount ?? 0) + copyAmountUsd > config.MAX_DAILY_LOSS_USD) {
-      await createSkippedRecord(trade, 'global daily loss limit reached', allocation.id);
+      await createSkippedRecord(trade, 'global daily loss limit reached', allocation.id, isPaper);
       return;
     }
   }
@@ -108,13 +112,13 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   // ─── Global open positions backstop ───
 
   const [globalBuys, globalSells] = await Promise.all([
-    prisma.copyTrade.count({ where: { status: 'FILLED', side: 'BUY' } }),
-    prisma.copyTrade.count({ where: { status: 'FILLED', side: 'SELL' } }),
+    prisma.copyTrade.count({ where: { status: 'FILLED', side: 'BUY', isPaper } }),
+    prisma.copyTrade.count({ where: { status: 'FILLED', side: 'SELL', isPaper } }),
   ]);
   const globalOpenPositions = Math.max(globalBuys - globalSells, 0);
 
   if (globalOpenPositions >= config.MAX_OPEN_POSITIONS) {
-    await createSkippedRecord(trade, 'global max open positions reached', allocation.id);
+    await createSkippedRecord(trade, 'global max open positions reached', allocation.id, isPaper);
     return;
   }
 
@@ -129,7 +133,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       },
     });
     if (!hasBuyPosition) {
-      await createSkippedRecord(trade, 'no position to sell', allocation.id);
+      await createSkippedRecord(trade, 'no position to sell', allocation.id, isPaper);
       return;
     }
   }
@@ -153,13 +157,16 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       requestedAmount: copyAmountUsd,
       requestedPrice: trade.price,
       status: 'PENDING',
+      isPaper,
       followAllocationId: allocation.id,
     },
   });
 
+  const executeFn = isPaper ? paperExecute : realExecute;
+
   let result: ExecuteOrderResult;
   try {
-    result = await executeMarketOrder({
+    result = await executeFn({
       tokenId: trade.asset,
       side: trade.side as 'BUY' | 'SELL',
       amount: executorAmount,
@@ -195,6 +202,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       filledSize: result.filledSize,
       slippageBps,
       failReason: result.failReason,
+      estimatedFee: result.estimatedFee ?? null,
       latencyMs,
       filledAt: result.status === 'FILLED' ? new Date() : null,
     },
@@ -234,9 +242,12 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
 
   // ─── Log ───
 
+  const mode = isPaper ? 'PAPER' : 'LIVE';
+
   if (result.status === 'FILLED') {
-    log.info(`COPY TRADE EXECUTED`, {
+    log.info(`COPY TRADE EXECUTED [${mode}]`, {
       trader: trade.proxyWallet.slice(0, 10),
+      mode,
       side: trade.side,
       outcome: trade.outcome,
       title: trade.title?.slice(0, 50),
@@ -245,19 +256,22 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       filledPrice: result.filledPrice,
       filledSize: result.filledSize,
       slippageBps,
+      estimatedFee: result.estimatedFee,
       latencyMs,
       allocationId: allocation.id,
     });
   } else if (result.status === 'SKIPPED') {
-    log.info(`COPY TRADE SKIPPED`, {
+    log.info(`COPY TRADE SKIPPED [${mode}]`, {
       trader: trade.proxyWallet.slice(0, 10),
+      mode,
       reason: result.failReason,
       side: trade.side,
       title: trade.title?.slice(0, 50),
     });
   } else {
-    log.warn(`COPY TRADE FAILED`, {
+    log.warn(`COPY TRADE FAILED [${mode}]`, {
       trader: trade.proxyWallet.slice(0, 10),
+      mode,
       reason: result.failReason,
       side: trade.side,
       title: trade.title?.slice(0, 50),
@@ -270,6 +284,7 @@ async function createSkippedRecord(
   trade: DetectedTradeRow,
   reason: string,
   followAllocationId: string | null,
+  isPaper: boolean,
 ): Promise<void> {
   try {
     await prisma.copyTrade.create({
@@ -280,6 +295,7 @@ async function createSkippedRecord(
         requestedAmount: 0,
         requestedPrice: trade.price,
         status: 'SKIPPED',
+        isPaper,
         failReason: reason,
         latencyMs: 0,
         followAllocationId,
