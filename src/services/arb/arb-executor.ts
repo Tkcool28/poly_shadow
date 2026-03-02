@@ -230,10 +230,17 @@ async function executeWithClient(client: ClobClient, params: ExecuteOrderParams)
     let filledPrice: number | null;
 
     if (side === 'BUY') {
-      // BUY: makingAmount = shares received, takingAmount = USDC paid
+      // Standard CTF markets: makingAmount = shares received, takingAmount = USDC paid.
+      // NegRisk markets invert the convention. Heuristic: try standard first; if
+      // price > 1.0 (impossible for prediction markets), flip to negRisk convention.
       filledSize = makingAmount > 0 ? makingAmount : null;
       filledPrice = makingAmount > 0 && takingAmount > 0
         ? takingAmount / makingAmount : null;
+      if (filledPrice !== null && filledPrice > 1.0) {
+        filledSize = takingAmount > 0 ? takingAmount : null;
+        filledPrice = makingAmount > 0 && takingAmount > 0
+          ? makingAmount / takingAmount : null;
+      }
     } else {
       // SELL: makingAmount = USDC received, takingAmount = shares given
       filledSize = takingAmount > 0 ? takingAmount : null;
@@ -241,20 +248,22 @@ async function executeWithClient(client: ClobClient, params: ExecuteOrderParams)
         ? makingAmount / takingAmount : null;
     }
 
-    // Guard: if CLOB reported success but no fill data, treat as FAILED (ghost fill)
-    if (filledSize == null || filledPrice == null) {
-      log.warn('Arb ghost fill detected: CLOB success but no fill amounts', {
+    // Guard: ghost fill (null/zero amounts) or impossible price for a prediction market
+    if (!filledSize || !filledPrice || filledPrice > 1.0) {
+      log.warn('Arb ghost fill detected: CLOB success but invalid fill data', {
         orderId,
         side,
         makingAmount: response?.makingAmount,
         takingAmount: response?.takingAmount,
+        filledSize,
+        filledPrice,
       });
       return {
         orderId,
         status: 'FAILED',
         filledPrice: null,
         filledSize: null,
-        failReason: 'ghost fill: success reported but no fill amounts',
+        failReason: `ghost fill: ${filledPrice != null && filledPrice > 1.0 ? `impossible price ${filledPrice}` : 'no fill amounts'}`,
         transactionHashes: txHashes,
       };
     }
