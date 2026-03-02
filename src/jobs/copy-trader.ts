@@ -129,8 +129,8 @@ async function main() {
         continue;
       }
 
-      // Fetch unprocessed detected trades (no linked CopyTrade, within last 5 min)
-      const staleCutoff = new Date(Date.now() - 5 * 60 * 1000);
+      // Fetch unprocessed detected trades (no linked CopyTrade, within stale cutoff window)
+      const staleCutoff = new Date(Date.now() - config.STALE_TRADE_CUTOFF_MS);
       const pending = await prisma.detectedTrade.findMany({
         where: {
           copyTrade: null,

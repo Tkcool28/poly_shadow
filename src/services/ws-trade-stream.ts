@@ -130,6 +130,13 @@ export class RtdsTradeStream {
     this.clearHeartbeat();
     this.heartbeatTimer = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
+        // Detect stale connection: no message (including PONG) in 3 heartbeat intervals
+        if (this.lastMessageAt &&
+            Date.now() - this.lastMessageAt.getTime() > HEARTBEAT_INTERVAL_MS * 3) {
+          log.warn('RTDS connection stale (no messages in 15s), forcing reconnect');
+          ws.terminate(); // force-close → 'close' event → scheduleReconnect
+          return;
+        }
         ws.send('PING');
       }
     }, HEARTBEAT_INTERVAL_MS);

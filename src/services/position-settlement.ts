@@ -17,8 +17,12 @@ export async function sweepPositionSettlements(): Promise<void> {
     FROM "CopyTrade"
     WHERE status = 'FILLED' AND "followAllocationId" IS NOT NULL
     GROUP BY "tokenId", "followAllocationId", "isPaper"
-    HAVING SUM(CASE WHEN side = 'BUY' THEN 1 ELSE 0 END) >
-           SUM(CASE WHEN side = 'SELL' THEN 1 ELSE 0 END)
+    HAVING SUM(CASE WHEN side = 'BUY'
+               THEN COALESCE("filledSize", "requestedAmount" / NULLIF("filledPrice", 0))
+               ELSE 0 END) >
+           SUM(CASE WHEN side = 'SELL'
+               THEN COALESCE("filledSize", 0)
+               ELSE 0 END)
   `;
 
   if (openPositions.length === 0) {
@@ -129,23 +133,29 @@ export async function sweepPositionSettlements(): Promise<void> {
       select: { id: true, side: true, filledSize: true, requestedAmount: true, filledPrice: true },
     });
 
-    // Calculate net shares and cost basis
-    let netShares = 0;
+    // Calculate net shares and cost basis (average cost method — matches unrealized-pnl.ts)
+    let totalBuyShares = 0;
     let totalBuyCost = 0;
+    let totalSellShares = 0;
     for (const fill of fills) {
       if (fill.side === 'BUY') {
-        netShares += fill.filledSize ?? (fill.requestedAmount / (fill.filledPrice ?? 1));
-        totalBuyCost += fill.requestedAmount;
+        totalBuyShares += fill.filledSize ?? (fill.requestedAmount / (fill.filledPrice ?? 1));
+        // Prefer actual fill value over requested amount (accounts for slippage)
+        totalBuyCost += (fill.filledSize != null && fill.filledPrice != null)
+          ? fill.filledSize * fill.filledPrice
+          : fill.requestedAmount;
       } else {
-        netShares -= fill.filledSize ?? 0;
+        totalSellShares += fill.filledSize ?? 0;
       }
     }
-    netShares = Math.max(netShares, 0);
+    const netShares = Math.max(totalBuyShares - totalSellShares, 0);
 
-    if (netShares <= 0) continue;
+    if (netShares <= 0 || totalBuyShares <= 0) continue;
 
+    const avgCostPerShare = totalBuyCost / totalBuyShares;
+    const remainingCostBasis = avgCostPerShare * netShares;
     const settlementValue = netShares * settlementPrice;
-    const pnl = settlementValue - totalBuyCost;
+    const pnl = settlementValue - remainingCostBasis;
 
     // Apply settlement in transaction
     await prisma.$transaction(async (tx) => {
@@ -157,7 +167,7 @@ export async function sweepPositionSettlements(): Promise<void> {
         where: { id: pos.followAllocationId },
         data: {
           currentCapital: { increment: settlementValue },
-          deployedCapital: { decrement: Math.min(totalBuyCost, fresh.deployedCapital) },
+          deployedCapital: { decrement: Math.min(remainingCostBasis, fresh.deployedCapital) },
         },
       });
 

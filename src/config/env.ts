@@ -63,6 +63,8 @@ const envSchema = z.object({
 
   // Position settlement
   SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(300000), // 5 minutes
+  STALE_TRADE_CUTOFF_MS: z.coerce.number().default(600000), // 10 min (was hardcoded 5 min)
+  MIN_SELL_USD: z.coerce.number().min(0).default(0.01), // Skip dust sells below this
 
   // Paper trade fee simulation (Polymarket formula: C × feeRate × (p × (1-p))^exponent)
   PAPER_TRADE_FEE_RATE: z.coerce.number().default(0), // 0 = no fees (most markets)

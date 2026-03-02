@@ -76,6 +76,12 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     // Full position close — when trader sells, we exit entirely
     sellShares = heldShares;
     copyAmountUsd = sellShares * trade.price;
+
+    // Skip dust sells (rounding remnants)
+    if (copyAmountUsd < config.MIN_SELL_USD) {
+      await createSkippedRecord(trade, `dust sell: $${copyAmountUsd.toFixed(4)} below minimum`, allocation.id, isPaper);
+      return;
+    }
   } else {
     const tradeUsdValue = trade.size * trade.price;
     const tradePercent = tradeUsdValue / allocation.traderPortfolioValue;
@@ -102,7 +108,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
 
     const todayBuySpend = await prisma.copyTrade.aggregate({
       where: {
-        status: 'FILLED',
+        status: { in: ['FILLED', 'POOLED'] },
         side: 'BUY',
         createdAt: { gte: todayStart },
         followAllocationId: allocation.id,
@@ -119,7 +125,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     // Global daily backstop (across all allocations, scoped by paper/live)
     const globalSpend = await prisma.copyTrade.aggregate({
       where: {
-        status: 'FILLED',
+        status: { in: ['FILLED', 'POOLED'] },
         side: 'BUY',
         createdAt: { gte: todayStart },
         isPaper,
@@ -215,11 +221,18 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       });
 
       if (trade.side === 'BUY') {
+        // Defense-in-depth: cap decrement to available capital to prevent negative balance
+        const safeDecrement = Math.min(usdValue, Math.max(fresh.currentCapital, 0));
+        if (safeDecrement < usdValue) {
+          log.warn('Capital re-check: capping decrement to available capital', {
+            available: fresh.currentCapital, required: usdValue, allocationId: allocation.id,
+          });
+        }
         await tx.followAllocation.update({
           where: { id: allocation.id },
           data: {
-            currentCapital: { decrement: usdValue },
-            deployedCapital: { increment: usdValue },
+            currentCapital: { decrement: safeDecrement },
+            deployedCapital: { increment: safeDecrement },
           },
         });
       } else {

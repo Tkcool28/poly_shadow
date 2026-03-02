@@ -35,8 +35,12 @@ export async function calculateUnrealizedPnl(
     FROM "CopyTrade"
     WHERE status = 'FILLED' AND "followAllocationId" IS NOT NULL
     GROUP BY "tokenId", "followAllocationId", "isPaper"
-    HAVING SUM(CASE WHEN side = 'BUY' THEN 1 ELSE 0 END) >
-           SUM(CASE WHEN side = 'SELL' THEN 1 ELSE 0 END)
+    HAVING SUM(CASE WHEN side = 'BUY'
+               THEN COALESCE("filledSize", "requestedAmount" / NULLIF("filledPrice", 0))
+               ELSE 0 END) >
+           SUM(CASE WHEN side = 'SELL'
+               THEN COALESCE("filledSize", 0)
+               ELSE 0 END)
   `;
 
   // Filter to requested allocations
@@ -150,7 +154,9 @@ export async function calculateUnrealizedPnl(
     for (const fill of fills) {
       if (fill.side === 'BUY') {
         totalBuyShares += fill.filledSize ?? (fill.requestedAmount / (fill.filledPrice ?? 1));
-        totalBuyCost += fill.requestedAmount;
+        totalBuyCost += (fill.filledSize != null && fill.filledPrice != null)
+          ? fill.filledSize * fill.filledPrice
+          : fill.requestedAmount;
       } else {
         totalSellShares += fill.filledSize ?? 0;
       }
