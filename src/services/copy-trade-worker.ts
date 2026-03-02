@@ -89,6 +89,9 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       return;
     }
   } else {
+    // Guard: negative or zero capital means no buying power — skip silently
+    if (allocation.currentCapital <= 0) return;
+
     const tradeUsdValue = trade.size * trade.price;
     const tradePercent = tradeUsdValue / allocation.traderPortfolioValue;
     cappedPercent = Math.min(tradePercent, config.MAX_TRADE_PERCENT);
