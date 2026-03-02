@@ -3,11 +3,13 @@ import { createJobLogger } from '../lib/logger';
 import { prisma } from '../lib/prisma';
 import { config } from '../config/env';
 import { isShuttingDown } from '../lib/shutdown';
-import { initialize as initExecutor, isLiveReady } from '../services/trade-executor';
+import { initialize as initExecutor, isLiveReady, getWalletBalance } from '../services/trade-executor';
 import { processCopyTrade } from '../services/copy-trade-worker';
 import { startPortfolioRefresh, stopPortfolioRefresh } from '../services/portfolio-cache';
 import { rehydratePool, sweepPool } from '../services/order-pool';
 import { sweepPositionSettlements } from '../services/position-settlement';
+import { reconcileStalePending } from '../services/clob-reconciler';
+import { sweepPreResolutionSells } from '../services/pre-resolution-seller';
 
 const JOB_NAME = 'copy-trader';
 const log = createJobLogger(JOB_NAME);
@@ -77,33 +79,17 @@ async function main() {
     log.warn(`Pool rehydration failed: ${err.message}`);
   }
 
-  // Recover stale PENDING records from previous crash
+  // Recover stale PENDING records via CLOB reconciliation
   try {
-    const stalePending = await prisma.copyTrade.findMany({
-      where: { status: 'PENDING', createdAt: { lt: new Date(Date.now() - 60000) } },
-    });
-    if (stalePending.length > 0) {
-      await prisma.copyTrade.updateMany({
-        where: { id: { in: stalePending.map(r => r.id) } },
-        data: { status: 'FAILED', failReason: 'process restart: order status unknown — check CLOB manually' },
-      });
-      const liveStale = stalePending.filter(r => !r.isPaper);
-      if (liveStale.length > 0) {
-        log.error(`${liveStale.length} LIVE PENDING records recovered — MANUAL CLOB RECONCILIATION REQUIRED`, {
-          ids: liveStale.map(r => r.id),
-          amounts: liveStale.map(r => `${r.side} $${r.requestedAmount.toFixed(2)}`),
-        });
-      }
-      if (stalePending.length > liveStale.length) {
-        log.warn(`Recovered ${stalePending.length - liveStale.length} paper PENDING records on startup`);
-      }
-    }
+    await reconcileStalePending();
   } catch (err: any) {
-    log.warn(`PENDING record recovery failed: ${err.message}`);
+    log.warn(`PENDING record reconciliation failed: ${err.message}`);
   }
 
-  // Settlement sweep throttle
+  // Sweep throttles
   let lastSettlementSweep = 0;
+  let lastBalanceCheck = 0;
+  let lastPreResolutionSweep = 0;
 
   // Main loop: drain DetectedTrade queue
   while (!shuttingDown && !isShuttingDown()) {
@@ -163,6 +149,46 @@ async function main() {
           lastSettlementSweep = Date.now();
         } catch (err: any) {
           log.warn(`Settlement sweep failed: ${err.message}`);
+        }
+      }
+
+      // Balance check: warn if CLOB wallet balance diverges from DB capital
+      if (isLiveReady() && Date.now() - lastBalanceCheck >= config.BALANCE_CHECK_INTERVAL_MS) {
+        try {
+          const walletBal = await getWalletBalance();
+          if (walletBal) {
+            const dbCapital = (await prisma.followAllocation.aggregate({
+              where: { isActive: true, isPaper: false },
+              _sum: { currentCapital: true },
+            }))._sum.currentCapital ?? 0;
+
+            const diff = Math.abs(walletBal.balance - dbCapital);
+            if (diff > config.BALANCE_MISMATCH_THRESHOLD) {
+              log.warn('Balance mismatch: CLOB wallet vs DB capital', {
+                clobBalance: walletBal.balance.toFixed(2),
+                dbCurrentCapital: dbCapital.toFixed(2),
+                diff: diff.toFixed(2),
+              });
+            } else {
+              log.debug('Balance check OK', {
+                clobBalance: walletBal.balance.toFixed(2),
+                dbCurrentCapital: dbCapital.toFixed(2),
+              });
+            }
+          }
+          lastBalanceCheck = Date.now();
+        } catch (err: any) {
+          log.warn(`Balance check failed: ${err.message}`);
+        }
+      }
+
+      // Pre-resolution sweep: auto-sell positions before market closes
+      if (Date.now() - lastPreResolutionSweep >= config.SETTLEMENT_SWEEP_INTERVAL_MS) {
+        try {
+          await sweepPreResolutionSells();
+          lastPreResolutionSweep = Date.now();
+        } catch (err: any) {
+          log.warn(`Pre-resolution sweep failed: ${err.message}`);
         }
       }
     } catch (err: any) {

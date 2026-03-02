@@ -1,4 +1,4 @@
-import { ClobClient, OrderType, Side, SignatureType } from '@polymarket/clob-client';
+import { AssetType, ClobClient, OrderType, Side, SignatureType } from '@polymarket/clob-client';
 import type { ApiKeyCreds, TickSize } from '@polymarket/clob-client';
 import { Wallet } from '@ethersproject/wallet';
 import { createJobLogger } from '../lib/logger';
@@ -31,6 +31,21 @@ let client: ClobClient | null = null;
 
 export function isLiveReady(): boolean {
   return client !== null;
+}
+
+export function getClient(): ClobClient | null {
+  return client;
+}
+
+export async function getWalletBalance(): Promise<{ balance: number } | null> {
+  if (!client) return null;
+  try {
+    const result = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+    return { balance: parseFloat(result?.balance ?? '0') };
+  } catch (err: any) {
+    log.warn(`Failed to fetch wallet balance: ${err.message}`);
+    return null;
+  }
 }
 
 export async function initialize(): Promise<void> {
@@ -176,6 +191,23 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
       filledSize = takingAmount > 0 ? takingAmount : null;
       filledPrice = takingAmount > 0 && makingAmount > 0
         ? makingAmount / takingAmount : null;
+    }
+
+    // Guard: if CLOB reported success but no actual fill data, treat as FAILED
+    if (filledSize == null || filledPrice == null) {
+      log.warn('Ghost fill detected: CLOB success but no fill amounts', {
+        orderId,
+        makingAmount: response?.makingAmount,
+        takingAmount: response?.takingAmount,
+      });
+      return {
+        orderId,
+        status: 'FAILED',
+        filledPrice: null,
+        filledSize: null,
+        failReason: 'ghost fill: success reported but no fill amounts',
+        transactionHashes: txHashes,
+      };
     }
 
     log.info('Order filled', {

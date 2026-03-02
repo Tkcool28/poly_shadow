@@ -66,6 +66,17 @@ const envSchema = z.object({
   STALE_TRADE_CUTOFF_MS: z.coerce.number().default(600000), // 10 min (was hardcoded 5 min)
   MIN_SELL_USD: z.coerce.number().min(0).default(0.01), // Skip dust sells below this
 
+  // CLOB reconciliation & balance check
+  BALANCE_CHECK_INTERVAL_MS: z.coerce.number().default(600000), // 10 min
+  BALANCE_MISMATCH_THRESHOLD: z.coerce.number().default(5), // $5 warn threshold
+
+  // Pre-resolution auto-sell
+  PRE_RESOLUTION_SELL_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+  PRE_RESOLUTION_SELL_WINDOW_MS: z.coerce.number().default(3600000), // 1 hour before end
+
   // Paper trade fee simulation (Polymarket formula: C × feeRate × (p × (1-p))^exponent)
   PAPER_TRADE_FEE_RATE: z.coerce.number().default(0), // 0 = no fees (most markets)
   PAPER_TRADE_FEE_EXPONENT: z.coerce.number().default(1), // 1 = sports, 2 = crypto
