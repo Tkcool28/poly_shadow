@@ -85,7 +85,7 @@ function computeMaxDrawdown(sortedPositions: ClosedPositionInput[]): number {
     }
   }
 
-  // Clamp to [0, 1] — cumulative P&L can go negative past the peak,
-  // producing values > 1.0 which break percentile ranking assumptions.
-  return Math.min(maxDrawdown.toNumber(), 1);
+  // Values > 1.0 mean cumPnl went negative past the peak (e.g., dd=1.3 = lost 130% of peak).
+  // Percentile ranking in composite.ts is order-based and handles any range.
+  return maxDrawdown.toNumber();
 }
