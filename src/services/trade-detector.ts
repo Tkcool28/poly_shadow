@@ -4,15 +4,17 @@ import { getTrades } from '../api/data-api';
 import type { RtdsTradePayload } from './ws-trade-stream';
 
 // ─── In-memory caches for WebSocket real-time path ───
+// Tracks ALL completed traders for WS filtering (not just isMonitored top-N).
+// Polling fallback in detectNewTrades() still uses its own isMonitored query.
 
-let monitoredWallets: Set<string> = new Set();
+let trackedWallets: Set<string> = new Set();
 let scoreCache: Map<string, number> = new Map(); // proxyWallet → compositeScore
 let userNameCache: Map<string, string | null> = new Map();
 let cacheRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
-export async function refreshMonitoredWallets(): Promise<void> {
+export async function refreshTrackedWallets(): Promise<void> {
   const traders = await prisma.trader.findMany({
-    where: { isMonitored: true },
+    where: { backfillStatus: 'COMPLETED' },
     select: {
       proxyWallet: true,
       userName: true,
@@ -32,16 +34,16 @@ export async function refreshMonitoredWallets(): Promise<void> {
     }
   }
 
-  monitoredWallets = wallets;
+  trackedWallets = wallets;
   scoreCache = scores;
   userNameCache = names;
-  logger.debug(`Refreshed monitored wallets cache: ${wallets.size} wallets`);
+  logger.debug(`Refreshed tracked wallets cache: ${wallets.size} wallets (all COMPLETED traders)`);
 }
 
 export async function startCacheRefresh(intervalMs = 60000): Promise<void> {
   if (cacheRefreshTimer) return;
-  await refreshMonitoredWallets();
-  cacheRefreshTimer = setInterval(() => refreshMonitoredWallets(), intervalMs);
+  await refreshTrackedWallets();
+  cacheRefreshTimer = setInterval(() => refreshTrackedWallets(), intervalMs);
 }
 
 export function stopCacheRefresh(): void {
@@ -56,7 +58,7 @@ export function stopCacheRefresh(): void {
  * Returns true if the trade was inserted (new detection), false if skipped/duplicate.
  */
 export async function handleRealtimeTrade(payload: RtdsTradePayload): Promise<boolean> {
-  if (!monitoredWallets.has(payload.proxyWallet)) return false;
+  if (!trackedWallets.has(payload.proxyWallet)) return false;
 
   const compositeScore = scoreCache.get(payload.proxyWallet) ?? null;
   const userName = userNameCache.get(payload.proxyWallet) ?? payload.name ?? null;
