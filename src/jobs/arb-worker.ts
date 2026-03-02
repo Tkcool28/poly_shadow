@@ -7,7 +7,10 @@ import { initialize as initSharedExecutor } from '../services/trade-executor';
 import { initArbExecutor } from '../services/arb/arb-executor';
 import { CryptoPriceFeed } from '../services/arb/crypto-price-feed';
 import { ArbEngine } from '../services/arb/arb-engine';
+import { sweepArbSettlements } from '../services/arb/arb-settlement';
 import { DURATION_CONFIGS, SUPPORTED_ASSETS, buildMarketConfig } from '../services/arb/arb-types';
+import { ArbCycleStatus } from '../../prisma/generated/prisma/client/enums';
+import { getMarketBySlug } from '../api/gamma-api';
 import type { SupportedAsset } from '../services/arb/arb-types';
 
 const JOB_NAME = 'arb-worker';
@@ -84,6 +87,54 @@ async function main() {
     });
   }
 
+  // Recover orphaned ENTERED cycles from previous crash
+  const orphanedCycles = await prisma.arbCycle.findMany({
+    where: { status: ArbCycleStatus.ENTERED, isPaper: config.ARB_IS_PAPER },
+  });
+
+  if (orphanedCycles.length > 0) {
+    log.warn(`Found ${orphanedCycles.length} orphaned ENTERED cycles from previous run`);
+    for (const cycle of orphanedCycles) {
+      try {
+        const market = await getMarketBySlug(cycle.slug);
+        if (market?.closed && market.outcomePrices) {
+          // Market resolved while we were down — queue for background settlement sweep
+          await prisma.arbCycle.update({
+            where: { id: cycle.id },
+            data: { settlementStartedAt: new Date() },
+          });
+          log.info(`Orphan ${cycle.slug}: market resolved, queued for settlement`);
+        } else {
+          // Market unresolved — fail and refund atomically
+          await prisma.$transaction(async (tx) => {
+            const fresh = await tx.arbCapital.findUniqueOrThrow({
+              where: { isPaper: cycle.isPaper },
+            });
+            const refundAmount = cycle.entryAmountUsd ?? 0;
+            await tx.arbCapital.update({
+              where: { isPaper: cycle.isPaper },
+              data: {
+                currentCapital: { increment: refundAmount },
+                deployedCapital: { decrement: Math.min(refundAmount, fresh.deployedCapital) },
+              },
+            });
+            await tx.arbCycle.update({
+              where: { id: cycle.id },
+              data: {
+                status: ArbCycleStatus.FAILED,
+                failReason: 'orphan recovery: market unresolved at restart',
+              },
+            });
+          });
+          log.warn(`Orphan ${cycle.slug}: failed & refunded $${(cycle.entryAmountUsd ?? 0).toFixed(2)}`);
+        }
+      } catch (err: any) {
+        log.error(`Orphan recovery failed for ${cycle.slug}: ${err.message}`);
+        // Leave in ENTERED — background sweep will pick it up
+      }
+    }
+  }
+
   // Parse assets and durations
   const assets = config.ARB_ASSETS.split(',').map((a) => a.trim().toLowerCase())
     .filter((a): a is SupportedAsset => (SUPPORTED_ASSETS as readonly string[]).includes(a));
@@ -148,6 +199,7 @@ async function main() {
   });
 
   // Main loop: tick all engines every second
+  let lastSettlementSweep = 0;
   while (!shuttingDown && !isShuttingDown()) {
     const start = Date.now();
     let processedCount = 0;
@@ -164,6 +216,16 @@ async function main() {
       result = 'error';
       errorMessage = err.message?.slice(0, 500);
       log.error(`Arb cycle failed: ${err.message}`, { stack: err.stack });
+    }
+
+    // Non-blocking settlement sweep (periodic)
+    if (Date.now() - lastSettlementSweep >= config.ARB_SETTLEMENT_SWEEP_INTERVAL_MS) {
+      try {
+        await sweepArbSettlements();
+        lastSettlementSweep = Date.now();
+      } catch (err: any) {
+        log.warn(`Arb settlement sweep failed: ${err.message}`);
+      }
     }
 
     // Update system health

@@ -435,9 +435,10 @@ model ArbCycle {
   orderId       String? // CLOB order ID
 
   // Settlement
-  settlementPrice Float?  // 1.0 (win) or 0.0 (loss)
-  pnl             Float?  // Net P&L for this cycle
-  estimatedFee    Float?  // Estimated Polymarket fee
+  settlementPrice     Float?  // 1.0 (win) or 0.0 (loss)
+  pnl                 Float?  // Net P&L for this cycle
+  estimatedFee        Float?  // Estimated Polymarket fee
+  settlementStartedAt DateTime? // When background settlement first attempted this cycle
 
   status        ArbCycleStatus @default(PENDING)
   failReason    String?
@@ -449,6 +450,7 @@ model ArbCycle {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
+  @@unique([marketType, candleStartMs, isPaper]) // One cycle per candle per engine
   @@index([status])
   @@index([marketType, candleStartMs])
   @@index([createdAt(sort: Desc)])

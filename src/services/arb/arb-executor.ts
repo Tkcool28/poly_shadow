@@ -199,6 +199,18 @@ async function executeWithClient(client: ClobClient, params: ExecuteOrderParams)
         };
       }
 
+      if (errorMsg.includes('NOT_ENOUGH_BALANCE')) {
+        log.warn('Insufficient on-chain balance for arb order', { tokenId, side, amount });
+        return {
+          orderId: null,
+          status: 'FAILED',
+          filledPrice: null,
+          filledSize: null,
+          failReason: 'insufficient balance',
+          transactionHashes: [],
+        };
+      }
+
       return {
         orderId: null,
         status: 'FAILED',

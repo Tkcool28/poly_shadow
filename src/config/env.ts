@@ -90,6 +90,10 @@ const envSchema = z.object({
   ARB_MIN_PRICE_CHANGE: z.coerce.number().default(0.0001), // 0.01% min BTC move
   ARB_MAX_CONSECUTIVE_LOSSES: z.coerce.number().min(1).default(5),
 
+  // Settlement sweep (background, non-blocking)
+  ARB_SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(10000),  // 10s sweep cadence
+  ARB_SETTLEMENT_TIMEOUT_MS: z.coerce.number().default(600000),        // 10-min resolution timeout
+
   // Fees (crypto 5/15-min markets)
   ARB_FEE_RATE: z.coerce.number().default(0.25),
   ARB_FEE_EXPONENT: z.coerce.number().default(2),

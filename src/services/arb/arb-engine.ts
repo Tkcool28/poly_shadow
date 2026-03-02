@@ -2,9 +2,8 @@ import { createJobLogger } from '../../lib/logger';
 import { prisma } from '../../lib/prisma';
 import { ArbCycleStatus } from '../../../prisma/generated/prisma/client/enums';
 import { config } from '../../config/env';
-import { getMarketBySlug } from '../../api/gamma-api';
 import { CryptoPriceFeed } from './crypto-price-feed';
-import { discoverMarket, buildSlug, pruneCache } from './market-discovery';
+import { discoverMarket, buildSlug } from './market-discovery';
 import { arbExecuteOrder, arbGetOrderBook } from './arb-executor';
 import type { ArbMarketConfig, CandleInfo, CandleState } from './arb-types';
 
@@ -25,7 +24,7 @@ export function getCandleInfo(nowMs: number, durationMs: number, epochOffsetMs =
  * Calculate Polymarket crypto fee.
  * fee = shares × feeRate × (price × (1 - price))^exponent
  */
-function calculateFee(shares: number, price: number): number {
+export function calculateFee(shares: number, price: number): number {
   if (config.ARB_FEE_RATE <= 0 || shares <= 0) return 0;
   return shares * config.ARB_FEE_RATE * Math.pow(price * (1 - price), config.ARB_FEE_EXPONENT);
 }
@@ -39,11 +38,6 @@ export class ArbEngine {
   // Current candle state
   private currentCandle: CandleState | null = null;
   private lastCandleStartMs = 0;
-
-  // Risk counters (reset daily)
-  private dailyPnl = 0;
-  private dailyResetDate = '';
-  private consecutiveLosses = 0;
 
   constructor(marketConfig: ArbMarketConfig, priceFeed: CryptoPriceFeed, isPaper: boolean) {
     this.marketConfig = marketConfig;
@@ -60,27 +54,13 @@ export class ArbEngine {
     const now = Date.now();
     const candle = getCandleInfo(now, this.marketConfig.candleDurationMs, this.marketConfig.epochOffsetMs);
 
-    // Reset daily counters at midnight UTC
-    const today = new Date().toISOString().slice(0, 10);
-    if (today !== this.dailyResetDate) {
-      this.dailyPnl = 0;
-      this.dailyResetDate = today;
-      pruneCache();
-    }
-
-    // New candle? Reset state.
+    // New candle? Reset state. Settlement handled by background sweep.
     if (candle.candleStartMs !== this.lastCandleStartMs) {
-      // If we have an unsettled candle from the previous window, settle it
-      if (this.currentCandle?.entered) {
-        await this.settleCandle();
-      }
       this.currentCandle = null;
       this.lastCandleStartMs = candle.candleStartMs;
     }
 
     // Phase 1: Begin candle (initialize if not yet done for this candle).
-    // No time gate — settlement polling can block past the first 30s, so we must
-    // always attempt initialization when currentCandle is null.
     if (!this.currentCandle) {
       await this.beginCandle(candle);
     }
@@ -93,8 +73,7 @@ export class ArbEngine {
       await this.evaluateAndEnter();
     }
 
-    // Phase 3: Settlement runs automatically when the next candle starts (line 68-72 above).
-    // The new-candle transition detects unsettled entries and calls settleCandle().
+    // Phase 3: Settlement handled by background sweep (arb-settlement.ts).
   }
 
   // ─── Phase 1: Begin candle ───
@@ -150,8 +129,8 @@ export class ArbEngine {
       }
     }
 
-    // Circuit breakers
-    const skip = this.shouldSkip();
+    // Circuit breakers (DB-backed, crash-resilient)
+    const skip = await this.shouldSkip();
     if (skip) {
       await this.recordSkip(skip);
       return;
@@ -210,42 +189,60 @@ export class ArbEngine {
     const estimatedFee = calculateFee(result.filledSize, result.filledPrice);
     const entryAmountUsd = result.filledSize * result.filledPrice;
 
-    // Update capital (decrement available, increment deployed)
-    await prisma.$transaction(async (tx) => {
-      const fresh = await tx.arbCapital.findUnique({ where: { isPaper: this.isPaper } });
-      if (!fresh || fresh.currentCapital < entryAmountUsd) {
-        throw new Error('Insufficient capital at execution time');
-      }
-      await tx.arbCapital.update({
-        where: { isPaper: this.isPaper },
-        data: {
-          currentCapital: { decrement: entryAmountUsd },
-          deployedCapital: { increment: entryAmountUsd },
-        },
+    // Atomic: capital decrement + cycle creation in single transaction
+    let cycle;
+    try {
+      cycle = await prisma.$transaction(async (tx) => {
+        const fresh = await tx.arbCapital.findUnique({ where: { isPaper: this.isPaper } });
+        if (!fresh || fresh.currentCapital < entryAmountUsd) {
+          throw new Error('Insufficient capital at execution time');
+        }
+        await tx.arbCapital.update({
+          where: { isPaper: this.isPaper },
+          data: {
+            currentCapital: { decrement: entryAmountUsd },
+            deployedCapital: { increment: entryAmountUsd },
+          },
+        });
+        return tx.arbCycle.create({
+          data: {
+            marketType: this.marketConfig.type,
+            candleStartMs: BigInt(candle.candleStartMs),
+            slug: buildSlug(this.marketConfig, candle.slugTimestamp),
+            conditionId: candle.marketInfo!.conditionId,
+            btcOpenPrice: candle.openPrice,
+            btcEntryPrice: this.priceFeed.lastPrice,
+            direction,
+            tokenId,
+            entryPrice: result.filledPrice,
+            entryShares: result.filledSize,
+            entryAmountUsd,
+            orderId: result.orderId,
+            estimatedFee,
+            status: ArbCycleStatus.ENTERED,
+            isPaper: this.isPaper,
+            enteredAt: new Date(),
+          },
+        });
       });
-    });
-
-    // Record cycle
-    const cycle = await prisma.arbCycle.create({
-      data: {
-        marketType: this.marketConfig.type,
-        candleStartMs: BigInt(candle.candleStartMs),
-        slug: buildSlug(this.marketConfig, candle.slugTimestamp),
-        conditionId: candle.marketInfo.conditionId,
-        btcOpenPrice: candle.openPrice,
-        btcEntryPrice: this.priceFeed.lastPrice,
-        direction,
-        tokenId,
-        entryPrice: result.filledPrice,
-        entryShares: result.filledSize,
-        entryAmountUsd,
+    } catch (err: any) {
+      // Handle dedup (unique constraint violation)
+      if (err.code === 'P2002') {
+        this.log.warn('Duplicate cycle detected, skipping', { market: this.marketConfig.type });
+        candle.entered = true;
+        return;
+      }
+      // Transaction failed after live order was placed — log for manual reconciliation
+      this.log.error('Entry transaction failed AFTER order fill', {
+        market: this.marketConfig.type,
         orderId: result.orderId,
-        estimatedFee,
-        status: ArbCycleStatus.ENTERED,
-        isPaper: this.isPaper,
-        enteredAt: new Date(),
-      },
-    });
+        filledSize: result.filledSize,
+        filledPrice: result.filledPrice,
+        error: err.message,
+      });
+      candle.entered = true; // Prevent re-entry
+      return;
+    }
 
     // Update candle state
     candle.entered = true;
@@ -266,146 +263,60 @@ export class ArbEngine {
     });
   }
 
-  // ─── Phase 3: Settlement ───
-
-  private async settleCandle(): Promise<void> {
-    const candle = this.currentCandle;
-    if (!candle?.entered || !candle.cycleId || !candle.marketInfo) {
-      this.currentCandle = null;
-      return;
-    }
-
-    const slug = buildSlug(this.marketConfig, candle.slugTimestamp);
-
-    // Poll for resolution (max 180s — Polymarket BTC markets can take 1-3 min to resolve)
-    let resolved = false;
-    let settlementPrice = 0;
-    const maxWait = 180_000;
-    const pollInterval = 5_000;
-    const start = Date.now();
-
-    while (Date.now() - start < maxWait) {
-      const market = await getMarketBySlug(slug);
-      if (market?.closed && market.outcomePrices) {
-        try {
-          const outcomes: string[] = JSON.parse(market.outcomes);
-          const prices: number[] = JSON.parse(market.outcomePrices).map(Number);
-          const ourOutcome = candle.entryDirection === 'UP' ? 'up' : 'down';
-          const idx = outcomes.findIndex((o) => o.toLowerCase() === ourOutcome);
-          if (idx !== -1) {
-            settlementPrice = prices[idx];
-            resolved = true;
-            break;
-          }
-        } catch {
-          // Parse error — retry
-        }
-      }
-      await new Promise((r) => setTimeout(r, pollInterval));
-    }
-
-    if (!resolved) {
-      this.log.warn(`Market ${slug} not resolved after ${maxWait / 1000}s`);
-      await prisma.arbCycle.update({
-        where: { id: candle.cycleId },
-        data: { status: ArbCycleStatus.FAILED, failReason: 'resolution timeout' },
-      });
-      // Refund capital
-      await this.refundCapital(candle.entryAmountUsd!);
-      this.currentCandle = null;
-      return;
-    }
-
-    // Calculate P&L
-    const settlementValue = (candle.entryShares ?? 0) * settlementPrice;
-    const estimatedFee = calculateFee(candle.entryShares ?? 0, candle.entryPrice ?? 0);
-    const pnl = settlementValue - (candle.entryAmountUsd ?? 0) - estimatedFee;
-    const won = settlementPrice >= 0.95;
-
-    // Update capital
-    await prisma.$transaction(async (tx) => {
-      const fresh = await tx.arbCapital.findUniqueOrThrow({ where: { isPaper: this.isPaper } });
-      await tx.arbCapital.update({
-        where: { isPaper: this.isPaper },
-        data: {
-          currentCapital: { increment: settlementValue },
-          deployedCapital: { decrement: Math.min(candle.entryAmountUsd!, fresh.deployedCapital) },
-          totalPnl: { increment: pnl },
-          totalCycles: { increment: 1 },
-          totalWins: { increment: won ? 1 : 0 },
-        },
-      });
-    });
-
-    // Update cycle record
-    await prisma.arbCycle.update({
-      where: { id: candle.cycleId },
-      data: {
-        status: won ? ArbCycleStatus.WON : ArbCycleStatus.LOST,
-        settlementPrice,
-        pnl,
-        estimatedFee,
-        btcClosePrice: this.priceFeed.lastPrice,
-        resolvedAt: new Date(),
-      },
-    });
-
-    // Update risk counters
-    if (won) {
-      this.consecutiveLosses = 0;
-    } else {
-      this.consecutiveLosses++;
-    }
-    this.dailyPnl += pnl;
-
-    this.log.info(`${won ? 'WON' : 'LOST'} ${candle.entryDirection}`, {
-      market: this.marketConfig.type,
-      settlementPrice: settlementPrice.toFixed(4),
-      pnl: `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`,
-      dailyPnl: `$${this.dailyPnl.toFixed(2)}`,
-      consecutiveLosses: this.consecutiveLosses,
-    });
-
-    this.currentCandle = null;
-  }
-
   // ─── Helpers ───
 
-  private shouldSkip(): string | null {
-    if (this.consecutiveLosses >= config.ARB_MAX_CONSECUTIVE_LOSSES) {
-      return `circuit breaker: ${this.consecutiveLosses} consecutive losses`;
-    }
-    if (this.dailyPnl <= -config.ARB_MAX_DAILY_LOSS_USD) {
-      return `daily loss limit: $${this.dailyPnl.toFixed(2)}`;
-    }
+  /**
+   * DB-backed circuit breakers (crash-resilient, no in-memory state).
+   * - Daily PnL: GLOBAL across all market types (protects total arb exposure)
+   * - Consecutive losses: PER-ENGINE (each market type has independent streaks)
+   */
+  private async shouldSkip(): Promise<string | null> {
+    // Price feed checks (fast, no DB)
     if (this.priceFeed.priceAge > 5000) {
       return `${this.marketConfig.asset.toUpperCase()} price feed stale`;
     }
     if (this.priceFeed.state !== 'connected') {
       return `${this.marketConfig.asset.toUpperCase()} feed: ${this.priceFeed.state}`;
     }
+
+    // Daily loss: GLOBAL across all market types
+    const todayStart = new Date();
+    todayStart.setUTCHours(0, 0, 0, 0);
+    const todayStats = await prisma.arbCycle.aggregate({
+      where: {
+        isPaper: this.isPaper,
+        createdAt: { gte: todayStart },
+        status: { in: [ArbCycleStatus.WON, ArbCycleStatus.LOST] },
+      },
+      _sum: { pnl: true },
+    });
+    const dailyPnl = todayStats._sum.pnl ?? 0;
+    if (dailyPnl <= -config.ARB_MAX_DAILY_LOSS_USD) {
+      return `daily loss limit: $${dailyPnl.toFixed(2)}`;
+    }
+
+    // Consecutive losses: per-engine (each market has independent streaks)
+    const recentCycles = await prisma.arbCycle.findMany({
+      where: {
+        isPaper: this.isPaper,
+        marketType: this.marketConfig.type,
+        status: { in: [ArbCycleStatus.WON, ArbCycleStatus.LOST] },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: config.ARB_MAX_CONSECUTIVE_LOSSES,
+      select: { status: true },
+    });
+    const firstWinIdx = recentCycles.findIndex((c) => c.status !== ArbCycleStatus.LOST);
+    const consecutiveLosses = firstWinIdx === -1 ? recentCycles.length : firstWinIdx;
+    if (consecutiveLosses >= config.ARB_MAX_CONSECUTIVE_LOSSES) {
+      return `circuit breaker: ${consecutiveLosses} consecutive losses`;
+    }
+
     return null;
   }
 
   private async getCapital() {
     return prisma.arbCapital.findUnique({ where: { isPaper: this.isPaper } });
-  }
-
-  private async refundCapital(amount: number): Promise<void> {
-    try {
-      await prisma.$transaction(async (tx) => {
-        const fresh = await tx.arbCapital.findUniqueOrThrow({ where: { isPaper: this.isPaper } });
-        await tx.arbCapital.update({
-          where: { isPaper: this.isPaper },
-          data: {
-            currentCapital: { increment: amount },
-            deployedCapital: { decrement: Math.min(amount, fresh.deployedCapital) },
-          },
-        });
-      });
-    } catch (err: any) {
-      this.log.error(`Capital refund failed: ${err.message}`);
-    }
   }
 
   private async recordSkip(reason: string): Promise<void> {
@@ -432,7 +343,7 @@ export class ArbEngine {
         },
       });
     } catch {
-      // Non-critical — skip recording errors silently
+      // Non-critical — skip recording errors silently (includes P2002 dedup)
     }
 
     this.currentCandle.entered = true; // Prevent re-entry attempts
