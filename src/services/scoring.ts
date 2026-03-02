@@ -8,6 +8,7 @@ import { computeCategoryScores } from '../scoring/category';
 import { computeRisk } from '../scoring/risk';
 import { computeRecency } from '../scoring/recency';
 import { computeCompositeScores } from '../scoring/composite';
+import { partitionPositions } from '../scoring/expired-position-detector';
 
 export async function calculateAllScores(): Promise<number> {
   // Only score traders with completed backfill
@@ -22,8 +23,13 @@ export async function calculateAllScores(): Promise<number> {
 
   // Fetch markets once for all traders (Critical #1 fix)
   const markets = await prisma.market.findMany({
-    select: { conditionId: true, category: true },
+    select: { conditionId: true, category: true, closed: true },
   });
+
+  // Pre-compute closed market set for expired position detection
+  const closedMarketConditionIds = new Set(
+    markets.filter(m => m.closed).map(m => m.conditionId),
+  );
 
   // Compute individual metrics for each trader
   const traderScores: Array<{
@@ -38,7 +44,7 @@ export async function calculateAllScores(): Promise<number> {
 
   for (const { proxyWallet } of traders) {
     try {
-      const metrics = await computeTraderMetrics(proxyWallet);
+      const metrics = await computeTraderMetrics(proxyWallet, closedMarketConditionIds);
       if (metrics) {
         traderScores.push(metrics);
       }
@@ -82,31 +88,53 @@ export async function calculateAllScores(): Promise<number> {
   return traderScores.length;
 }
 
-async function computeTraderMetrics(proxyWallet: string) {
-  const [trades, closedPositions, positions] = await Promise.all([
+async function computeTraderMetrics(
+  proxyWallet: string,
+  closedMarketConditionIds: Set<string>,
+) {
+  const [trades, dbClosedPositions, positions] = await Promise.all([
     prisma.trade.findMany({
       where: { proxyWallet },
       select: { conditionId: true, size: true, price: true, timestamp: true, side: true },
     }),
     prisma.closedPosition.findMany({
       where: { proxyWallet },
-      select: { conditionId: true, realizedPnl: true, totalBought: true, timestamp: true },
+      select: { asset: true, conditionId: true, realizedPnl: true, totalBought: true, timestamp: true },
     }),
     prisma.position.findMany({
       where: { proxyWallet },
-      select: { cashPnl: true, initialValue: true },
+      select: {
+        asset: true, conditionId: true, cashPnl: true, initialValue: true,
+        curPrice: true, currentValue: true, endDate: true, snapshotAt: true,
+      },
     }),
   ]);
 
-  if (trades.length === 0 && closedPositions.length === 0) return null;
+  if (trades.length === 0 && dbClosedPositions.length === 0 && positions.length === 0) return null;
 
-  const profitability = computeProfitability(closedPositions, positions);
-  const consistency = computeConsistency(closedPositions);
-  const activity = computeActivity(trades, closedPositions);
+  // Partition open positions into truly-open vs expired/resolved
+  const dbClosedAssets = new Set(dbClosedPositions.map(cp => cp.asset));
+  const { trulyOpen, syntheticClosed } = partitionPositions(
+    positions, closedMarketConditionIds, dbClosedAssets,
+  );
+
+  if (syntheticClosed.length > 0) {
+    logger.debug(
+      `${proxyWallet.slice(0, 10)}: ${positions.length} open → ` +
+      `${trulyOpen.length} truly open, ${syntheticClosed.length} expired/resolved`,
+    );
+  }
+
+  // Merge DB closed positions + synthetic closed positions
+  const allClosedPositions = [...dbClosedPositions, ...syntheticClosed];
+
+  const profitability = computeProfitability(allClosedPositions, trulyOpen);
+  const consistency = computeConsistency(allClosedPositions);
+  const activity = computeActivity(trades, allClosedPositions);
   const risk = computeRisk(trades);
-  const recency = computeRecency(closedPositions);
+  const recency = computeRecency(allClosedPositions);
 
-  return { proxyWallet, profitability, consistency, activity, risk, recency, closedPositions };
+  return { proxyWallet, profitability, consistency, activity, risk, recency, closedPositions: allClosedPositions };
 }
 
 async function upsertScores(
