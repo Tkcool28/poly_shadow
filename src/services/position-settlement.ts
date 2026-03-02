@@ -152,6 +152,29 @@ export async function sweepPositionSettlements(): Promise<void> {
 
     if (netShares <= 0 || totalBuyShares <= 0) continue;
 
+    // Guard: defer settlement if a recent SELL is in-flight — prevents double-credit
+    // with pre-resolution seller. 120s recency window ensures stale PENDING SELLs
+    // from prior crashes (handled by reconcileStalePending at startup) don't block
+    // settlement permanently.
+    const pendingSell = await prisma.copyTrade.findFirst({
+      where: {
+        tokenId: pos.tokenId,
+        followAllocationId: pos.followAllocationId,
+        isPaper: pos.isPaper,
+        side: 'SELL',
+        status: 'PENDING',
+        createdAt: { gte: new Date(Date.now() - 120_000) },
+      },
+      select: { id: true },
+    });
+    if (pendingSell) {
+      log.debug('Settlement: deferring — recent SELL in-flight', {
+        tokenId: pos.tokenId.slice(0, 20),
+        pendingSellId: pendingSell.id,
+      });
+      continue;
+    }
+
     const avgCostPerShare = totalBuyCost / totalBuyShares;
     const remainingCostBasis = avgCostPerShare * netShares;
     const settlementValue = netShares * settlementPrice;

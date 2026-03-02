@@ -29,8 +29,24 @@ const metadataCache = new Map<string, { tickSize: TickSize; negRisk: boolean }>(
 
 let client: ClobClient | null = null;
 
+let consecutiveBalanceFailures = 0;
+let balancePaused = false;
+const BALANCE_PAUSE_THRESHOLD = 3;
+
 export function isLiveReady(): boolean {
   return client !== null;
+}
+
+export function isBalancePaused(): boolean {
+  return balancePaused;
+}
+
+export function resetBalancePause(): void {
+  if (balancePaused) {
+    log.info('Balance pause cleared — resuming live trade execution');
+  }
+  balancePaused = false;
+  consecutiveBalanceFailures = 0;
 }
 
 export function getClient(): ClobClient | null {
@@ -151,7 +167,18 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
       }
 
       if (errorMsg.includes('NOT_ENOUGH_BALANCE')) {
-        log.warn('Insufficient balance for copy trade', { tokenId, side, amount });
+        consecutiveBalanceFailures++;
+        if (consecutiveBalanceFailures >= BALANCE_PAUSE_THRESHOLD) {
+          balancePaused = true;
+          log.error('LIVE TRADING PAUSED: consecutive NOT_ENOUGH_BALANCE failures', {
+            threshold: BALANCE_PAUSE_THRESHOLD,
+            consecutiveFailures: consecutiveBalanceFailures,
+          });
+        } else {
+          log.warn('Insufficient balance for copy trade', {
+            tokenId, side, amount, consecutiveFailures: consecutiveBalanceFailures,
+          });
+        }
         return {
           orderId: null,
           status: 'FAILED',
@@ -209,6 +236,8 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
         transactionHashes: txHashes,
       };
     }
+
+    resetBalancePause(); // clear any prior balance failure count on successful fill
 
     log.info('Order filled', {
       orderId,

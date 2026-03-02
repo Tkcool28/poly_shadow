@@ -1,7 +1,7 @@
 import { prisma } from '../lib/prisma';
 import { createJobLogger } from '../lib/logger';
 import { config } from '../config/env';
-import { executeMarketOrder as realExecute } from './trade-executor';
+import { executeMarketOrder as realExecute, isBalancePaused } from './trade-executor';
 import { executeMarketOrder as paperExecute } from './paper-executor';
 import type { ExecuteOrderResult } from './trade-executor';
 import { addToPool } from './order-pool';
@@ -46,6 +46,12 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   }
 
   const isPaper = allocation.isPaper;
+
+  // Skip live trades when wallet balance is insufficient — paper allocations continue normally
+  if (!isPaper && isBalancePaused()) {
+    await createSkippedRecord(trade, 'live trading paused: insufficient wallet balance', allocation.id, isPaper);
+    return;
+  }
 
   // Check cached trader portfolio value
   if (!allocation.traderPortfolioValue || allocation.traderPortfolioValue <= 0) {

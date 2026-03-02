@@ -3,7 +3,7 @@ import { createJobLogger } from '../lib/logger';
 import { prisma } from '../lib/prisma';
 import { config } from '../config/env';
 import { isShuttingDown } from '../lib/shutdown';
-import { initialize as initExecutor, isLiveReady, getWalletBalance } from '../services/trade-executor';
+import { initialize as initExecutor, isLiveReady, getWalletBalance, resetBalancePause } from '../services/trade-executor';
 import { processCopyTrade } from '../services/copy-trade-worker';
 import { startPortfolioRefresh, stopPortfolioRefresh } from '../services/portfolio-cache';
 import { rehydratePool, sweepPool } from '../services/order-pool';
@@ -175,8 +175,11 @@ async function main() {
                 dbCurrentCapital: dbCapital.toFixed(2),
               });
             }
+            // Any successful wallet fetch clears the balance pause.
+            // The circuit breaker re-engages immediately if the next live trade still fails.
+            resetBalancePause();
+            lastBalanceCheck = Date.now();
           }
-          lastBalanceCheck = Date.now();
         } catch (err: any) {
           log.warn(`Balance check failed: ${err.message}`);
         }
