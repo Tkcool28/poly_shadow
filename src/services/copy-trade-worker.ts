@@ -99,17 +99,10 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     copyAmountUsd = Math.min(copyAmountUsd, config.MAX_POSITION_USD);
   }
 
-  if (trade.side === 'BUY' && copyAmountUsd < CLOB_MIN_ORDER_USD) {
-    await addToPool(trade, copyAmountUsd, { id: allocation.id, isPaper });
-    return;
-  }
-
-  if (trade.side === 'BUY' && copyAmountUsd > allocation.currentCapital) {
-    await createSkippedRecord(trade, 'insufficient allocated capital', allocation.id, isPaper);
-    return;
-  }
-
   // ─── Per-allocation daily spend check (BUY only) ───
+  // Done before pool routing so pool entries also respect daily limits.
+  // Caps copyAmountUsd to remaining budget rather than hard-blocking, so
+  // traders with large single-trade sizes (vs small allocation) can still execute.
 
   if (trade.side === 'BUY') {
     const todayStart = new Date();
@@ -126,9 +119,13 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     });
     const spent = todayBuySpend._sum.requestedAmount ?? 0;
     const dailyLimit = allocation.initialCapital * 0.20;
-    if (spent + copyAmountUsd > dailyLimit) {
+    const remaining = dailyLimit - spent;
+    if (remaining <= 0) {
       await createSkippedRecord(trade, 'per-allocation daily limit reached', allocation.id, isPaper);
       return;
+    }
+    if (copyAmountUsd > remaining) {
+      copyAmountUsd = remaining; // cap to remaining budget, execute at reduced size
     }
 
     // Global daily backstop (across all allocations, scoped by paper/live)
@@ -141,10 +138,24 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       },
       _sum: { requestedAmount: true },
     });
-    if ((globalSpend._sum.requestedAmount ?? 0) + copyAmountUsd > config.MAX_DAILY_LOSS_USD) {
+    const globalRemaining = config.MAX_DAILY_LOSS_USD - (globalSpend._sum.requestedAmount ?? 0);
+    if (globalRemaining <= 0) {
       await createSkippedRecord(trade, 'global daily loss limit reached', allocation.id, isPaper);
       return;
     }
+    if (copyAmountUsd > globalRemaining) {
+      copyAmountUsd = globalRemaining;
+    }
+  }
+
+  if (trade.side === 'BUY' && copyAmountUsd < CLOB_MIN_ORDER_USD) {
+    await addToPool(trade, copyAmountUsd, { id: allocation.id, isPaper });
+    return;
+  }
+
+  if (trade.side === 'BUY' && copyAmountUsd > allocation.currentCapital) {
+    await createSkippedRecord(trade, 'insufficient allocated capital', allocation.id, isPaper);
+    return;
   }
 
   // ─── Convert amount for executor ───
