@@ -47,8 +47,8 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
 
   const isPaper = allocation.isPaper;
 
-  // Skip live trades when wallet balance is insufficient — paper allocations continue normally
-  if (!isPaper && isBalancePaused()) {
+  // Skip live BUYs when wallet balance is insufficient — SELLs and paper allocations continue normally
+  if (!isPaper && trade.side === 'BUY' && isBalancePaused()) {
     await createSkippedRecord(trade, 'live trading paused: insufficient wallet balance', allocation.id, isPaper);
     return;
   }

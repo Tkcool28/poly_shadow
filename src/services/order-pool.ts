@@ -1,7 +1,7 @@
 import { prisma } from '../lib/prisma';
 import { createJobLogger } from '../lib/logger';
 import { config } from '../config/env';
-import { executeMarketOrder as realExecute } from './trade-executor';
+import { executeMarketOrder as realExecute, isBalancePaused } from './trade-executor';
 import { executeMarketOrder as paperExecute } from './paper-executor';
 import type { ExecuteOrderResult } from './trade-executor';
 
@@ -263,22 +263,33 @@ async function fireBucket(bucket: PoolBucket): Promise<void> {
   const executeFn = isPaper ? paperExecute : realExecute;
 
   let result: ExecuteOrderResult;
-  try {
-    result = await executeFn({
-      tokenId,
-      side: side as 'BUY' | 'SELL',
-      amount: executorAmount,
-      detectedPrice: latestPrice,
-    });
-  } catch (err: any) {
+  if (!isPaper && isBalancePaused()) {
     result = {
       orderId: null,
       status: 'FAILED',
       filledPrice: null,
       filledSize: null,
-      failReason: err.message?.slice(0, 500),
+      failReason: 'live trading paused: insufficient wallet balance',
       transactionHashes: [],
     };
+  } else {
+    try {
+      result = await executeFn({
+        tokenId,
+        side: side as 'BUY' | 'SELL',
+        amount: executorAmount,
+        detectedPrice: latestPrice,
+      });
+    } catch (err: any) {
+      result = {
+        orderId: null,
+        status: 'FAILED',
+        filledPrice: null,
+        filledSize: null,
+        failReason: err.message?.slice(0, 500),
+        transactionHashes: [],
+      };
+    }
   }
 
   // Update all CopyTrade records in this bucket

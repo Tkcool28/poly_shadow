@@ -178,8 +178,8 @@ async function main() {
             // Any successful wallet fetch clears the balance pause.
             // The circuit breaker re-engages immediately if the next live trade still fails.
             resetBalancePause();
-            lastBalanceCheck = Date.now();
           }
+          lastBalanceCheck = Date.now();
         } catch (err: any) {
           log.warn(`Balance check failed: ${err.message}`);
         }
