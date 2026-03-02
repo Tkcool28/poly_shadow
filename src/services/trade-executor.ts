@@ -159,10 +159,20 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
     const makingAmount = parseFloat(response?.makingAmount || '0');
     const takingAmount = parseFloat(response?.takingAmount || '0');
 
-    // For BUY: filledSize = makingAmount (shares received), filledPrice = takingAmount/makingAmount
-    // For SELL: filledSize = takingAmount (USDC received), filledPrice = takingAmount/makingAmount
-    const filledSize = makingAmount > 0 ? makingAmount : null;
-    const filledPrice = makingAmount > 0 && takingAmount > 0 ? takingAmount / makingAmount : null;
+    let filledSize: number | null;
+    let filledPrice: number | null;
+
+    if (side === 'BUY') {
+      // BUY: makingAmount = shares received, takingAmount = USDC paid
+      filledSize = makingAmount > 0 ? makingAmount : null;
+      filledPrice = makingAmount > 0 && takingAmount > 0
+        ? takingAmount / makingAmount : null;
+    } else {
+      // SELL: makingAmount = USDC received, takingAmount = shares given
+      filledSize = takingAmount > 0 ? takingAmount : null;
+      filledPrice = takingAmount > 0 && makingAmount > 0
+        ? makingAmount / takingAmount : null;
+    }
 
     log.info('Order filled', {
       orderId,

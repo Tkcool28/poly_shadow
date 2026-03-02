@@ -7,6 +7,7 @@ import { initialize as initExecutor } from '../services/trade-executor';
 import { processCopyTrade } from '../services/copy-trade-worker';
 import { startPortfolioRefresh, stopPortfolioRefresh } from '../services/portfolio-cache';
 import { rehydratePool, sweepPool } from '../services/order-pool';
+import { sweepPositionSettlements } from '../services/position-settlement';
 
 const JOB_NAME = 'copy-trader';
 const log = createJobLogger(JOB_NAME);
@@ -58,6 +59,9 @@ async function main() {
     log.warn(`Pool rehydration failed: ${err.message}`);
   }
 
+  // Settlement sweep throttle
+  let lastSettlementSweep = 0;
+
   // Main loop: drain DetectedTrade queue
   while (!shuttingDown && !isShuttingDown()) {
     const start = Date.now();
@@ -108,6 +112,16 @@ async function main() {
       }
       // Sweep pool: burn expired FIFO entries
       await sweepPool();
+
+      // Settlement sweep: settle resolved market positions
+      if (Date.now() - lastSettlementSweep >= config.SETTLEMENT_SWEEP_INTERVAL_MS) {
+        try {
+          await sweepPositionSettlements();
+          lastSettlementSweep = Date.now();
+        } catch (err: any) {
+          log.warn(`Settlement sweep failed: ${err.message}`);
+        }
+      }
     } catch (err: any) {
       result = 'error';
       errorMessage = err.message?.slice(0, 500);

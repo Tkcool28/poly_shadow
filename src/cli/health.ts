@@ -105,10 +105,11 @@ export async function showHealth() {
   }
 
   // Copy trade stats
-  const [liveCopyTrades, paperCopyTrades, pooledCopyTrades] = await Promise.all([
+  const [liveCopyTrades, paperCopyTrades, pooledCopyTrades, settledCopyTrades] = await Promise.all([
     prisma.copyTrade.count({ where: { isPaper: false } }),
     prisma.copyTrade.count({ where: { isPaper: true } }),
     prisma.copyTrade.count({ where: { status: 'POOLED' } }),
+    prisma.copyTrade.count({ where: { status: 'SETTLED' } }),
   ]);
 
   // Data stats
@@ -119,4 +120,5 @@ export async function showHealth() {
   console.log(`  Copy trades (live): ${liveCopyTrades}`);
   console.log(`  Copy trades (paper): ${paperCopyTrades}`);
   console.log(`  Copy trades (pooled): ${pooledCopyTrades}`);
+  console.log(`  Copy trades (settled): ${settledCopyTrades}`);
 }

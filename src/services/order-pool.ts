@@ -54,6 +54,8 @@ export async function addToPool(
   copyAmountUsd: number,
   allocation: { id: string; isPaper: boolean },
 ): Promise<void> {
+  if (trade.side === 'SELL') return; // SELLs should never be pooled
+
   // 1. Create POOLED CopyTrade record (audit trail)
   let copyTradeId: string;
   try {

@@ -53,16 +53,30 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     return;
   }
 
-  // ─── Percentage-based sizing ───
+  // ─── Sizing ───
 
-  const tradeUsdValue = trade.size * trade.price;
-  const tradePercent = tradeUsdValue / allocation.traderPortfolioValue;
-  const cappedPercent = Math.min(tradePercent, config.MAX_TRADE_PERCENT);
+  let copyAmountUsd: number;
+  let sellShares: number | null = null;
+  let cappedPercent: number | null = null;
 
-  let copyAmountUsd = cappedPercent * allocation.currentCapital;
-  copyAmountUsd = Math.min(copyAmountUsd, config.MAX_POSITION_USD);
+  if (trade.side === 'SELL') {
+    const heldShares = await getHeldShares(trade.asset, allocation.id, isPaper);
+    if (heldShares <= 0) {
+      await createSkippedRecord(trade, 'no shares held to sell', allocation.id, isPaper);
+      return;
+    }
+    // Full position close — when trader sells, we exit entirely
+    sellShares = heldShares;
+    copyAmountUsd = sellShares * trade.price;
+  } else {
+    const tradeUsdValue = trade.size * trade.price;
+    const tradePercent = tradeUsdValue / allocation.traderPortfolioValue;
+    cappedPercent = Math.min(tradePercent, config.MAX_TRADE_PERCENT);
+    copyAmountUsd = cappedPercent * allocation.currentCapital;
+    copyAmountUsd = Math.min(copyAmountUsd, config.MAX_POSITION_USD);
+  }
 
-  if (copyAmountUsd < config.POOL_MIN_AMOUNT_USD) {
+  if (trade.side === 'BUY' && copyAmountUsd < config.POOL_MIN_AMOUNT_USD) {
     await addToPool(trade, copyAmountUsd, { id: allocation.id, isPaper });
     return;
   }
@@ -110,31 +124,23 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     }
   }
 
-  // ─── Global open positions backstop ───
+  // ─── Global open positions backstop (BUY only — SELLs reduce positions) ───
 
-  const [globalBuys, globalSells] = await Promise.all([
-    prisma.copyTrade.count({ where: { status: 'FILLED', side: 'BUY', isPaper } }),
-    prisma.copyTrade.count({ where: { status: 'FILLED', side: 'SELL', isPaper } }),
-  ]);
-  const globalOpenPositions = Math.max(globalBuys - globalSells, 0);
+  if (trade.side === 'BUY') {
+    const result = await prisma.$queryRaw<{ count: bigint }[]>`
+      SELECT COUNT(*) as count FROM (
+        SELECT "tokenId"
+        FROM "CopyTrade"
+        WHERE status = 'FILLED' AND "isPaper" = ${isPaper}
+        GROUP BY "tokenId"
+        HAVING SUM(CASE WHEN side = 'BUY' THEN 1 ELSE 0 END) >
+               SUM(CASE WHEN side = 'SELL' THEN 1 ELSE 0 END)
+      ) AS open_positions
+    `;
+    const globalOpenPositions = Number(result[0]?.count ?? 0);
 
-  if (globalOpenPositions >= config.MAX_OPEN_POSITIONS) {
-    await createSkippedRecord(trade, 'global max open positions reached', allocation.id, isPaper);
-    return;
-  }
-
-  // SELL guard: only sell tokens we hold (scoped to this allocation)
-  if (trade.side === 'SELL') {
-    const hasBuyPosition = await prisma.copyTrade.findFirst({
-      where: {
-        tokenId: trade.asset,
-        side: 'BUY',
-        status: 'FILLED',
-        followAllocationId: allocation.id,
-      },
-    });
-    if (!hasBuyPosition) {
-      await createSkippedRecord(trade, 'no position to sell', allocation.id, isPaper);
+    if (globalOpenPositions >= config.MAX_OPEN_POSITIONS) {
+      await createSkippedRecord(trade, 'global max open positions reached', allocation.id, isPaper);
       return;
     }
   }
@@ -145,7 +151,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   // SELL: executor expects share count
   const executorAmount = trade.side === 'BUY'
     ? copyAmountUsd
-    : copyAmountUsd / trade.price;
+    : sellShares!;
 
   // ─── Execute ───
 
@@ -252,7 +258,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       side: trade.side,
       outcome: trade.outcome,
       title: trade.title?.slice(0, 50),
-      tradePercent: (cappedPercent * 100).toFixed(2) + '%',
+      tradePercent: cappedPercent != null ? (cappedPercent * 100).toFixed(2) + '%' : 'full-close',
       copyAmountUsd: copyAmountUsd.toFixed(2),
       filledPrice: result.filledPrice,
       filledSize: result.filledSize,
@@ -279,6 +285,33 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       latencyMs,
     });
   }
+}
+
+async function getHeldShares(
+  tokenId: string,
+  followAllocationId: string,
+  isPaper: boolean,
+): Promise<number> {
+  const fills = await prisma.copyTrade.findMany({
+    where: { tokenId, followAllocationId, isPaper, status: 'FILLED' },
+    select: { side: true, filledSize: true, filledPrice: true, requestedAmount: true },
+  });
+
+  let netShares = 0;
+  for (const fill of fills) {
+    if (fill.side === 'BUY') {
+      if (fill.filledSize != null) {
+        netShares += fill.filledSize;
+      } else {
+        const price = fill.filledPrice ?? 1;
+        netShares += fill.requestedAmount / price;
+        log.warn('getHeldShares: BUY fill missing filledSize, using fallback', { tokenId, fillPrice: price });
+      }
+    } else {
+      netShares -= fill.filledSize ?? 0;
+    }
+  }
+  return Math.max(netShares, 0);
 }
 
 async function createSkippedRecord(
