@@ -78,8 +78,8 @@ export async function calculateAllScores(): Promise<number> {
     await upsertScores(ts, composite, markets);
   }
 
-  // Update isMonitored: top N traders (atomically via transaction — Suggestion #9)
-  await updateMonitoredTraders(config.TOP_N_THRESHOLD);
+  // Update isMonitored: all COMPLETED traders
+  await updateMonitoredTraders();
 
   // Prune old data
   await pruneData();
@@ -204,44 +204,19 @@ async function upsertScores(
   }
 }
 
-async function updateMonitoredTraders(topN: number) {
-  // Atomic update via transaction (Suggestion #9 fix)
+async function updateMonitoredTraders() {
   await prisma.$transaction(async (tx) => {
     await tx.trader.updateMany({
       where: { isMonitored: true },
       data: { isMonitored: false },
     });
 
-    const topScores = await tx.traderScore.findMany({
-      orderBy: { compositeScore: 'desc' },
-      take: topN,
-      select: { proxyWallet: true },
+    const result = await tx.trader.updateMany({
+      where: { backfillStatus: 'COMPLETED' },
+      data: { isMonitored: true },
     });
 
-    if (topScores.length > 0) {
-      await tx.trader.updateMany({
-        where: { proxyWallet: { in: topScores.map(s => s.proxyWallet) } },
-        data: { isMonitored: true },
-      });
-    }
-
-    // Protect manually followed traders — always keep them monitored
-    const activeFollows = await tx.followAllocation.findMany({
-      where: { isActive: true },
-      select: { proxyWallet: true },
-    });
-    if (activeFollows.length > 0) {
-      await tx.trader.updateMany({
-        where: { proxyWallet: { in: activeFollows.map(f => f.proxyWallet) } },
-        data: { isMonitored: true },
-      });
-    }
-
-    const uniqueWallets = new Set([
-      ...topScores.map(s => s.proxyWallet),
-      ...activeFollows.map(f => f.proxyWallet),
-    ]);
-    logger.info(`Updated monitored traders: ${topScores.length} by score + ${activeFollows.length} by follow allocation = ${uniqueWallets.size} unique`);
+    logger.info(`Updated monitored traders: ${result.count} (all COMPLETED)`);
   });
 }
 

@@ -4,8 +4,8 @@ import { getTrades } from '../api/data-api';
 import type { RtdsTradePayload } from './ws-trade-stream';
 
 // ─── In-memory caches for WebSocket real-time path ───
-// Tracks ALL completed traders for WS filtering (not just isMonitored top-N).
-// Polling fallback in detectNewTrades() still uses its own isMonitored query.
+// Tracks ALL completed traders for WS filtering.
+// Polling fallback in detectNewTrades() uses isMonitored (= all COMPLETED traders).
 
 let trackedWallets: Set<string> = new Set();
 let scoreCache: Map<string, number> = new Map(); // proxyWallet → compositeScore

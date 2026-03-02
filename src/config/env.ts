@@ -7,7 +7,6 @@ const envSchema = z.object({
   BACKFILL_POLL_INTERVAL_MS: z.coerce.number().default(60000),
   SCORE_RECALC_INTERVAL_MS: z.coerce.number().default(21600000),
   TRADE_MONITOR_INTERVAL_MS: z.coerce.number().default(120000),
-  TOP_N_THRESHOLD: z.coerce.number().default(20),
   PROXY_ENABLED: z
     .string()
     .default('false')
