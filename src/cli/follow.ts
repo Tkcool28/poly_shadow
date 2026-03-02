@@ -1,5 +1,6 @@
 import { prisma } from '../lib/prisma';
 import { refreshSingleTrader } from '../services/portfolio-cache';
+import { calculateUnrealizedPnl, type UnrealizedPnlResult } from '../services/unrealized-pnl';
 
 async function resolveTrader(identifier: string) {
   // Try by userName (case-insensitive)
@@ -150,6 +151,15 @@ export async function listFollows(): Promise<void> {
     return;
   }
 
+  // Fetch unrealized P&L (graceful degradation if Gamma API is down)
+  let unrealizedMap: Map<string, UnrealizedPnlResult> | null = null;
+  try {
+    console.log('Fetching current market prices...');
+    unrealizedMap = await calculateUnrealizedPnl(allocations.map(a => a.id));
+  } catch (err: any) {
+    console.log(`  Warning: Could not fetch market prices (${err.message}). Showing without unrealized P&L.\n`);
+  }
+
   const header = [
     'Username'.padEnd(15),
     'Mode'.padEnd(7),
@@ -157,7 +167,8 @@ export async function listFollows(): Promise<void> {
     'Initial'.padStart(10),
     'Current'.padStart(10),
     'Deployed'.padStart(10),
-    'P&L'.padStart(10),
+    'Unrealized'.padStart(12),
+    'Total P&L'.padStart(12),
     'Portfolio'.padStart(12),
   ].join('  ');
 
@@ -165,12 +176,32 @@ export async function listFollows(): Promise<void> {
   console.log(`  ${header}`);
   console.log('  ' + '-'.repeat(header.length));
 
+  let anyStale = false;
+
   for (const alloc of allocations) {
     const name = (alloc.trader.userName ?? alloc.trader.proxyWallet.slice(0, 10)).slice(0, 15);
     const mode = alloc.isPaper ? 'PAPER' : 'LIVE';
     const status = alloc.isActive ? 'ACTIVE' : 'PAUSED';
-    const pnl = alloc.currentCapital + alloc.deployedCapital - alloc.initialCapital;
-    const pnlStr = (pnl >= 0 ? '+' : '') + pnl.toFixed(2);
+
+    const data = unrealizedMap?.get(alloc.id);
+    const unrealized = data?.unrealizedPnl ?? null;
+    const mktValue = data?.marketValue ?? null;
+
+    // Total P&L: mark-to-market if available, else fall back to book value
+    const totalPnl = mktValue != null
+      ? alloc.currentCapital + mktValue - alloc.initialCapital
+      : alloc.currentCapital + alloc.deployedCapital - alloc.initialCapital;
+
+    let unrealizedStr: string;
+    if (unrealized != null) {
+      const stale = data?.hasStaleData ? '*' : '';
+      if (stale) anyStale = true;
+      unrealizedStr = (unrealized >= 0 ? '+' : '') + unrealized.toFixed(2) + stale;
+    } else {
+      unrealizedStr = 'N/A';
+    }
+
+    const totalPnlStr = (totalPnl >= 0 ? '+' : '') + totalPnl.toFixed(2);
     const portfolioStr = alloc.traderPortfolioValue
       ? `$${alloc.traderPortfolioValue.toFixed(0)}`
       : 'N/A';
@@ -182,11 +213,16 @@ export async function listFollows(): Promise<void> {
       `$${alloc.initialCapital.toFixed(2)}`.padStart(10),
       `$${alloc.currentCapital.toFixed(2)}`.padStart(10),
       `$${alloc.deployedCapital.toFixed(2)}`.padStart(10),
-      pnlStr.padStart(10),
+      unrealizedStr.padStart(12),
+      totalPnlStr.padStart(12),
       portfolioStr.padStart(12),
     ].join('  ');
 
     console.log(`  ${row}`);
+  }
+
+  if (anyStale) {
+    console.log('  * = uses cached prices (Gamma API unavailable for some markets)');
   }
   console.log('');
 }
