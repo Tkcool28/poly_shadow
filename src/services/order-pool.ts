@@ -1,7 +1,7 @@
 import { prisma } from '../lib/prisma';
 import { createJobLogger } from '../lib/logger';
 import { config } from '../config/env';
-import { executeMarketOrder as realExecute, isBalancePaused } from './trade-executor';
+import { executeMarketOrder as realExecute, isBalancePaused, CLOB_MIN_ORDER_USD } from './trade-executor';
 import { executeMarketOrder as paperExecute } from './paper-executor';
 import type { ExecuteOrderResult } from './trade-executor';
 
@@ -255,10 +255,61 @@ async function fireBucket(bucket: PoolBucket): Promise<void> {
   // Use latest entry's price (most recent market state)
   const latestPrice = entries[entries.length - 1].price;
 
-  // BUY: executor expects USD, SELL: executor expects shares
-  const executorAmount = side === 'BUY'
-    ? totalAmountUsd
-    : totalAmountUsd / latestPrice;
+  // Live BUY: bump to CLOB minimum. Paper BUY: use signal amount as-is. SELL: shares.
+  const executorAmount = (side === 'BUY' && !isPaper)
+    ? Math.max(totalAmountUsd, CLOB_MIN_ORDER_USD)
+    : side === 'BUY'
+      ? totalAmountUsd
+      : totalAmountUsd / latestPrice;
+
+  // Reserve extra capital needed to reach CLOB minimum (live BUY only)
+  const bumpAmount = (!isPaper && side === 'BUY')
+    ? Math.max(0, executorAmount - totalAmountUsd)
+    : 0;
+
+  if (bumpAmount > 0) {
+    try {
+      await prisma.$transaction(async (tx) => {
+        const fresh = await tx.followAllocation.findUniqueOrThrow({
+          where: { id: followAllocationId },
+        });
+        if (fresh.currentCapital < bumpAmount) {
+          throw new Error(
+            `need $${bumpAmount.toFixed(4)}, have $${fresh.currentCapital.toFixed(4)}`,
+          );
+        }
+        await tx.followAllocation.update({
+          where: { id: followAllocationId },
+          data: { currentCapital: { decrement: bumpAmount } },
+        });
+      });
+    } catch (err: any) {
+      // Can't top-up to CLOB minimum — skip entire bucket, refund pool reservations
+      await prisma.$transaction(async (tx) => {
+        for (const entry of entries) {
+          await tx.copyTrade.update({
+            where: { id: entry.copyTradeId },
+            data: {
+              status: 'SKIPPED',
+              failReason: `min-order bump: insufficient capital (${err.message})`,
+              latencyMs: Date.now() - entry.addedAt,
+            },
+          });
+        }
+        await tx.followAllocation.update({
+          where: { id: followAllocationId },
+          data: { currentCapital: { increment: totalAmountUsd } },
+        });
+      });
+      log.warn('POOL BUCKET SKIPPED: insufficient capital for CLOB min-order bump', {
+        side,
+        totalAmountUsd: totalAmountUsd.toFixed(4),
+        bumpAmount: bumpAmount.toFixed(4),
+        tokenId: tokenId.slice(0, 20) + '...',
+      });
+      return;
+    }
+  }
 
   const executeFn = isPaper ? paperExecute : realExecute;
 
@@ -316,23 +367,26 @@ async function fireBucket(bucket: PoolBucket): Promise<void> {
           estimatedFee: result.estimatedFee ? result.estimatedFee * proportion : null,
           latencyMs: Date.now() - entry.addedAt,
           filledAt: result.status === 'FILLED' ? new Date() : null,
+          // Update requestedAmount to bumped proportion so daily spend limit counts actual USD committed
+          requestedAmount: executorAmount * proportion,
         },
       });
     }
 
     // Capital accounting
     if (result.status === 'FILLED') {
+      // Use executorAmount as fallback (covers bumped amount if fill data is missing)
       const actualUsd = (result.filledSize && result.filledPrice)
         ? result.filledSize * result.filledPrice
-        : totalAmountUsd;
+        : executorAmount;
 
       const fresh = await tx.followAllocation.findUniqueOrThrow({
         where: { id: followAllocationId },
       });
 
       if (side === 'BUY') {
-        // Capital was already reserved on pool entry. Adjust for fill vs reserved difference.
-        const overReserved = totalAmountUsd - actualUsd;
+        // Capital was already reserved (pool + bump). Adjust for fill vs reserved difference.
+        const overReserved = executorAmount - actualUsd;
         await tx.followAllocation.update({
           where: { id: followAllocationId },
           data: {
@@ -350,11 +404,11 @@ async function fireBucket(bucket: PoolBucket): Promise<void> {
         });
       }
     } else {
-      // FAILED/SKIPPED: refund reserved BUY capital
+      // FAILED/SKIPPED: refund full reserved BUY capital (pool + any bump already deducted)
       if (side === 'BUY') {
         await tx.followAllocation.update({
           where: { id: followAllocationId },
-          data: { currentCapital: { increment: totalAmountUsd } },
+          data: { currentCapital: { increment: executorAmount } },
         });
       }
     }
@@ -365,7 +419,10 @@ async function fireBucket(bucket: PoolBucket): Promise<void> {
     side,
     entries: entries.length,
     totalAmountUsd: totalAmountUsd.toFixed(4),
+    executorAmount: executorAmount.toFixed(4),
+    bumpAmount: bumpAmount > 0 ? bumpAmount.toFixed(4) : undefined,
     filledPrice: result.filledPrice,
+    filledSize: result.filledSize,
     tokenId: tokenId.slice(0, 20) + '...',
   });
 }

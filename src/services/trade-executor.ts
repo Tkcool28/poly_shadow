@@ -124,10 +124,25 @@ function calculateSlippagePrice(detectedPrice: number, side: 'BUY' | 'SELL'): nu
   return Math.max(detectedPrice * (1 - slippageMultiplier), 0.01);
 }
 
+export const CLOB_MIN_ORDER_USD = 1.0; // Polymarket hard minimum per live order
+
 export async function executeMarketOrder(params: ExecuteOrderParams): Promise<ExecuteOrderResult> {
   if (!client) throw new Error('CLOB client not initialized');
 
   const { tokenId, side, amount, detectedPrice } = params;
+
+  // Guard: BUY USD amount must meet Polymarket's $1 minimum order size
+  if (side === 'BUY' && amount < CLOB_MIN_ORDER_USD) {
+    return {
+      orderId: null,
+      status: 'SKIPPED',
+      filledPrice: null,
+      filledSize: null,
+      failReason: `amount too small for CLOB: $${amount.toFixed(4)} < $${CLOB_MIN_ORDER_USD} minimum`,
+      transactionHashes: [],
+    };
+  }
+
   const slippagePrice = calculateSlippagePrice(detectedPrice, side);
 
   log.info('Placing FOK market order', {

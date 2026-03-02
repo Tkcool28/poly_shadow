@@ -1,7 +1,7 @@
 import { prisma } from '../lib/prisma';
 import { createJobLogger } from '../lib/logger';
 import { config } from '../config/env';
-import { executeMarketOrder as realExecute, isBalancePaused } from './trade-executor';
+import { executeMarketOrder as realExecute, isBalancePaused, CLOB_MIN_ORDER_USD } from './trade-executor';
 import { executeMarketOrder as paperExecute } from './paper-executor';
 import type { ExecuteOrderResult } from './trade-executor';
 import { addToPool } from './order-pool';
@@ -96,7 +96,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     copyAmountUsd = Math.min(copyAmountUsd, config.MAX_POSITION_USD);
   }
 
-  if (trade.side === 'BUY' && copyAmountUsd < config.POOL_MIN_AMOUNT_USD) {
+  if (trade.side === 'BUY' && copyAmountUsd < CLOB_MIN_ORDER_USD) {
     await addToPool(trade, copyAmountUsd, { id: allocation.id, isPaper });
     return;
   }
