@@ -34,10 +34,11 @@ describe('computeMaxDrawdown', () => {
     expect(result.maxDrawdown).toBe(0);
   });
 
-  it('allows values > 1.0 when cumPnl goes negative past peak', () => {
-    // cumPnl: 100, 70, 90, -30 → peak=100, trough=-30 → drawdown = 130/100 = 1.3
+  it('caps drawdown at 1.0 when cumPnl goes negative past peak', () => {
+    // cumPnl: 100, 70, 90, -30 → peak=100, trough=-30 → raw drawdown = 130/100 = 1.3
+    // Capped at 1.0 (100%) per convention
     const result = computeConsistency(makePositions([100, -30, 20, -120]));
-    expect(result.maxDrawdown).toBeCloseTo(1.3, 5);
+    expect(result.maxDrawdown).toBe(1.0);
   });
 
   it('handles single winning position', () => {

@@ -92,17 +92,31 @@ async function computeTraderMetrics(
   proxyWallet: string,
   closedMarketConditionIds: Set<string>,
 ) {
+  const arbPrice = config.ARB_FILTER_PRICE;
+
   const [trades, dbClosedPositions, positions] = await Promise.all([
     prisma.trade.findMany({
-      where: { proxyWallet },
+      where: {
+        proxyWallet,
+        // Exclude arb entries: BUY trades at >= threshold price
+        NOT: { side: 'BUY', price: { gte: arbPrice } },
+      },
       select: { conditionId: true, size: true, price: true, timestamp: true, side: true },
     }),
     prisma.closedPosition.findMany({
-      where: { proxyWallet },
+      where: {
+        proxyWallet,
+        // Exclude positions entered at arb prices
+        avgPrice: { lt: arbPrice },
+      },
       select: { asset: true, conditionId: true, realizedPnl: true, totalBought: true, timestamp: true },
     }),
     prisma.position.findMany({
-      where: { proxyWallet },
+      where: {
+        proxyWallet,
+        // Exclude open positions entered at arb prices
+        avgPrice: { lt: arbPrice },
+      },
       select: {
         asset: true, conditionId: true, cashPnl: true, initialValue: true,
         curPrice: true, currentValue: true, endDate: true, snapshotAt: true,

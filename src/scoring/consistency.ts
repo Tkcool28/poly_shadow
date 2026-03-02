@@ -65,27 +65,31 @@ function computeStdDev(values: number[]): number {
 function computeMaxDrawdown(sortedPositions: ClosedPositionInput[]): number {
   if (sortedPositions.length === 0) return 0;
 
-  // Build cumulative P&L equity curve
+  // Bin realized P&L by calendar day (UTC) to eliminate arbitrary intra-day ordering.
+  // Multiple positions closing on the same day are aggregated into a single daily sum,
+  // matching how portfolio P&L charts display performance.
+  const dailyPnl = new Map<string, Decimal>();
+  for (const cp of sortedPositions) {
+    const day = new Date(cp.timestamp * 1000).toISOString().slice(0, 10);
+    dailyPnl.set(day, (dailyPnl.get(day) ?? new Decimal(0)).plus(cp.realizedPnl));
+  }
+
+  // ISO date strings sort lexicographically → chronological order
+  const sortedDays = [...dailyPnl.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+
   let cumPnl = new Decimal(0);
   let peak = new Decimal(0);
   let maxDrawdown = new Decimal(0);
 
-  for (const cp of sortedPositions) {
-    cumPnl = cumPnl.plus(cp.realizedPnl);
-
-    if (cumPnl.gt(peak)) {
-      peak = cumPnl;
-    }
-
+  for (const [, pnl] of sortedDays) {
+    cumPnl = cumPnl.plus(pnl);
+    if (cumPnl.gt(peak)) peak = cumPnl;
     if (peak.gt(0)) {
       const drawdown = peak.minus(cumPnl).div(peak);
-      if (drawdown.gt(maxDrawdown)) {
-        maxDrawdown = drawdown;
-      }
+      if (drawdown.gt(maxDrawdown)) maxDrawdown = drawdown;
     }
   }
 
-  // Values > 1.0 mean cumPnl went negative past the peak (e.g., dd=1.3 = lost 130% of peak).
-  // Percentile ranking in composite.ts is order-based and handles any range.
-  return maxDrawdown.toNumber();
+  // Cap at 1.0 (100%) — safety net for edge cases where cumPnl goes negative past peak
+  return Math.min(maxDrawdown.toNumber(), 1.0);
 }

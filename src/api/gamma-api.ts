@@ -33,6 +33,13 @@ export async function getMarkets(params: {
   return safeParseArray(GammaMarketSchema, raw, 'gamma-markets');
 }
 
+export async function getMarketBySlug(slug: string): Promise<GammaMarketData | null> {
+  const raw = await gammaApi.get<unknown[]>('/markets', { slug, limit: 1 });
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const parsed = GammaMarketSchema.safeParse(raw[0]);
+  return parsed.success ? parsed.data : null;
+}
+
 /**
  * Fetch markets by condition IDs. The Gamma API only supports single
  * condition_ids lookups, so we query one at a time. All lookups are

@@ -33,9 +33,10 @@ program
   .command('scores')
   .description('Show top trader scores')
   .option('-t, --top <n>', 'Number of top traders to show', '20')
+  .option('-f, --filter', 'Filter: 30d PnL >= $100, WinRate >= 70%, Markets >= 100')
   .action(async (opts) => {
     const { showScores } = await import('./show-scores.js');
-    await showScores({ top: parseInt(opts.top) });
+    await showScores({ top: parseInt(opts.top), filter: opts.filter ?? false });
     await prisma.$disconnect();
   });
 

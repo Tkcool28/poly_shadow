@@ -380,6 +380,81 @@ model CopyTrade {
   @@index([status, side, createdAt])                        // daily spend check
 }
 
+// ─── ArbCapital (arb worker's independent capital ledger) ───
+
+model ArbCapital {
+  id              String   @id @default(cuid())
+  initialCapital  Float                 // Set from ARB_INITIAL_CAPITAL_USD
+  currentCapital  Float                 // Available to deploy (auto-recycles on settlement)
+  deployedCapital Float    @default(0)  // Locked in open arb positions
+  isPaper         Boolean  @default(true)
+  totalPnl        Float    @default(0)  // Running cumulative P&L
+  totalCycles     Int      @default(0)  // Total completed cycles
+  totalWins       Int      @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([isPaper]) // One record per mode (paper vs live)
+}
+
+// ─── ArbCycle (per-candle arb cycle tracking) ───
+
+enum ArbCycleStatus {
+  PENDING
+  WATCHING
+  ENTERED
+  WON
+  LOST
+  SKIPPED
+  FAILED
+}
+
+model ArbCycle {
+  id            String  @id @default(cuid())
+
+  // Candle identification
+  marketType    String  // "5m", "15m", "1h"
+  candleStartMs BigInt  // Unix ms of candle start
+  slug          String  // e.g. "btc-updown-5m-1709300100"
+  conditionId   String?
+
+  // BTC price tracking
+  btcOpenPrice  Float   // BTC price at candle open
+  btcEntryPrice Float?  // BTC price at entry decision
+  btcClosePrice Float?  // BTC price at candle close
+
+  // Direction
+  direction     String? // "UP", "DOWN", or null if skipped
+
+  // Entry
+  tokenId       String? // CLOB token ID of the outcome bought
+  entryPrice    Float?  // Price paid per share
+  entryShares   Float?  // Number of shares bought
+  entryAmountUsd Float? // Total USD spent
+  orderId       String? // CLOB order ID
+
+  // Settlement
+  settlementPrice Float?  // 1.0 (win) or 0.0 (loss)
+  pnl             Float?  // Net P&L for this cycle
+  estimatedFee    Float?  // Estimated Polymarket fee
+
+  status        ArbCycleStatus @default(PENDING)
+  failReason    String?
+  isPaper       Boolean @default(true)
+
+  // Timing
+  enteredAt     DateTime?
+  resolvedAt    DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([status])
+  @@index([marketType, candleStartMs])
+  @@index([createdAt(sort: Desc)])
+  @@index([isPaper, status])
+}
+
 // ─── SystemHealth ───
 
 model SystemHealth {

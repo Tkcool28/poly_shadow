@@ -11,6 +11,7 @@
     "backfiller": "tsx src/jobs/history-backfiller.ts",
     "scorer": "tsx src/jobs/score-calculator.ts",
     "monitor": "tsx src/jobs/trade-monitor.ts",
+    "arb": "tsx src/jobs/arb-worker.ts",
     "test": "vitest run"
   },
   "repository": {
