@@ -3,7 +3,7 @@ import { createJobLogger } from '../lib/logger';
 import { prisma } from '../lib/prisma';
 import { config } from '../config/env';
 import { isShuttingDown } from '../lib/shutdown';
-import { initialize as initExecutor } from '../services/trade-executor';
+import { initialize as initExecutor, isLiveReady } from '../services/trade-executor';
 import { processCopyTrade } from '../services/copy-trade-worker';
 import { startPortfolioRefresh, stopPortfolioRefresh } from '../services/portfolio-cache';
 import { rehydratePool, sweepPool } from '../services/order-pool';
@@ -39,10 +39,28 @@ async function main() {
       await initExecutor();
       log.info('Copy-trader daemon started (live + paper trading available)');
     } catch (err: any) {
-      log.warn(`CLOB executor init failed: ${err.message}. Only paper trading available.`);
+      log.error(`CLOB executor init failed — LIVE TRADING UNAVAILABLE: ${err.message}`);
     }
   } else {
     log.info('No CLOB credentials configured — only paper trading available');
+  }
+
+  // Check for live allocations without CLOB executor
+  const liveAllocations = await prisma.followAllocation.findMany({
+    where: { isActive: true, isPaper: false },
+  });
+  if (liveAllocations.length > 0) {
+    const dbTotal = liveAllocations.reduce((s, a) => s + a.currentCapital, 0);
+    if (!isLiveReady()) {
+      log.error(`${liveAllocations.length} LIVE allocations exist but CLOB executor unavailable — live trades will NOT execute`, {
+        dbCurrentCapital: dbTotal.toFixed(2),
+      });
+    } else {
+      log.info('Live capital check', {
+        dbCurrentCapital: dbTotal.toFixed(2),
+        allocations: liveAllocations.length,
+      });
+    }
   }
 
   // Start portfolio value cache
@@ -57,6 +75,31 @@ async function main() {
     await rehydratePool();
   } catch (err: any) {
     log.warn(`Pool rehydration failed: ${err.message}`);
+  }
+
+  // Recover stale PENDING records from previous crash
+  try {
+    const stalePending = await prisma.copyTrade.findMany({
+      where: { status: 'PENDING', createdAt: { lt: new Date(Date.now() - 60000) } },
+    });
+    if (stalePending.length > 0) {
+      await prisma.copyTrade.updateMany({
+        where: { id: { in: stalePending.map(r => r.id) } },
+        data: { status: 'FAILED', failReason: 'process restart: order status unknown — check CLOB manually' },
+      });
+      const liveStale = stalePending.filter(r => !r.isPaper);
+      if (liveStale.length > 0) {
+        log.error(`${liveStale.length} LIVE PENDING records recovered — MANUAL CLOB RECONCILIATION REQUIRED`, {
+          ids: liveStale.map(r => r.id),
+          amounts: liveStale.map(r => `${r.side} $${r.requestedAmount.toFixed(2)}`),
+        });
+      }
+      if (stalePending.length > liveStale.length) {
+        log.warn(`Recovered ${stalePending.length - liveStale.length} paper PENDING records on startup`);
+      }
+    }
+  } catch (err: any) {
+    log.warn(`PENDING record recovery failed: ${err.message}`);
   }
 
   // Settlement sweep throttle

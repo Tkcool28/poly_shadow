@@ -104,7 +104,8 @@ export async function sweepPositionSettlements(): Promise<void> {
       continue;
     }
 
-    const outcomeIndex = outcomes.indexOf(meta.outcome);
+    const normalizedOutcome = meta.outcome.trim().toLowerCase();
+    const outcomeIndex = outcomes.findIndex(o => o.trim().toLowerCase() === normalizedOutcome);
     if (outcomeIndex < 0 || outcomeIndex >= outcomePrices.length) {
       log.warn('Settlement: outcome not found in market', {
         outcome: meta.outcome,

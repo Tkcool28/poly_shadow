@@ -49,14 +49,14 @@ const envSchema = z.object({
     .string()
     .default('false')
     .transform((v) => v === 'true'),
-  MAX_POSITION_USD: z.coerce.number().default(50),
-  MAX_DAILY_LOSS_USD: z.coerce.number().default(200),
-  MAX_TRADE_PERCENT: z.coerce.number().default(0.50), // Max 50% of allocation per trade
+  MAX_POSITION_USD: z.coerce.number().min(1).max(10000).default(50),
+  MAX_DAILY_LOSS_USD: z.coerce.number().min(1).max(100000).default(200),
+  MAX_TRADE_PERCENT: z.coerce.number().min(0.01).max(1.0).default(0.50), // Max 50% of allocation per trade
   PORTFOLIO_VALUE_REFRESH_MS: z.coerce.number().default(300000), // 5 min
-  SLIPPAGE_BPS: z.coerce.number().default(200), // 2% default
+  SLIPPAGE_BPS: z.coerce.number().min(10).max(1000).default(200), // 2% default
 
   // Order aggregation pool
-  POOL_MIN_AMOUNT_USD: z.coerce.number().default(0.10), // min to execute (matches current threshold)
+  POOL_MIN_AMOUNT_USD: z.coerce.number().min(0.01).max(100).default(0.10), // min to execute (matches current threshold)
   POOL_BURN_TIMEOUT_MS: z.coerce.number().default(180000), // 3 min per-entry FIFO burn window
 
   // Position settlement

@@ -53,6 +53,14 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     return;
   }
 
+  // Check portfolio value freshness (stale data = bad sizing)
+  const maxStaleMs = 30 * 60 * 1000; // 30 minutes
+  if (allocation.portfolioValueAt &&
+      Date.now() - allocation.portfolioValueAt.getTime() > maxStaleMs) {
+    await createSkippedRecord(trade, 'trader portfolio value stale', allocation.id, isPaper);
+    return;
+  }
+
   // ─── Sizing ───
 
   let copyAmountUsd: number;
@@ -90,7 +98,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
 
   if (trade.side === 'BUY') {
     const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
+    todayStart.setUTCHours(0, 0, 0, 0);
 
     const todayBuySpend = await prisma.copyTrade.aggregate({
       where: {

@@ -361,7 +361,7 @@ model CopyTrade {
   filledPrice     Float?
   filledSize      Float?
   slippageBps     Float?
-  status             String    // PENDING, FILLED, FAILED, SKIPPED
+  status             String    // PENDING, FILLED, FAILED, SKIPPED, POOLED, SETTLED
   failReason         String?
   latencyMs          Int?
   isPaper            Boolean   @default(false) // derived from allocation at creation
@@ -376,6 +376,8 @@ model CopyTrade {
   @@index([tokenId])
   @@index([followAllocationId])
   @@index([isPaper])
+  @@index([tokenId, followAllocationId, isPaper, status])  // settlement + getHeldShares
+  @@index([status, side, createdAt])                        // daily spend check
 }
 
 // ─── SystemHealth ───

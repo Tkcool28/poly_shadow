@@ -29,6 +29,10 @@ const metadataCache = new Map<string, { tickSize: TickSize; negRisk: boolean }>(
 
 let client: ClobClient | null = null;
 
+export function isLiveReady(): boolean {
+  return client !== null;
+}
+
 export async function initialize(): Promise<void> {
   if (!config.PRIVATE_KEY || !config.CLOB_API_KEY || !config.CLOB_API_SECRET || !config.CLOB_API_PASSPHRASE || !config.FUNDER_ADDRESS) {
     throw new Error(

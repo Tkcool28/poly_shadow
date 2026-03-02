@@ -80,10 +80,30 @@ export async function addToPool(
 
   // 2. Reserve capital for BUY (prevent over-commitment)
   if (trade.side === 'BUY') {
-    await prisma.followAllocation.update({
-      where: { id: allocation.id },
-      data: { currentCapital: { decrement: copyAmountUsd } },
-    });
+    try {
+      await prisma.$transaction(async (tx) => {
+        const fresh = await tx.followAllocation.findUniqueOrThrow({
+          where: { id: allocation.id },
+        });
+        if (fresh.currentCapital < copyAmountUsd) {
+          throw new Error('insufficient capital for pool reservation');
+        }
+        await tx.followAllocation.update({
+          where: { id: allocation.id },
+          data: { currentCapital: { decrement: copyAmountUsd } },
+        });
+      });
+    } catch (err: any) {
+      // Clean up the POOLED record we just created
+      await prisma.copyTrade.update({
+        where: { id: copyTradeId },
+        data: { status: 'SKIPPED', failReason: `pool reservation failed: ${err.message}` },
+      });
+      log.debug('Pool entry skipped: insufficient capital', {
+        amount: copyAmountUsd.toFixed(4), tokenId: trade.asset.slice(0, 20),
+      });
+      return;
+    }
   }
 
   // 3. Add to in-memory bucket
