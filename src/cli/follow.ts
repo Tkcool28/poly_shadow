@@ -43,8 +43,8 @@ export async function followTrader(identifier: string, capital: number, isPaper 
   });
 
   if (existing) {
-    // Block mode switch — must unfollow first to change paper/live
-    if (existing.isPaper !== isPaper) {
+    // Block mode switch only when the allocation is actively following
+    if (existing.isPaper !== isPaper && existing.isActive) {
       const currentMode = existing.isPaper ? 'PAPER' : 'LIVE';
       const requestedMode = isPaper ? 'PAPER' : 'LIVE';
       console.error(`Error: ${displayName} is currently followed as ${currentMode}. Unfollow first to switch to ${requestedMode}.`);
@@ -61,6 +61,7 @@ export async function followTrader(identifier: string, capital: number, isPaper 
         currentCapital: capital - deployedCapital,
         deployedCapital,
         isActive: true,
+        isPaper,
       },
     });
 

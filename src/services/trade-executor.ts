@@ -57,7 +57,7 @@ export async function getWalletBalance(): Promise<{ balance: number } | null> {
   if (!client) return null;
   try {
     const result = await client.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-    return { balance: parseFloat(result?.balance ?? '0') };
+    return { balance: parseFloat(result?.balance ?? '0') / 1_000_000 };
   } catch (err: any) {
     log.warn(`Failed to fetch wallet balance: ${err.message}`);
     return null;
