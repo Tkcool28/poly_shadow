@@ -292,40 +292,40 @@ async function fireBucket(bucket: PoolBucket): Promise<void> {
     }
   }
 
-  // Update all CopyTrade records in this bucket
-  for (const entry of entries) {
-    const proportion = entry.amountUsd / totalAmountUsd;
-    const entryFilledSize = result.filledSize ? result.filledSize * proportion : null;
+  await prisma.$transaction(async (tx) => {
+    // Update all CopyTrade records in this bucket
+    for (const entry of entries) {
+      const proportion = entry.amountUsd / totalAmountUsd;
+      const entryFilledSize = result.filledSize ? result.filledSize * proportion : null;
 
-    let slippageBps: number | null = null;
-    if (result.filledPrice && entry.price > 0) {
-      slippageBps = Math.round(((result.filledPrice - entry.price) / entry.price) * 10000);
-      if (side === 'SELL') slippageBps = -slippageBps;
+      let slippageBps: number | null = null;
+      if (result.filledPrice && entry.price > 0) {
+        slippageBps = Math.round(((result.filledPrice - entry.price) / entry.price) * 10000);
+        if (side === 'SELL') slippageBps = -slippageBps;
+      }
+
+      await tx.copyTrade.update({
+        where: { id: entry.copyTradeId },
+        data: {
+          orderId: result.orderId,
+          status: result.status,
+          filledPrice: result.filledPrice,
+          filledSize: entryFilledSize,
+          slippageBps,
+          failReason: result.failReason,
+          estimatedFee: result.estimatedFee ? result.estimatedFee * proportion : null,
+          latencyMs: Date.now() - entry.addedAt,
+          filledAt: result.status === 'FILLED' ? new Date() : null,
+        },
+      });
     }
 
-    await prisma.copyTrade.update({
-      where: { id: entry.copyTradeId },
-      data: {
-        orderId: result.orderId,
-        status: result.status,
-        filledPrice: result.filledPrice,
-        filledSize: entryFilledSize,
-        slippageBps,
-        failReason: result.failReason,
-        estimatedFee: result.estimatedFee ? result.estimatedFee * proportion : null,
-        latencyMs: Date.now() - entry.addedAt,
-        filledAt: result.status === 'FILLED' ? new Date() : null,
-      },
-    });
-  }
+    // Capital accounting
+    if (result.status === 'FILLED') {
+      const actualUsd = (result.filledSize && result.filledPrice)
+        ? result.filledSize * result.filledPrice
+        : totalAmountUsd;
 
-  // Capital accounting
-  if (result.status === 'FILLED') {
-    const actualUsd = (result.filledSize && result.filledPrice)
-      ? result.filledSize * result.filledPrice
-      : totalAmountUsd;
-
-    await prisma.$transaction(async (tx) => {
       const fresh = await tx.followAllocation.findUniqueOrThrow({
         where: { id: followAllocationId },
       });
@@ -349,16 +349,16 @@ async function fireBucket(bucket: PoolBucket): Promise<void> {
           },
         });
       }
-    });
-  } else {
-    // FAILED: refund all reserved capital for BUY
-    if (side === 'BUY') {
-      await prisma.followAllocation.update({
-        where: { id: followAllocationId },
-        data: { currentCapital: { increment: totalAmountUsd } },
-      });
+    } else {
+      // FAILED/SKIPPED: refund reserved BUY capital
+      if (side === 'BUY') {
+        await tx.followAllocation.update({
+          where: { id: followAllocationId },
+          data: { currentCapital: { increment: totalAmountUsd } },
+        });
+      }
     }
-  }
+  });
 
   log.info(`POOL FIRED [${isPaper ? 'PAPER' : 'LIVE'}]`, {
     status: result.status,

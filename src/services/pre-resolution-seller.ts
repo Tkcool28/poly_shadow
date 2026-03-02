@@ -128,24 +128,23 @@ export async function sweepPreResolutionSells(): Promise<void> {
         ? result.filledSize * result.filledPrice
         : estimatedUsd;
 
-      await prisma.copyTrade.update({
-        where: { id: copyTrade.id },
-        data: {
-          orderId: result.orderId,
-          status: result.status,
-          filledPrice: result.filledPrice,
-          filledSize: result.filledSize,
-          failReason: result.failReason
-            ? `pre-resolution: ${result.failReason}`
-            : 'pre-resolution auto-sell',
-          latencyMs: Date.now() - copyTrade.createdAt.getTime(),
-          filledAt: result.status === 'FILLED' ? new Date() : null,
-        },
-      });
+      await prisma.$transaction(async (tx) => {
+        await tx.copyTrade.update({
+          where: { id: copyTrade.id },
+          data: {
+            orderId: result.orderId,
+            status: result.status,
+            filledPrice: result.filledPrice,
+            filledSize: result.filledSize,
+            failReason: result.failReason
+              ? `pre-resolution: ${result.failReason}`
+              : 'pre-resolution auto-sell',
+            latencyMs: Date.now() - copyTrade.createdAt.getTime(),
+            filledAt: result.status === 'FILLED' ? new Date() : null,
+          },
+        });
 
-      // Capital accounting for successful sell
-      if (result.status === 'FILLED') {
-        await prisma.$transaction(async (tx) => {
+        if (result.status === 'FILLED') {
           const fresh = await tx.followAllocation.findUniqueOrThrow({
             where: { id: pos.followAllocationId },
           });
@@ -156,7 +155,10 @@ export async function sweepPreResolutionSells(): Promise<void> {
               deployedCapital: { decrement: Math.min(usdValue, fresh.deployedCapital) },
             },
           });
-        });
+        }
+      });
+
+      if (result.status === 'FILLED') {
         soldCount++;
         log.info('PRE-RESOLUTION SELL', {
           tokenId: pos.tokenId.slice(0, 20) + '...',

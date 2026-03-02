@@ -198,30 +198,29 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     if (trade.side === 'SELL') slippageBps = -slippageBps;
   }
 
-  // Update record
-  await prisma.copyTrade.update({
-    where: { id: copyTrade.id },
-    data: {
-      orderId: result.orderId,
-      status: result.status,
-      filledPrice: result.filledPrice,
-      filledSize: result.filledSize,
-      slippageBps,
-      failReason: result.failReason,
-      estimatedFee: result.estimatedFee ?? null,
-      latencyMs,
-      filledAt: result.status === 'FILLED' ? new Date() : null,
-    },
-  });
+  // ─── Update record + capital atomically ───
 
-  // ─── Capital update after fill (transactional with fresh read) ───
+  await prisma.$transaction(async (tx) => {
+    await tx.copyTrade.update({
+      where: { id: copyTrade.id },
+      data: {
+        orderId: result.orderId,
+        status: result.status,
+        filledPrice: result.filledPrice,
+        filledSize: result.filledSize,
+        slippageBps,
+        failReason: result.failReason,
+        estimatedFee: result.estimatedFee ?? null,
+        latencyMs,
+        filledAt: result.status === 'FILLED' ? new Date() : null,
+      },
+    });
 
-  if (result.status === 'FILLED') {
-    const usdValue = (result.filledSize && result.filledPrice)
-      ? result.filledSize * result.filledPrice
-      : copyAmountUsd;
+    if (result.status === 'FILLED') {
+      const usdValue = (result.filledSize && result.filledPrice)
+        ? result.filledSize * result.filledPrice
+        : copyAmountUsd;
 
-    await prisma.$transaction(async (tx) => {
       const fresh = await tx.followAllocation.findUniqueOrThrow({
         where: { id: allocation.id },
       });
@@ -250,8 +249,8 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
           },
         });
       }
-    });
-  }
+    }
+  });
 
   // ─── Log ───
 
