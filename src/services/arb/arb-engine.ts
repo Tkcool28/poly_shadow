@@ -348,7 +348,7 @@ export class ArbEngine {
       where: {
         isPaper: this.isPaper,
         createdAt: { gte: todayStart },
-        status: { in: [ArbCycleStatus.WON, ArbCycleStatus.LOST] },
+        status: { in: [ArbCycleStatus.WON, ArbCycleStatus.LOST, ArbCycleStatus.STOPPED] },
       },
       _sum: { pnl: true },
     });
@@ -362,13 +362,13 @@ export class ArbEngine {
       where: {
         isPaper: this.isPaper,
         marketType: this.marketConfig.type,
-        status: { in: [ArbCycleStatus.WON, ArbCycleStatus.LOST] },
+        status: { in: [ArbCycleStatus.WON, ArbCycleStatus.LOST, ArbCycleStatus.STOPPED] },
       },
       orderBy: { createdAt: 'desc' },
       take: config.ARB_MAX_CONSECUTIVE_LOSSES,
       select: { status: true },
     });
-    const firstWinIdx = recentCycles.findIndex((c) => c.status !== ArbCycleStatus.LOST);
+    const firstWinIdx = recentCycles.findIndex((c) => c.status === ArbCycleStatus.WON);
     const consecutiveLosses = firstWinIdx === -1 ? recentCycles.length : firstWinIdx;
     if (consecutiveLosses >= config.ARB_MAX_CONSECUTIVE_LOSSES) {
       return `circuit breaker: ${consecutiveLosses} consecutive losses`;

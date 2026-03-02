@@ -226,10 +226,38 @@ async function executeWithClient(client: ClobClient, params: ExecuteOrderParams)
     const makingAmount = parseFloat(response?.makingAmount || '0');
     const takingAmount = parseFloat(response?.takingAmount || '0');
 
-    // BUY: makingAmount = shares received, takingAmount = USDC paid
-    const filledSize = makingAmount > 0 ? makingAmount : null;
-    const filledPrice = makingAmount > 0 && takingAmount > 0
-      ? takingAmount / makingAmount : null;
+    let filledSize: number | null;
+    let filledPrice: number | null;
+
+    if (side === 'BUY') {
+      // BUY: makingAmount = shares received, takingAmount = USDC paid
+      filledSize = makingAmount > 0 ? makingAmount : null;
+      filledPrice = makingAmount > 0 && takingAmount > 0
+        ? takingAmount / makingAmount : null;
+    } else {
+      // SELL: makingAmount = USDC received, takingAmount = shares given
+      filledSize = takingAmount > 0 ? takingAmount : null;
+      filledPrice = takingAmount > 0 && makingAmount > 0
+        ? makingAmount / takingAmount : null;
+    }
+
+    // Guard: if CLOB reported success but no fill data, treat as FAILED (ghost fill)
+    if (filledSize == null || filledPrice == null) {
+      log.warn('Arb ghost fill detected: CLOB success but no fill amounts', {
+        orderId,
+        side,
+        makingAmount: response?.makingAmount,
+        takingAmount: response?.takingAmount,
+      });
+      return {
+        orderId,
+        status: 'FAILED',
+        filledPrice: null,
+        filledSize: null,
+        failReason: 'ghost fill: success reported but no fill amounts',
+        transactionHashes: txHashes,
+      };
+    }
 
     log.info('Arb order filled', { orderId, filledSize, filledPrice, txHashes: txHashes.length });
 

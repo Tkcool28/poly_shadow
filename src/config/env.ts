@@ -96,7 +96,7 @@ const envSchema = z.object({
   // Capital (separate from copy-trade)
   ARB_INITIAL_CAPITAL_USD: z.coerce.number().min(1).default(1000),
   ARB_POSITION_SIZE_USD: z.coerce.number().min(1).max(50000).default(500),
-  ARB_MAX_DAILY_LOSS_USD: z.coerce.number().min(1).default(50),
+  ARB_MAX_DAILY_LOSS_USD: z.coerce.number().min(1).default(500),
 
   // Strategy
   ARB_MAX_ENTRY_PRICE: z.coerce.number().min(0.90).max(0.999).default(0.99),
@@ -108,6 +108,13 @@ const envSchema = z.object({
   ARB_CONFIDENCE_PRICE_SCALE: z.coerce.number().default(0.002),
   ARB_CONFIDENCE_VOL_SCALE: z.coerce.number().default(0.0003),
   ARB_SNAP_BUFFER_SIZE: z.coerce.number().min(60).max(600).default(300),
+
+  // Stop-loss (early exit when outcome price drops)
+  ARB_STOP_LOSS_ENABLED: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+  ARB_STOP_LOSS_PRICE: z.coerce.number().min(0.01).max(0.95).default(0.50),
 
   // Settlement sweep (background, non-blocking)
   ARB_SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(10000),  // 10s sweep cadence
