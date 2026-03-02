@@ -27,15 +27,24 @@ export class CryptoPriceFeed {
   // Per-candle snapshots (keyed by candle duration to support multiple engines)
   private candleOpenPrices = new Map<number, number>();
 
+  // 1-second snapshot ring buffer for momentum/volatility analysis
+  private snapBuffer: Float64Array;     // [price0, ts0, price1, ts1, ...]
+  private snapWriteIdx = 0;
+  private snapCount = 0;
+  private readonly snapCapacity: number;
+  private lastSnapSecond = 0;
+
   // Metrics
   state: ConnectionState = 'disconnected';
   connectedAt: Date | null = null;
   messagesReceived = 0;
 
-  constructor(symbol: string) {
+  constructor(symbol: string, snapCapacity = 300) {
     this.symbol = symbol.toLowerCase();
     this.wsUrl = `wss://stream.binance.com:9443/ws/${this.symbol}usdt@trade`;
     this.log = createJobLogger(`price-feed-${this.symbol}`);
+    this.snapCapacity = snapCapacity;
+    this.snapBuffer = new Float64Array(snapCapacity * 2);
   }
 
   get lastPrice(): number {
@@ -99,6 +108,26 @@ export class CryptoPriceFeed {
     return change > 0 ? 'UP' : 'DOWN';
   }
 
+  /** Get all 1-second snapshots within the last windowMs, oldest first. */
+  getSnapshotsInWindow(windowMs: number): Array<{ price: number; timestampMs: number }> {
+    if (this.snapCount === 0) return [];
+
+    const cutoff = Date.now() - windowMs;
+    const results: Array<{ price: number; timestampMs: number }> = [];
+
+    // Scan backward from most recent write, collect entries within window
+    for (let i = 0; i < this.snapCount; i++) {
+      const idx = ((this.snapWriteIdx - 1 - i) % this.snapCapacity + this.snapCapacity) % this.snapCapacity;
+      const si = idx * 2;
+      const ts = this.snapBuffer[si + 1];
+      if (ts < cutoff) break; // Older than window — stop
+      results.push({ price: this.snapBuffer[si], timestampMs: ts });
+    }
+
+    results.reverse(); // Chronological order (oldest first)
+    return results;
+  }
+
   private createConnection(): void {
     const ws = new WebSocket(this.wsUrl);
     this.ws = ws;
@@ -115,8 +144,21 @@ export class CryptoPriceFeed {
       try {
         const msg = JSON.parse(data.toString());
         if (msg.p) {
-          this._lastPrice = parseFloat(msg.p);
-          this._lastUpdateMs = Date.now();
+          const price = parseFloat(msg.p);
+          const now = Date.now();
+          this._lastPrice = price;
+          this._lastUpdateMs = now;
+
+          // Record 1-second snapshot (at most once per wall-clock second)
+          const sec = Math.floor(now / 1000);
+          if (sec !== this.lastSnapSecond) {
+            const si = (this.snapWriteIdx % this.snapCapacity) * 2;
+            this.snapBuffer[si] = price;
+            this.snapBuffer[si + 1] = now;
+            this.snapWriteIdx++;
+            if (this.snapCount < this.snapCapacity) this.snapCount++;
+            this.lastSnapSecond = sec;
+          }
         }
       } catch {
         // Ignore parse errors

@@ -153,7 +153,7 @@ async function main() {
   // Create one price feed per unique asset
   const feedMap = new Map<string, CryptoPriceFeed>();
   for (const asset of assets) {
-    const feed = new CryptoPriceFeed(asset);
+    const feed = new CryptoPriceFeed(asset, config.ARB_SNAP_BUFFER_SIZE);
     feed.connect();
     feedMap.set(asset, feed);
     priceFeeds.push(feed);

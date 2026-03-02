@@ -5,6 +5,7 @@ import { config } from '../../config/env';
 import { CryptoPriceFeed } from './crypto-price-feed';
 import { discoverMarket, buildSlug } from './market-discovery';
 import { arbExecuteOrder, arbGetOrderBook } from './arb-executor';
+import { computeConfidence, type ConfidenceConfig } from './confidence';
 import type { ArbMarketConfig, CandleInfo, CandleState } from './arb-types';
 
 /**
@@ -70,7 +71,26 @@ export class ArbEngine {
         && candle.elapsedMs <= this.marketConfig.entryEndMs
         && this.currentCandle
         && !this.currentCandle.entered) {
-      await this.evaluateAndEnter();
+      await this.evaluateAndEnter(candle);
+    }
+
+    // Record SKIPPED when entry window expires without entry
+    if (candle.elapsedMs > this.marketConfig.entryEndMs
+        && this.currentCandle
+        && !this.currentCandle.entered) {
+      let reason: string;
+      if (!this.currentCandle.marketInfo) {
+        reason = 'market not found';
+      } else if (this.currentCandle.permanentSkipReason) {
+        reason = this.currentCandle.permanentSkipReason;
+      } else if (this.currentCandle.lastConfidence) {
+        const conf = this.currentCandle.lastConfidence;
+        reason = `low confidence: ${conf.score.toFixed(3)} (move=${conf.signals.priceMovePct.toFixed(4)}, mom=${conf.signals.momentum.toFixed(2)}, vol=${conf.signals.volatility.toFixed(2)})`;
+      } else {
+        reason = `${this.marketConfig.asset.toUpperCase()} price flat`;
+      }
+      const conf = this.currentCandle.lastConfidence;
+      await this.recordSkip(reason, conf?.score ?? null, conf ? JSON.stringify(conf.signals) : null);
     }
 
     // Phase 3: Settlement handled by background sweep (arb-settlement.ts).
@@ -106,6 +126,9 @@ export class ArbEngine {
       entryAmountUsd: null,
       orderId: null,
       cycleId: null,
+      permanentSkipChecked: false,
+      permanentSkipReason: null,
+      lastConfidence: null,
     };
 
     if (!marketInfo) {
@@ -115,43 +138,71 @@ export class ArbEngine {
 
   // ─── Phase 2: Evaluate and enter ───
 
-  private async evaluateAndEnter(): Promise<void> {
+  private async evaluateAndEnter(candleInfo: CandleInfo): Promise<void> {
     const candle = this.currentCandle!;
 
-    // Retry market discovery if it failed earlier
+    // 1. Retry market discovery if it failed earlier (allow retry next tick)
     if (!candle.marketInfo) {
       const slug = buildSlug(this.marketConfig, candle.slugTimestamp);
       candle.marketInfo = await discoverMarket(slug);
       if (!candle.marketInfo) {
-        this.log.debug(`Still no market for ${slug}, skipping entry`);
-        await this.recordSkip('market not found');
-        return;
+        return; // No entered=true — retry next tick
       }
     }
 
-    // Circuit breakers (DB-backed, crash-resilient)
-    const skip = await this.shouldSkip();
-    if (skip) {
-      await this.recordSkip(skip);
-      return;
+    // 2. Permanent checks: circuit breakers + capital (run once per candle)
+    if (!candle.permanentSkipChecked) {
+      const skip = await this.shouldSkip();
+      if (skip) {
+        candle.permanentSkipChecked = true;
+        candle.permanentSkipReason = skip;
+        return; // Window-expiry handler records SKIPPED
+      }
+
+      const capital = await this.getCapital();
+      if (!capital || capital.currentCapital < config.ARB_POSITION_SIZE_USD) {
+        const reason = `insufficient capital: $${capital?.currentCapital.toFixed(2) ?? 0}`;
+        candle.permanentSkipChecked = true;
+        candle.permanentSkipReason = reason;
+        return;
+      }
+
+      candle.permanentSkipChecked = true;
     }
 
-    // Check capital
-    const capital = await this.getCapital();
-    if (!capital || capital.currentCapital < config.ARB_POSITION_SIZE_USD) {
-      await this.recordSkip(`insufficient capital: $${capital?.currentCapital.toFixed(2) ?? 0}`);
-      return;
-    }
+    // Already permanently skipped — wait for window expiry to record
+    if (candle.permanentSkipReason) return;
 
-    // Determine direction
-    const direction = this.priceFeed.getDirection(
-      this.marketConfig.candleDurationMs,
-      config.ARB_MIN_PRICE_CHANGE,
+    // 3. Confidence scoring (runs every tick during entry window)
+    const windowMs = Math.min(
+      (this.marketConfig.entryEndMs - this.marketConfig.entryStartMs) + 30_000,
+      120_000,
     );
-    if (direction === 'FLAT') {
-      await this.recordSkip(`${this.marketConfig.asset.toUpperCase()} price flat`);
-      return;
+    const snapshots = this.priceFeed.getSnapshotsInWindow(windowMs);
+
+    const confidenceConfig: ConfidenceConfig = {
+      priceScale: config.ARB_CONFIDENCE_PRICE_SCALE,
+      volScale: config.ARB_CONFIDENCE_VOL_SCALE,
+      minPriceChange: config.ARB_MIN_PRICE_CHANGE,
+    };
+
+    const confidence = computeConfidence({
+      openPrice: candle.openPrice,
+      currentPrice: this.priceFeed.lastPrice,
+      candleDurationMs: this.marketConfig.candleDurationMs,
+      elapsedMs: candleInfo.elapsedMs,
+      snapshots,
+      config: confidenceConfig,
+    });
+
+    candle.lastConfidence = confidence;
+
+    if (confidence.direction === 'FLAT' || confidence.score < config.ARB_MIN_CONFIDENCE) {
+      this.log.debug(`Confidence: ${confidence.score.toFixed(3)} (move=${confidence.signals.priceMovePct.toFixed(4)}, mom=${confidence.signals.momentum.toFixed(2)}, vol=${confidence.signals.volatility.toFixed(2)}, time=${confidence.signals.timeScore.toFixed(2)})`, { market: this.marketConfig.type });
+      return; // Low confidence — allow retry next tick
     }
+
+    const direction = confidence.direction;
 
     // Select token
     const tokenId = direction === 'UP'
@@ -167,7 +218,11 @@ export class ArbEngine {
 
       const requiredShares = config.ARB_POSITION_SIZE_USD / config.ARB_MAX_ENTRY_PRICE;
       if (availableLiquidity < requiredShares) {
-        await this.recordSkip(`low liquidity: ${availableLiquidity.toFixed(0)} < ${requiredShares.toFixed(0)} required`);
+        await this.recordSkip(
+          `low liquidity: ${availableLiquidity.toFixed(0)} < ${requiredShares.toFixed(0)} required`,
+          confidence.score,
+          JSON.stringify(confidence.signals),
+        );
         return;
       }
     }
@@ -181,7 +236,11 @@ export class ArbEngine {
     });
 
     if (result.status !== 'FILLED' || !result.filledSize || !result.filledPrice) {
-      await this.recordSkip(result.failReason ?? 'order not filled');
+      await this.recordSkip(
+        result.failReason ?? 'order not filled',
+        confidence.score,
+        JSON.stringify(confidence.signals),
+      );
       return;
     }
 
@@ -219,6 +278,8 @@ export class ArbEngine {
             entryAmountUsd,
             orderId: result.orderId,
             estimatedFee,
+            confidenceScore: confidence.score,
+            confidenceSignals: JSON.stringify(confidence.signals),
             status: ArbCycleStatus.ENTERED,
             isPaper: this.isPaper,
             enteredAt: new Date(),
@@ -256,6 +317,7 @@ export class ArbEngine {
 
     this.log.info(`ENTERED ${direction}`, {
       market: this.marketConfig.type,
+      confidence: confidence.score.toFixed(3),
       price: result.filledPrice.toFixed(4),
       shares: result.filledSize.toFixed(2),
       usd: entryAmountUsd.toFixed(2),
@@ -319,7 +381,11 @@ export class ArbEngine {
     return prisma.arbCapital.findUnique({ where: { isPaper: this.isPaper } });
   }
 
-  private async recordSkip(reason: string): Promise<void> {
+  private async recordSkip(
+    reason: string,
+    confidenceScore?: number | null,
+    confidenceSignals?: string | null,
+  ): Promise<void> {
     if (!this.currentCandle) return;
 
     // Only record skips that had a market (avoid spamming DB for early discovery failures)
@@ -337,6 +403,8 @@ export class ArbEngine {
           conditionId: this.currentCandle.marketInfo?.conditionId,
           btcOpenPrice: this.currentCandle.openPrice,
           btcEntryPrice: this.priceFeed.lastPrice,
+          confidenceScore: confidenceScore ?? undefined,
+          confidenceSignals: confidenceSignals ?? undefined,
           status: ArbCycleStatus.SKIPPED,
           failReason: reason,
           isPaper: this.isPaper,
@@ -347,6 +415,6 @@ export class ArbEngine {
     }
 
     this.currentCandle.entered = true; // Prevent re-entry attempts
-    this.log.debug(`Skipped: ${reason}`, { market: this.marketConfig.type });
+    this.log.info(`Skipped: ${reason}`, { market: this.marketConfig.type });
   }
 }

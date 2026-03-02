@@ -100,8 +100,14 @@ const envSchema = z.object({
 
   // Strategy
   ARB_MAX_ENTRY_PRICE: z.coerce.number().min(0.90).max(0.999).default(0.99),
-  ARB_MIN_PRICE_CHANGE: z.coerce.number().default(0.0001), // 0.01% min BTC move
+  ARB_MIN_PRICE_CHANGE: z.coerce.number().default(0.0001), // 0.01% min BTC move (FLAT floor)
   ARB_MAX_CONSECUTIVE_LOSSES: z.coerce.number().min(1).default(5),
+
+  // Confidence scoring
+  ARB_MIN_CONFIDENCE: z.coerce.number().min(0).max(1).default(0.60),
+  ARB_CONFIDENCE_PRICE_SCALE: z.coerce.number().default(0.002),
+  ARB_CONFIDENCE_VOL_SCALE: z.coerce.number().default(0.0003),
+  ARB_SNAP_BUFFER_SIZE: z.coerce.number().min(60).max(600).default(300),
 
   // Settlement sweep (background, non-blocking)
   ARB_SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(10000),  // 10s sweep cadence

@@ -1,3 +1,5 @@
+import type { ConfidenceResult } from './confidence';
+
 // ─── Candle timing ───
 
 export interface CandleInfo {
@@ -104,4 +106,7 @@ export interface CandleState {
   entryAmountUsd: number | null;
   orderId: string | null;
   cycleId: string | null; // DB record ID
+  permanentSkipChecked: boolean;       // Whether circuit breakers + capital have been evaluated
+  permanentSkipReason: string | null;  // If non-null, permanent skip was triggered
+  lastConfidence: ConfidenceResult | null; // Last evaluation result (for window-expiry SKIPPED record)
 }
