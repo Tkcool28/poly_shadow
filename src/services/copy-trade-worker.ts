@@ -124,27 +124,6 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     }
   }
 
-  // ─── Global open positions backstop (BUY only — SELLs reduce positions) ───
-
-  if (trade.side === 'BUY') {
-    const result = await prisma.$queryRaw<{ count: bigint }[]>`
-      SELECT COUNT(*) as count FROM (
-        SELECT "tokenId"
-        FROM "CopyTrade"
-        WHERE status = 'FILLED' AND "isPaper" = ${isPaper}
-        GROUP BY "tokenId"
-        HAVING SUM(CASE WHEN side = 'BUY' THEN 1 ELSE 0 END) >
-               SUM(CASE WHEN side = 'SELL' THEN 1 ELSE 0 END)
-      ) AS open_positions
-    `;
-    const globalOpenPositions = Number(result[0]?.count ?? 0);
-
-    if (globalOpenPositions >= config.MAX_OPEN_POSITIONS) {
-      await createSkippedRecord(trade, 'global max open positions reached', allocation.id, isPaper);
-      return;
-    }
-  }
-
   // ─── Convert amount for executor ───
 
   // BUY: executor expects USD amount

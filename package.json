@@ -10,7 +10,8 @@
     "scanner": "tsx src/jobs/leaderboard-scanner.ts",
     "backfiller": "tsx src/jobs/history-backfiller.ts",
     "scorer": "tsx src/jobs/score-calculator.ts",
-    "monitor": "tsx src/jobs/trade-monitor.ts"
+    "monitor": "tsx src/jobs/trade-monitor.ts",
+    "test": "vitest run"
   },
   "repository": {
     "type": "git",
@@ -46,6 +47,7 @@
     "@types/node": "^25.3.3",
     "@types/ws": "^8.18.1",
     "prisma": "^7.4.2",
-    "tsx": "^4.21.0"
+    "tsx": "^4.21.0",
+    "vitest": "^4.0.18"
   }
 }

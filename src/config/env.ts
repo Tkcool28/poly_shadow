@@ -51,7 +51,6 @@ const envSchema = z.object({
     .transform((v) => v === 'true'),
   MAX_POSITION_USD: z.coerce.number().default(50),
   MAX_DAILY_LOSS_USD: z.coerce.number().default(200),
-  MAX_OPEN_POSITIONS: z.coerce.number().default(20),
   MAX_TRADE_PERCENT: z.coerce.number().default(0.50), // Max 50% of allocation per trade
   PORTFOLIO_VALUE_REFRESH_MS: z.coerce.number().default(300000), // 5 min
   SLIPPAGE_BPS: z.coerce.number().default(200), // 2% default
