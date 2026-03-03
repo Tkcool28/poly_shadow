@@ -398,6 +398,7 @@ model ArbStrategyConfig {
   cooldownLosses    Int?                    // trigger cooldown after N consecutive losses
   cooldownSkip      Int?                    // skip N candles after cooldown triggers
   antiMartingale    Boolean  @default(false) // halve position after loss, restore after win
+  minConfidence     Float?                  // per-strategy confidence threshold (null = use global ARB_MIN_CONFIDENCE)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

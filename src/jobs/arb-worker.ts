@@ -289,6 +289,7 @@ async function main() {
           cooldownLosses: sc.cooldownLosses ?? undefined,
           cooldownSkip: sc.cooldownSkip ?? undefined,
           antiMartingale: sc.antiMartingale,
+          minConfidence: sc.minConfidence ?? undefined,
         }));
       }
     }

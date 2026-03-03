@@ -37,6 +37,7 @@ export interface StrategyParams {
   cooldownLosses?: number;   // trigger cooldown after N consecutive losses
   cooldownSkip?: number;     // skip N candles after cooldown triggers
   antiMartingale?: boolean;  // halve position after loss, restore after win
+  minConfidence?: number;    // per-strategy confidence threshold (undefined = use global)
 }
 
 export class ArbEngine {
@@ -124,6 +125,8 @@ export class ArbEngine {
         reason = 'market not found';
       } else if (this.currentCandle.permanentSkipReason) {
         reason = this.currentCandle.permanentSkipReason;
+      } else if (this.currentCandle.lastSkipDetail) {
+        reason = this.currentCandle.lastSkipDetail;
       } else if (this.currentCandle.lastConfidence) {
         const conf = this.currentCandle.lastConfidence;
         reason = `low confidence: ${conf.score.toFixed(3)} (move=${conf.signals.priceMovePct.toFixed(4)}, mom=${conf.signals.momentum.toFixed(2)}, vol=${conf.signals.volatility.toFixed(2)})`;
@@ -170,6 +173,7 @@ export class ArbEngine {
       permanentSkipChecked: false,
       permanentSkipReason: null,
       lastConfidence: null,
+      lastSkipDetail: null,
     };
 
     if (!marketInfo) {
@@ -285,7 +289,8 @@ export class ArbEngine {
 
     candle.lastConfidence = confidence;
 
-    if (confidence.direction === 'FLAT' || confidence.score < config.ARB_MIN_CONFIDENCE) {
+    const minConfidence = this.strategyParams.minConfidence ?? config.ARB_MIN_CONFIDENCE;
+    if (confidence.direction === 'FLAT' || confidence.score < minConfidence) {
       this.log.debug(`Confidence: ${confidence.score.toFixed(3)} (move=${confidence.signals.priceMovePct.toFixed(4)}, mom=${confidence.signals.momentum.toFixed(2)}, vol=${confidence.signals.volatility.toFixed(2)}, time=${confidence.signals.timeScore.toFixed(2)})`, { market: this.marketConfig.type });
       return; // Low confidence — allow retry next tick
     }
@@ -311,6 +316,7 @@ export class ArbEngine {
 
       if (!oppositePrice || !Number.isFinite(oppositePrice)
           || oppositePrice > this.strategyParams.maxEntryPrice) {
+        candle.lastSkipDetail = `opposite price $${oppositePrice?.toFixed(3) ?? 'N/A'} > max $${this.strategyParams.maxEntryPrice}`;
         return; // Too expensive or no price — retry next tick
       }
 

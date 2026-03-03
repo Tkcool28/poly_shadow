@@ -111,4 +111,5 @@ export interface CandleState {
   permanentSkipChecked: boolean;       // Whether circuit breakers + capital have been evaluated
   permanentSkipReason: string | null;  // If non-null, permanent skip was triggered
   lastConfidence: ConfidenceResult | null; // Last evaluation result (for window-expiry SKIPPED record)
+  lastSkipDetail: string | null;           // Last non-permanent skip reason (e.g. "opposite price too high")
 }
