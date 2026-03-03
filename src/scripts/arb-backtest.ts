@@ -150,7 +150,7 @@ function getDirectionFromKlines(
   if (!openKline || !entryKline) return null;
 
   const openPrice = openKline.open;
-  const entryPrice = entryKline.close;
+  const entryPrice = entryKline.open;
 
   if (entryPrice === openPrice) return null; // FLAT — skip
   return {
@@ -161,16 +161,17 @@ function getDirectionFromKlines(
   };
 }
 
+/** Find the kline whose openTime is closest to (but not after) targetMs. Assumes klines sorted by openTime. */
 function findClosestKline(klines: Kline[], targetMs: number): Kline | null {
   let best: Kline | null = null;
   let bestDelta = Infinity;
   for (const k of klines) {
-    const delta = Math.abs(k.openTime - targetMs);
+    if (k.openTime > targetMs) break; // Only consider klines at or before target (no look-ahead)
+    const delta = targetMs - k.openTime;
     if (delta < bestDelta) {
       bestDelta = delta;
       best = k;
     }
-    if (k.openTime > targetMs + 120_000) break;
   }
   return best;
 }
@@ -412,11 +413,11 @@ async function main(): Promise<void> {
           process.stdout.write(`\r  Processing ${i + 1}/${resolvedCandleStarts.length}...`);
         }
 
-        // 1. Get direction + move magnitude from klines
-        const candleKlines = klines.filter(
-          (k) => k.openTime >= candleStartMs && k.openTime < candleStartMs + dc.candleDurationMs,
+        // 1. Get direction + move magnitude from klines (pre-entry only — no future data)
+        const preEntryKlines = klines.filter(
+          (k) => k.openTime >= candleStartMs && k.openTime < candleStartMs + dc.entryStartMs,
         );
-        const result = getDirectionFromKlines(candleKlines, candleStartMs, dc);
+        const result = getDirectionFromKlines(preEntryKlines, candleStartMs, dc);
         if (!result) {
           directionFlat++;
           continue;
@@ -424,8 +425,8 @@ async function main(): Promise<void> {
 
         const { direction: predicted, moveMagnitude, openPrice } = result;
 
-        // 2. Compute volatility for filters
-        const volatility = computeVolatility(candleKlines, openPrice);
+        // 2. Compute volatility for filters (pre-entry klines only)
+        const volatility = computeVolatility(preEntryKlines, openPrice);
 
         // 3. Generate slug and query Gamma API
         const candle = getCandleInfo(candleStartMs + dc.entryStartMs, dc.candleDurationMs, dc.epochOffsetMs);
@@ -511,6 +512,10 @@ async function main(): Promise<void> {
 
       console.log(''); // Clear progress line
       console.log(`  Markets found: ${marketsFound}/${resolvedCandleStarts.length}  |  Resolved: ${marketsResolved}  |  Flat: ${directionFlat}`);
+      const unresolvedCount = marketsFound - marketsResolved;
+      if (unresolvedCount > 0 && marketsFound > 0) {
+        console.log(`  Unresolved markets: ${unresolvedCount} (${((unresolvedCount / marketsFound) * 100).toFixed(1)}%) — capital lockup not modeled`);
+      }
 
       if (marketsResolved === 0) {
         console.log('  No resolved trades to analyze.\n');
@@ -538,17 +543,128 @@ async function main(): Promise<void> {
         }
       }
 
-      // Per-direction breakdown
-      if (stdAcc && stdAcc.pnls.length > 0) {
-        // Re-run to get direction info (we need to track this separately)
-        // For simplicity, use the direction accuracy from the standard strategy
-        console.log('');
+      // ─── Drawdown-reduction strategies (stateful: decisions depend on prior outcomes) ───
+      // These operate on the base contrarian P&L arrays sequentially.
+
+      for (const cp of CONTRARIAN_PRICES) {
+        const baseKey = `${prefix} Contrarian @$${cp.toFixed(2)}`;
+        const baseAcc = accumulators.get(baseKey);
+        if (!baseAcc || baseAcc.pnls.length < 20) continue;
+        const basePnls = baseAcc.pnls;
+        const baseFees = baseAcc.fees;
+
+        // 1. Streak cooldown: after N consecutive losses, skip the next M candles
+        for (const [cooldownAfter, skipCount] of [[3, 2], [5, 3], [5, 5], [3, 5]] as const) {
+          const filtPnls: number[] = [];
+          const filtFees: number[] = [];
+          let consecLosses = 0;
+          let cooldownRemaining = 0;
+
+          for (let j = 0; j < basePnls.length; j++) {
+            if (cooldownRemaining > 0) {
+              cooldownRemaining--;
+              continue; // Skip this trade
+            }
+            filtPnls.push(basePnls[j]);
+            filtFees.push(baseFees[j]);
+            if (basePnls[j] < 0) {
+              consecLosses++;
+              if (consecLosses >= cooldownAfter) {
+                cooldownRemaining = skipCount;
+                consecLosses = 0;
+              }
+            } else {
+              consecLosses = 0;
+            }
+          }
+
+          const key = `${baseKey} cool${cooldownAfter}L→skip${skipCount}`;
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+        }
+
+        // 2. Drawdown pause: stop entering when cumulative DD exceeds threshold,
+        //    skip a fixed cooldown period, then resume unconditionally.
+        //    Cooldown scales with threshold: $50→3 candles, $100→5, $200→8.
+        const DD_COOLDOWNS: [number, number][] = [[50, 3], [100, 5], [200, 8]];
+        for (const [maxDdUsd, cooldownCandles] of DD_COOLDOWNS) {
+          const filtPnls: number[] = [];
+          const filtFees: number[] = [];
+          let cumPnl = 0;
+          let peak = 0;
+          let skipRemaining = 0;
+
+          for (let j = 0; j < basePnls.length; j++) {
+            if (skipRemaining > 0) {
+              skipRemaining--;
+              continue;
+            }
+            filtPnls.push(basePnls[j]);
+            filtFees.push(baseFees[j]);
+            cumPnl += basePnls[j];
+            if (cumPnl > peak) peak = cumPnl;
+            const ddUsd = peak - cumPnl;
+            if (ddUsd >= maxDdUsd) {
+              skipRemaining = cooldownCandles;
+            }
+          }
+
+          const key = `${baseKey} ddPause$${maxDdUsd}`;
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+        }
+
+        // 3. Every-Nth trade: only enter every Nth candle (reduces exposure & streak length)
+        for (const nth of [2, 3]) {
+          const filtPnls: number[] = [];
+          const filtFees: number[] = [];
+          for (let j = 0; j < basePnls.length; j++) {
+            if (j % nth === 0) {
+              filtPnls.push(basePnls[j]);
+              filtFees.push(baseFees[j]);
+            }
+          }
+          const key = `${baseKey} every${nth}th`;
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+        }
+
+        // 4. Martingale inverse: halve position after each loss, reset after win
+        // Simulated as: after a loss, the next trade P&L is halved (smaller bet)
+        {
+          const filtPnls: number[] = [];
+          const filtFees: number[] = [];
+          let scale = 1.0;
+          for (let j = 0; j < basePnls.length; j++) {
+            filtPnls.push(basePnls[j] * scale);
+            filtFees.push(baseFees[j] * scale);
+            if (basePnls[j] < 0) {
+              scale = Math.max(0.25, scale * 0.5); // Floor at 25% of base
+            } else {
+              scale = 1.0; // Reset on win
+            }
+          }
+          const key = `${baseKey} antiMart`;
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+        }
+      }
+
+      // Print drawdown-reduction strategy stats
+      console.log('');
+      const ddKeys = [...accumulators.keys()].filter((k) =>
+        k.includes('cool') || k.includes('ddPause') || k.includes('every') || k.includes('antiMart'),
+      );
+      if (ddKeys.length > 0) {
+        console.log(`  --- Drawdown-Reduction Variants ---`);
+        for (const key of ddKeys) {
+          const acc = accumulators.get(key)!;
+          if (acc.pnls.length < 10) continue;
+          const stats = buildStats(key.slice(prefix.length + 1), acc.pnls, acc.fees);
+          printStats(stats);
+        }
       }
 
       // Time-of-day analysis
       const sortedHours = [...hourlyCorrect.entries()].sort((a, b) => a[0] - b[0]);
       if (sortedHours.length > 0) {
-        console.log(`  Time-of-day (UTC):`);
+        console.log(`\n  Time-of-day (UTC):`);
         for (const [hour, data] of sortedHours) {
           const pct = data.total > 0 ? ((data.correct / data.total) * 100).toFixed(1) : '0.0';
           const pnlStr = data.pnl >= 0 ? `+$${data.pnl.toFixed(2)}` : `-$${Math.abs(data.pnl).toFixed(2)}`;
@@ -600,6 +716,27 @@ async function main(): Promise<void> {
       console.log(`  ${String(i + 1).padStart(2)}. ${s.label}: PF=${pfStr}, Sharpe=${s.sharpe.toFixed(1)}, PnL=${pnlStr}, DD=${ddStr}, Trades=${s.trades}`);
     }
     console.log('');
+
+    // ─── Low-Drawdown Ranking (sorted by lowest DD among profitable strategies) ───
+    const lowDdRanked = allRanked
+      .filter((s) => s.profitFactor > 1 && s.trades >= MIN_TRADES)
+      .sort((a, b) => a.maxDrawdown - b.maxDrawdown || b.profitFactor - a.profitFactor)
+      .slice(0, 15);
+
+    if (lowDdRanked.length > 0) {
+      console.log(`${'='.repeat(80)}`);
+      console.log(`=== LOW-DRAWDOWN RANKING (profitable, sorted by lowest DD, min ${MIN_TRADES} trades) ===`);
+      console.log(`${'='.repeat(80)}`);
+      for (let i = 0; i < lowDdRanked.length; i++) {
+        const s = lowDdRanked[i];
+        const pfStr = s.profitFactor >= 999.9 ? '999.9+' : s.profitFactor.toFixed(2);
+        const pnlStr = s.totalPnl >= 0 ? `+$${s.totalPnl.toFixed(0)}` : `-$${Math.abs(s.totalPnl).toFixed(0)}`;
+        const ddStr = `${(s.maxDrawdown * 100).toFixed(1)}%`;
+        const ddUsdStr = `$${s.maxDrawdownUsd.toFixed(0)}`;
+        console.log(`  ${String(i + 1).padStart(2)}. ${s.label}: DD=${ddStr}(${ddUsdStr}), PF=${pfStr}, PnL=${pnlStr}, MaxConsecL=${s.maxConsecutiveLosses}, Trades=${s.trades}`);
+      }
+      console.log('');
+    }
 
     // ─── Recommended Config ───
     // Only consider base strategies (no move/vol filter variants) since those can't be deployed at runtime
