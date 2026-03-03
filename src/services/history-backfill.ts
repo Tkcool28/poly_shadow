@@ -3,6 +3,7 @@ import {
   getAllTrades,
   getAllClosedPositions,
   getAllPositions,
+  getClosedPositionsSince,
 } from '../api/data-api';
 import { resolveMarkets } from './market-resolver';
 import { logger } from '../lib/logger';
@@ -452,4 +453,93 @@ export async function backfillTrader(proxyWallet: string): Promise<void> {
       log.error(`Permanently failed after ${MAX_BACKFILL_RETRIES} retries`);
     }
   }
+}
+
+/**
+ * Incrementally refresh ClosedPosition records for a monitored trader.
+ * Fetches only positions settled after sinceTimestamp and upserts them.
+ * Updates lastPositionSync on success. Returns the number of positions upserted.
+ */
+export async function refreshTraderClosedPositions(
+  proxyWallet: string,
+  sinceTimestamp: number,
+): Promise<number> {
+  const newPositions = await getClosedPositionsSince(proxyWallet, sinceTimestamp);
+  if (newPositions.length === 0) return 0;
+
+  for (let i = 0; i < newPositions.length; i += UPSERT_BATCH_CHUNK) {
+    const chunk = newPositions.slice(i, i + UPSERT_BATCH_CHUNK);
+    try {
+      await prisma.$transaction(
+        chunk.map((cp) =>
+          prisma.closedPosition.upsert({
+            where: {
+              proxyWallet_asset_conditionId: {
+                proxyWallet,
+                asset: cp.asset,
+                conditionId: cp.conditionId,
+              },
+            },
+            create: {
+              proxyWallet,
+              asset: cp.asset,
+              conditionId: cp.conditionId,
+              avgPrice: cp.avgPrice,
+              totalBought: cp.totalBought,
+              realizedPnl: cp.realizedPnl,
+              curPrice: cp.curPrice,
+              timestamp: cp.timestamp,
+              outcome: cp.outcome,
+              outcomeIndex: cp.outcomeIndex ?? null,
+              title: cp.title ?? null,
+              eventSlug: cp.eventSlug ?? null,
+              endDate: cp.endDate ? new Date(cp.endDate) : null,
+            },
+            update: { realizedPnl: cp.realizedPnl, curPrice: cp.curPrice },
+          }),
+        ),
+      );
+    } catch (err: any) {
+      // Fallback: individual upserts so one bad record doesn't drop the whole chunk
+      logger.warn(`Closed position refresh batch failed, falling back to individual upserts: ${err.message}`);
+      for (const cp of chunk) {
+        try {
+          await prisma.closedPosition.upsert({
+            where: {
+              proxyWallet_asset_conditionId: {
+                proxyWallet,
+                asset: cp.asset,
+                conditionId: cp.conditionId,
+              },
+            },
+            create: {
+              proxyWallet,
+              asset: cp.asset,
+              conditionId: cp.conditionId,
+              avgPrice: cp.avgPrice,
+              totalBought: cp.totalBought,
+              realizedPnl: cp.realizedPnl,
+              curPrice: cp.curPrice,
+              timestamp: cp.timestamp,
+              outcome: cp.outcome,
+              outcomeIndex: cp.outcomeIndex ?? null,
+              title: cp.title ?? null,
+              eventSlug: cp.eventSlug ?? null,
+              endDate: cp.endDate ? new Date(cp.endDate) : null,
+            },
+            update: { realizedPnl: cp.realizedPnl, curPrice: cp.curPrice },
+          });
+        } catch (innerErr: any) {
+          logger.warn(`Failed to upsert closed position during refresh: ${innerErr.message}`);
+        }
+      }
+    }
+  }
+
+  await prisma.trader.update({
+    where: { proxyWallet },
+    data: { lastPositionSync: new Date() },
+  });
+
+  return newPositions.length;
 }

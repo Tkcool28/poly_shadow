@@ -35,16 +35,19 @@ export class ArbEngine {
   private marketConfig: ArbMarketConfig;
   private priceFeed: CryptoPriceFeed;
   private isPaper: boolean;
+  private strategy: string;
+  private get isContrarian(): boolean { return this.strategy === 'contrarian'; }
 
   // Current candle state
   private currentCandle: CandleState | null = null;
   private lastCandleStartMs = 0;
 
-  constructor(marketConfig: ArbMarketConfig, priceFeed: CryptoPriceFeed, isPaper: boolean) {
+  constructor(marketConfig: ArbMarketConfig, priceFeed: CryptoPriceFeed, isPaper: boolean, strategy = 'standard') {
     this.marketConfig = marketConfig;
     this.priceFeed = priceFeed;
     this.isPaper = isPaper;
-    this.log = createJobLogger(`arb-engine-${marketConfig.type}`);
+    this.strategy = strategy;
+    this.log = createJobLogger(`arb-engine-${marketConfig.type}-${strategy}`);
   }
 
   /**
@@ -143,9 +146,9 @@ export class ArbEngine {
 
     // 1. Retry market discovery if it failed earlier (allow retry next tick)
     //    Contrarian mode: always refresh prices (outcome prices change each tick)
-    if (!candle.marketInfo || config.ARB_CONTRARIAN_ENABLED) {
+    if (!candle.marketInfo || this.isContrarian) {
       const slug = buildSlug(this.marketConfig, candle.slugTimestamp);
-      candle.marketInfo = await discoverMarket(slug, config.ARB_CONTRARIAN_ENABLED);
+      candle.marketInfo = await discoverMarket(slug, this.isContrarian);
       if (!candle.marketInfo) {
         return; // No entered=true — retry next tick
       }
@@ -161,7 +164,7 @@ export class ArbEngine {
       }
 
       const capital = await this.getCapital();
-      const requiredCapital = config.ARB_CONTRARIAN_ENABLED
+      const requiredCapital = this.isContrarian
         ? config.ARB_CONTRARIAN_POSITION_SIZE_USD
         : config.ARB_POSITION_SIZE_USD;
       if (!capital || capital.currentCapital < requiredCapital) {
@@ -214,7 +217,7 @@ export class ArbEngine {
     let positionSize: number;
     let detectedPrice: number;
 
-    if (config.ARB_CONTRARIAN_ENABLED) {
+    if (this.isContrarian) {
       // Contrarian: buy the OPPOSITE token at low price
       entryDirection = modelDirection === 'UP' ? 'DOWN' : 'UP';
       tokenId = modelDirection === 'UP'
@@ -245,7 +248,7 @@ export class ArbEngine {
     // Optional order book check (only available with own wallet)
     const orderBook = await arbGetOrderBook(tokenId);
     if (orderBook) {
-      const maxPrice = config.ARB_CONTRARIAN_ENABLED ? detectedPrice : config.ARB_MAX_ENTRY_PRICE;
+      const maxPrice = this.isContrarian ? detectedPrice : config.ARB_MAX_ENTRY_PRICE;
       const availableLiquidity = (orderBook.asks ?? [])
         .filter((a: { price: string }) => parseFloat(a.price) <= maxPrice)
         .reduce((sum: number, a: { size: string }) => sum + parseFloat(a.size), 0);
@@ -286,12 +289,13 @@ export class ArbEngine {
     let cycle;
     try {
       cycle = await prisma.$transaction(async (tx) => {
-        const fresh = await tx.arbCapital.findUnique({ where: { isPaper: this.isPaper } });
+        const capitalKey = { isPaper_strategy: { isPaper: this.isPaper, strategy: this.strategy } };
+        const fresh = await tx.arbCapital.findUnique({ where: capitalKey });
         if (!fresh || fresh.currentCapital < entryAmountUsd) {
           throw new Error('Insufficient capital at execution time');
         }
         await tx.arbCapital.update({
-          where: { isPaper: this.isPaper },
+          where: capitalKey,
           data: {
             currentCapital: { decrement: entryAmountUsd },
             deployedCapital: { increment: entryAmountUsd },
@@ -316,10 +320,11 @@ export class ArbEngine {
             confidenceSignals: JSON.stringify({
               ...confidence.signals,
               modelDirection,
-              contrarian: config.ARB_CONTRARIAN_ENABLED,
+              contrarian: this.isContrarian,
             }),
             status: ArbCycleStatus.ENTERED,
             isPaper: this.isPaper,
+            strategy: this.strategy,
             enteredAt: new Date(),
           },
         });
@@ -353,10 +358,10 @@ export class ArbEngine {
     candle.orderId = result.orderId;
     candle.cycleId = cycle.id;
 
-    const modeLabel = config.ARB_CONTRARIAN_ENABLED ? 'CONTRARIAN' : 'ENTERED';
+    const modeLabel = this.isContrarian ? 'CONTRARIAN' : 'ENTERED';
     this.log.info(`${modeLabel} ${entryDirection}`, {
       market: this.marketConfig.type,
-      ...(config.ARB_CONTRARIAN_ENABLED ? { modelSaid: modelDirection } : {}),
+      ...(this.isContrarian ? { modelSaid: modelDirection } : {}),
       confidence: confidence.score.toFixed(3),
       price: result.filledPrice.toFixed(4),
       shares: result.filledSize.toFixed(2),
@@ -397,10 +402,11 @@ export class ArbEngine {
       return `daily loss limit: $${dailyPnl.toFixed(2)}`;
     }
 
-    // Consecutive losses: per-engine (each market has independent streaks)
+    // Consecutive losses: per-engine per-strategy (each market+strategy has independent streaks)
     const recentCycles = await prisma.arbCycle.findMany({
       where: {
         isPaper: this.isPaper,
+        strategy: this.strategy,
         marketType: this.marketConfig.type,
         status: { in: [ArbCycleStatus.WON, ArbCycleStatus.LOST, ArbCycleStatus.STOPPED] },
       },
@@ -418,7 +424,9 @@ export class ArbEngine {
   }
 
   private async getCapital() {
-    return prisma.arbCapital.findUnique({ where: { isPaper: this.isPaper } });
+    return prisma.arbCapital.findUnique({
+      where: { isPaper_strategy: { isPaper: this.isPaper, strategy: this.strategy } },
+    });
   }
 
   private async recordSkip(
@@ -448,6 +456,7 @@ export class ArbEngine {
           status: ArbCycleStatus.SKIPPED,
           failReason: reason,
           isPaper: this.isPaper,
+          strategy: this.strategy,
         },
       });
     } catch {

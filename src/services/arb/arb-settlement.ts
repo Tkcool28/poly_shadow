@@ -98,11 +98,11 @@ export async function sweepArbSettlements(): Promise<void> {
           if (current?.status !== ArbCycleStatus.ENTERED) return false;
 
           const fresh = await tx.arbCapital.findUniqueOrThrow({
-            where: { isPaper: cycle.isPaper },
+            where: { isPaper_strategy: { isPaper: cycle.isPaper, strategy: cycle.strategy } },
           });
 
           await tx.arbCapital.update({
-            where: { isPaper: cycle.isPaper },
+            where: { isPaper_strategy: { isPaper: cycle.isPaper, strategy: cycle.strategy } },
             data: {
               currentCapital: { increment: settlementValue },
               deployedCapital: { decrement: Math.min(cycle.entryAmountUsd ?? 0, fresh.deployedCapital) },
@@ -187,11 +187,11 @@ export async function sweepArbSettlements(): Promise<void> {
                 if (current?.status !== ArbCycleStatus.ENTERED) return false;
 
                 const fresh = await tx.arbCapital.findUniqueOrThrow({
-                  where: { isPaper: cycle.isPaper },
+                  where: { isPaper_strategy: { isPaper: cycle.isPaper, strategy: cycle.strategy } },
                 });
 
                 await tx.arbCapital.update({
-                  where: { isPaper: cycle.isPaper },
+                  where: { isPaper_strategy: { isPaper: cycle.isPaper, strategy: cycle.strategy } },
                   data: {
                     currentCapital: { increment: saleProceeds },
                     deployedCapital: { decrement: Math.min(cycle.entryAmountUsd ?? 0, fresh.deployedCapital) },
@@ -262,12 +262,12 @@ export async function sweepArbSettlements(): Promise<void> {
           if (current?.status !== ArbCycleStatus.ENTERED) return false;
 
           const fresh = await tx.arbCapital.findUniqueOrThrow({
-            where: { isPaper: cycle.isPaper },
+            where: { isPaper_strategy: { isPaper: cycle.isPaper, strategy: cycle.strategy } },
           });
           const refundAmount = cycle.entryAmountUsd ?? 0;
 
           await tx.arbCapital.update({
-            where: { isPaper: cycle.isPaper },
+            where: { isPaper_strategy: { isPaper: cycle.isPaper, strategy: cycle.strategy } },
             data: {
               currentCapital: { increment: refundAmount },
               deployedCapital: { decrement: Math.min(refundAmount, fresh.deployedCapital) },

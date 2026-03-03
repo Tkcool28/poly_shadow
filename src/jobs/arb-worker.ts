@@ -60,31 +60,37 @@ async function main() {
     }
   }
 
-  // Ensure ArbCapital record exists
-  const existingCapital = await prisma.arbCapital.findUnique({
-    where: { isPaper: config.ARB_IS_PAPER },
-  });
-  if (!existingCapital) {
-    await prisma.arbCapital.create({
-      data: {
-        initialCapital: config.ARB_INITIAL_CAPITAL_USD,
-        currentCapital: config.ARB_INITIAL_CAPITAL_USD,
-        deployedCapital: 0,
-        isPaper: config.ARB_IS_PAPER,
-      },
-    });
-    log.info('Created ArbCapital record', {
-      initialCapital: config.ARB_INITIAL_CAPITAL_USD,
-      isPaper: config.ARB_IS_PAPER,
-    });
-  } else {
-    log.info('ArbCapital loaded', {
-      currentCapital: existingCapital.currentCapital.toFixed(2),
-      deployedCapital: existingCapital.deployedCapital.toFixed(2),
-      totalPnl: existingCapital.totalPnl.toFixed(2),
-      totalCycles: existingCapital.totalCycles,
-      totalWins: existingCapital.totalWins,
-    });
+  // Determine active strategies
+  const strategies = ['standard', ...(config.ARB_CONTRARIAN_ENABLED ? ['contrarian'] : [])];
+
+  // Ensure ArbCapital record exists per strategy
+  for (const strategy of strategies) {
+    const initialCapital = strategy === 'contrarian'
+      ? config.ARB_CONTRARIAN_INITIAL_CAPITAL_USD
+      : (config.ARB_STANDARD_INITIAL_CAPITAL_USD ?? config.ARB_INITIAL_CAPITAL_USD);
+
+    const capitalKey = { isPaper_strategy: { isPaper: config.ARB_IS_PAPER, strategy } };
+    const existingCapital = await prisma.arbCapital.findUnique({ where: capitalKey });
+    if (!existingCapital) {
+      await prisma.arbCapital.create({
+        data: {
+          initialCapital,
+          currentCapital: initialCapital,
+          deployedCapital: 0,
+          isPaper: config.ARB_IS_PAPER,
+          strategy,
+        },
+      });
+      log.info(`Created ArbCapital [${strategy}]`, { initialCapital, isPaper: config.ARB_IS_PAPER });
+    } else {
+      log.info(`ArbCapital [${strategy}] loaded`, {
+        currentCapital: existingCapital.currentCapital.toFixed(2),
+        deployedCapital: existingCapital.deployedCapital.toFixed(2),
+        totalPnl: existingCapital.totalPnl.toFixed(2),
+        totalCycles: existingCapital.totalCycles,
+        totalWins: existingCapital.totalWins,
+      });
+    }
   }
 
   // Recover orphaned ENTERED cycles from previous crash
@@ -107,12 +113,13 @@ async function main() {
         } else {
           // Market unresolved — fail and refund atomically
           await prisma.$transaction(async (tx) => {
+            const capitalKey = { isPaper_strategy: { isPaper: cycle.isPaper, strategy: cycle.strategy } };
             const fresh = await tx.arbCapital.findUniqueOrThrow({
-              where: { isPaper: cycle.isPaper },
+              where: capitalKey,
             });
             const refundAmount = cycle.entryAmountUsd ?? 0;
             await tx.arbCapital.update({
-              where: { isPaper: cycle.isPaper },
+              where: capitalKey,
               data: {
                 currentCapital: { increment: refundAmount },
                 deployedCapital: { decrement: Math.min(refundAmount, fresh.deployedCapital) },
@@ -174,18 +181,21 @@ async function main() {
     }
   }
 
-  // Create one engine per (asset, duration) combination
+  // Create one engine per (asset, duration, strategy) combination
   const engines: ArbEngine[] = [];
   for (const asset of assets) {
     const feed = feedMap.get(asset)!;
     for (const duration of durations) {
       const dc = DURATION_CONFIGS[duration];
       const mc = buildMarketConfig(asset, dc);
-      log.info(`Starting engine: ${mc.type}`, {
-        duration: `${mc.candleDurationMs / 1000}s`,
-        entryWindow: `${mc.entryStartMs / 1000}s-${mc.entryEndMs / 1000}s`,
-      });
-      engines.push(new ArbEngine(mc, feed, config.ARB_IS_PAPER));
+      for (const strategy of strategies) {
+        log.info(`Starting engine: ${mc.type}-${strategy}`, {
+          duration: `${mc.candleDurationMs / 1000}s`,
+          entryWindow: `${mc.entryStartMs / 1000}s-${mc.entryEndMs / 1000}s`,
+          strategy,
+        });
+        engines.push(new ArbEngine(mc, feed, config.ARB_IS_PAPER, strategy));
+      }
     }
   }
 
@@ -193,6 +203,7 @@ async function main() {
     mode: config.ARB_IS_PAPER ? 'PAPER' : 'LIVE',
     assets: assets.join(','),
     durations: durations.join(','),
+    strategies: strategies.join(','),
     engines: engines.length,
     positionSize: `$${config.ARB_POSITION_SIZE_USD}`,
     maxEntryPrice: config.ARB_MAX_ENTRY_PRICE,

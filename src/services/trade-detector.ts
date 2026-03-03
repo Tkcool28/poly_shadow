@@ -3,6 +3,61 @@ import { logger } from '../lib/logger';
 import { getTrades } from '../api/data-api';
 import type { RtdsTradePayload } from './ws-trade-stream';
 
+// ─── Trade table sync helper ───
+
+async function upsertToTradeTable(data: {
+  proxyWallet: string;
+  side: string;
+  asset: string;
+  conditionId: string;
+  size: number;
+  price: number;
+  outcome: string;
+  transactionHash: string;
+  timestamp: number;
+  title?: string | null;
+  eventSlug?: string | null;
+}): Promise<void> {
+  try {
+    await prisma.trade.upsert({
+      where: {
+        transactionHash_proxyWallet_asset_side_size_price: {
+          transactionHash: data.transactionHash,
+          proxyWallet: data.proxyWallet,
+          asset: data.asset,
+          side: data.side,
+          size: data.size,
+          price: data.price,
+        },
+      },
+      create: {
+        proxyWallet: data.proxyWallet,
+        side: data.side,
+        asset: data.asset,
+        conditionId: data.conditionId,
+        size: data.size,
+        price: data.price,
+        outcome: data.outcome,
+        outcomeIndex: null,
+        timestamp: data.timestamp,
+        transactionHash: data.transactionHash,
+        title: data.title ?? null,
+        eventSlug: data.eventSlug ?? null,
+        usdValue: data.size * data.price,
+      },
+      update: {}, // no-op on conflict
+    });
+  } catch (err: any) {
+    // P2002 = unique constraint: trade already in table from backfill, safe to skip
+    if (err.code !== 'P2002') {
+      logger.warn(`Failed to sync trade to Trade table: ${err.message}`, {
+        txHash: data.transactionHash.slice(0, 16),
+        proxyWallet: data.proxyWallet.slice(0, 10),
+      });
+    }
+  }
+}
+
 // ─── In-memory caches for WebSocket real-time path ───
 // Tracks ALL completed traders for WS filtering.
 // Polling fallback in detectNewTrades() uses isMonitored (= all COMPLETED traders).
@@ -80,6 +135,21 @@ export async function handleRealtimeTrade(payload: RtdsTradePayload): Promise<bo
         timestamp: payload.timestamp,
         compositeScore,
       },
+    });
+
+    // Dual-write to Trade table for scoring freshness (fire-and-forget)
+    void upsertToTradeTable({
+      proxyWallet: payload.proxyWallet,
+      side: payload.side,
+      asset: payload.asset,
+      conditionId: payload.conditionId,
+      size: parseFloat(payload.size),
+      price: parseFloat(payload.price),
+      outcome: payload.outcome,
+      transactionHash: payload.transactionHash,
+      timestamp: payload.timestamp,
+      title: payload.title ?? null,
+      eventSlug: payload.eventSlug ?? null,
     });
 
     const usdValue = (parseFloat(payload.size) * parseFloat(payload.price)).toFixed(2);
@@ -200,6 +270,21 @@ async function checkTraderForNewTrades(
         },
       });
       insertedCount++;
+
+      // Dual-write to Trade table for scoring freshness (fire-and-forget)
+      void upsertToTradeTable({
+        proxyWallet,
+        side: trade.side,
+        asset: trade.asset,
+        conditionId: trade.conditionId,
+        size: trade.size,
+        price: trade.price,
+        outcome: trade.outcome,
+        transactionHash: trade.transactionHash,
+        timestamp: trade.timestamp,
+        title: trade.title ?? null,
+        eventSlug: trade.eventSlug ?? null,
+      });
 
       // Log the detected trade
       const usdValue = (trade.size * trade.price).toFixed(2);

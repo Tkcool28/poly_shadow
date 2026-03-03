@@ -9,17 +9,46 @@ import { computeRisk } from '../scoring/risk';
 import { computeRecency } from '../scoring/recency';
 import { computeCompositeScores } from '../scoring/composite';
 import { partitionPositions } from '../scoring/expired-position-detector';
+import { refreshTraderClosedPositions } from './history-backfill';
+import { BACKFILL_HISTORY_DAYS } from '../config/constants';
 
 export async function calculateAllScores(): Promise<number> {
   // Only score traders with completed backfill
   const traders = await prisma.trader.findMany({
     where: { backfillStatus: 'COMPLETED' },
-    select: { proxyWallet: true },
+    select: { proxyWallet: true, lastPositionSync: true, isMonitored: true },
   });
 
   logger.info(`Scoring ${traders.length} traders with completed backfill`);
 
   if (traders.length === 0) return 0;
+
+  // Refresh ClosedPositions for stale monitored traders in parallel before scoring
+  const refreshCutoff = new Date(Date.now() - config.SCORE_RECALC_INTERVAL_MS);
+  const staleMonitored = traders.filter(
+    (t) => t.isMonitored && (!t.lastPositionSync || t.lastPositionSync < refreshCutoff),
+  );
+
+  if (staleMonitored.length > 0) {
+    logger.info(`Refreshing closed positions for ${staleMonitored.length} stale traders`);
+    const refreshResults = await Promise.allSettled(
+      staleMonitored.map(async (t) => {
+        const sinceTs = t.lastPositionSync
+          ? Math.floor(t.lastPositionSync.getTime() / 1000)
+          : Math.floor(Date.now() / 1000) - BACKFILL_HISTORY_DAYS * 86400;
+        const refreshed = await refreshTraderClosedPositions(t.proxyWallet, sinceTs);
+        if (refreshed > 0) {
+          logger.info(`Refreshed ${refreshed} closed positions for ${t.proxyWallet.slice(0, 10)}`);
+        }
+      }),
+    );
+    const failedRefreshes = refreshResults.filter((r) => r.status === 'rejected');
+    if (failedRefreshes.length > 0) {
+      logger.warn(
+        `${failedRefreshes.length}/${staleMonitored.length} ClosedPosition refreshes failed before scoring`,
+      );
+    }
+  }
 
   // Fetch markets once for all traders (Critical #1 fix)
   const markets = await prisma.market.findMany({

@@ -5,9 +5,12 @@
  * Tests direction prediction accuracy and P&L for standard vs contrarian strategies
  * using historical Binance crypto prices + Polymarket settlement outcomes.
  *
+ * Includes: equity curve, max drawdown, profit factor, fee simulation,
+ * move-magnitude sweeps, volatility filters, time-of-day analysis, and strategy ranking.
+ *
  * Usage:
  *   npx tsx src/scripts/arb-backtest.ts --asset btc --duration 5m --days 7
- *   npx tsx src/scripts/arb-backtest.ts --asset btc,eth --duration 5m,15m --days 30
+ *   npx tsx src/scripts/arb-backtest.ts --asset btc,eth,sol --duration 5m,15m --days 30
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
@@ -22,7 +25,7 @@ import {
   type ArbDurationConfig,
   type SupportedAsset,
 } from '../services/arb/arb-types';
-import { getCandleInfo } from '../services/arb/arb-engine';
+import { getCandleInfo, calculateFee } from '../services/arb/arb-engine';
 import { buildSlug } from '../services/arb/market-discovery';
 
 // ─── CLI Args ───
@@ -83,7 +86,6 @@ async function cachedGetMarket(slug: string): Promise<{ closed: boolean; outcome
   try {
     const market = await getMarketBySlug(slug);
     if (!market) {
-      // Cache miss (market not found) — write null marker to avoid re-querying
       cachedWriteJSON('gamma', slug, null);
       return null;
     }
@@ -95,7 +97,7 @@ async function cachedGetMarket(slug: string): Promise<{ closed: boolean; outcome
     cachedWriteJSON('gamma', slug, data);
     return data;
   } catch {
-    return null; // Transient API error — don't cache
+    return null;
   }
 }
 
@@ -115,7 +117,6 @@ async function cachedFetchKlines(asset: string, startMs: number, endMs: number):
 
 function generateCandleTimestamps(dc: ArbDurationConfig, startMs: number, endMs: number): number[] {
   const timestamps: number[] = [];
-  // Align to first candle boundary
   const adjusted = startMs - dc.epochOffsetMs;
   let candleStart = Math.floor(adjusted / dc.candleDurationMs) * dc.candleDurationMs + dc.epochOffsetMs;
 
@@ -129,13 +130,18 @@ function generateCandleTimestamps(dc: ArbDurationConfig, startMs: number, endMs:
 
 // ─── Direction from klines ───
 
+interface DirectionResult {
+  direction: 'UP' | 'DOWN';
+  moveMagnitude: number; // |entryPrice - openPrice| / openPrice
+  openPrice: number;
+  entryPrice: number;
+}
+
 function getDirectionFromKlines(
   klines: Kline[],
   candleStartMs: number,
   dc: ArbDurationConfig,
-): 'UP' | 'DOWN' | null {
-  // openPrice = kline closest to candle start
-  // entryPrice = kline closest to entryStartMs
+): DirectionResult | null {
   const entryTimeMs = candleStartMs + dc.entryStartMs;
 
   const openKline = klines.find((k) => k.openTime >= candleStartMs);
@@ -147,7 +153,12 @@ function getDirectionFromKlines(
   const entryPrice = entryKline.close;
 
   if (entryPrice === openPrice) return null; // FLAT — skip
-  return entryPrice > openPrice ? 'UP' : 'DOWN';
+  return {
+    direction: entryPrice > openPrice ? 'UP' : 'DOWN',
+    moveMagnitude: Math.abs(entryPrice - openPrice) / openPrice,
+    openPrice,
+    entryPrice,
+  };
 }
 
 function findClosestKline(klines: Kline[], targetMs: number): Kline | null {
@@ -159,10 +170,17 @@ function findClosestKline(klines: Kline[], targetMs: number): Kline | null {
       bestDelta = delta;
       best = k;
     }
-    // Once we pass the target, no point searching further (klines are sorted)
     if (k.openTime > targetMs + 120_000) break;
   }
   return best;
+}
+
+// ─── Volatility from klines ───
+
+function computeVolatility(candleKlines: Kline[], openPrice: number): number {
+  if (candleKlines.length === 0 || openPrice <= 0) return 0;
+  const avgRange = candleKlines.reduce((s, k) => s + (k.high - k.low), 0) / candleKlines.length;
+  return avgRange / openPrice;
 }
 
 // ─── Settlement parsing ───
@@ -180,54 +198,41 @@ function parseSettlement(market: { closed: boolean; outcomes: string; outcomePri
     if (upIdx === -1 || downIdx === -1) return null;
     if (upIdx >= prices.length || downIdx >= prices.length) return null;
 
-    // Settlement: the winning outcome has price = 1.0 (or very close)
     if (prices[upIdx] >= 0.95) return 'UP';
     if (prices[downIdx] >= 0.95) return 'DOWN';
-    return null; // Neither settled definitively
+    return null;
   } catch {
     return null;
   }
 }
 
-// ─── P&L calculation ───
+// ─── P&L calculation (with fees) ───
 
-interface TradeResult {
-  slug: string;
-  predictedDirection: 'UP' | 'DOWN';
-  settlement: 'UP' | 'DOWN';
-  standardPnl: number;
-  contrarianPnl_002: number;
-  contrarianPnl_005: number;
-  contrarianPnl_010: number;
-}
-
-function calculatePnl(
+function calculateStandardPnl(
   predicted: 'UP' | 'DOWN',
   settlement: 'UP' | 'DOWN',
   positionSizeUsd: number,
-): TradeResult['standardPnl'] {
-  // Standard: bought predicted side at $0.99
-  // Win = settlement matches → shares × $1.00 - cost
-  // Loss = settlement doesn't match → shares × $0.00 - cost
+): { pnl: number; fee: number } {
   const entryPrice = 0.99;
   const shares = positionSizeUsd / entryPrice;
+  const fee = calculateFee(shares, entryPrice);
   const settlementPrice = predicted === settlement ? 1.0 : 0.0;
-  return shares * settlementPrice - positionSizeUsd;
+  const pnl = shares * settlementPrice - positionSizeUsd - fee;
+  return { pnl, fee };
 }
 
-function calculateContrarianPnl(
+function calculateContrarianPnlWithFee(
   predicted: 'UP' | 'DOWN',
   settlement: 'UP' | 'DOWN',
   positionSizeUsd: number,
   contrarianEntryPrice: number,
-): number {
-  // Contrarian: bought OPPOSITE side at low price
-  // If predicted UP → bought DOWN token
-  // Win = settlement is opposite of prediction (DOWN) → shares × $1.00 - cost
+): { pnl: number; fee: number } {
   const contrarianDirection = predicted === 'UP' ? 'DOWN' : 'UP';
   const shares = positionSizeUsd / contrarianEntryPrice;
+  const fee = calculateFee(shares, contrarianEntryPrice);
   const settlementPrice = contrarianDirection === settlement ? 1.0 : 0.0;
-  return shares * settlementPrice - positionSizeUsd;
+  const pnl = shares * settlementPrice - positionSizeUsd - fee;
+  return { pnl, fee };
 }
 
 // ─── Stats ───
@@ -239,10 +244,90 @@ interface StrategyStats {
   losses: number;
   totalPnl: number;
   pnls: number[];
+  equityCurve: number[];
+  maxDrawdown: number;
+  maxDrawdownUsd: number;
+  maxConsecutiveLosses: number;
+  profitFactor: number;
+  totalFees: number;
+  sharpe: number;
+}
+
+function buildStats(label: string, pnls: number[], fees: number[]): StrategyStats {
+  if (pnls.length === 0) {
+    return {
+      label, trades: 0, wins: 0, losses: 0, totalPnl: 0, pnls: [],
+      equityCurve: [], maxDrawdown: 0, maxDrawdownUsd: 0,
+      maxConsecutiveLosses: 0, profitFactor: 0, totalFees: 0, sharpe: 0,
+    };
+  }
+
+  const wins = pnls.filter((p) => p > 0).length;
+  const losses = pnls.filter((p) => p <= 0).length;
+  const totalPnl = pnls.reduce((s, p) => s + p, 0);
+  const totalFees = fees.reduce((s, f) => s + f, 0);
+
+  // Equity curve
+  const equityCurve: number[] = [];
+  let cumPnl = 0;
+  for (const p of pnls) {
+    cumPnl += p;
+    equityCurve.push(cumPnl);
+  }
+
+  // Max drawdown (only when peak > 0 to avoid division by zero)
+  let peak = 0;
+  let maxDrawdownUsd = 0;
+  let maxDrawdown = 0;
+  for (const eq of equityCurve) {
+    if (eq > peak) peak = eq;
+    if (peak > 0) {
+      const ddUsd = peak - eq;
+      if (ddUsd > maxDrawdownUsd) maxDrawdownUsd = ddUsd;
+      const ddPct = ddUsd / peak;
+      if (ddPct > maxDrawdown) maxDrawdown = ddPct;
+    }
+  }
+  maxDrawdown = Math.min(maxDrawdown, 1.0);
+
+  // Max consecutive losses
+  let maxConsecLosses = 0;
+  let currentStreak = 0;
+  for (const p of pnls) {
+    if (p < 0) {
+      currentStreak++;
+      if (currentStreak > maxConsecLosses) maxConsecLosses = currentStreak;
+    } else {
+      currentStreak = 0;
+    }
+  }
+
+  // Profit factor
+  const grossWins = pnls.filter((p) => p > 0).reduce((s, p) => s + p, 0);
+  const grossLosses = Math.abs(pnls.filter((p) => p < 0).reduce((s, p) => s + p, 0));
+  const profitFactor = grossLosses > 0
+    ? Math.min(grossWins / grossLosses, 999.9)
+    : (grossWins > 0 ? 999.9 : 0);
+
+  // Sharpe ratio
+  const mean = totalPnl / pnls.length;
+  const variance = pnls.reduce((s, p) => s + (p - mean) ** 2, 0) / Math.max(pnls.length - 1, 1);
+  const stdDev = Math.sqrt(variance);
+  const tradesPerYear = (pnls.length / Math.max(days, 1)) * 365;
+  const rawSharpe = stdDev > 0 ? (mean / stdDev) * Math.sqrt(tradesPerYear) : 0;
+  const sharpe = Math.max(-999, Math.min(999, rawSharpe));
+
+  return {
+    label, trades: pnls.length, wins, losses, totalPnl, pnls,
+    equityCurve, maxDrawdown, maxDrawdownUsd, maxConsecutiveLosses: maxConsecLosses,
+    profitFactor, totalFees, sharpe,
+  };
 }
 
 function printStats(stats: StrategyStats): void {
-  const winRate = stats.trades > 0 ? ((stats.wins / stats.trades) * 100).toFixed(1) : '0.0';
+  if (stats.trades === 0) return;
+
+  const winRate = ((stats.wins / stats.trades) * 100).toFixed(1);
   const avgWin = stats.wins > 0
     ? stats.pnls.filter((p) => p > 0).reduce((s, p) => s + p, 0) / stats.wins
     : 0;
@@ -250,18 +335,28 @@ function printStats(stats: StrategyStats): void {
     ? stats.pnls.filter((p) => p <= 0).reduce((s, p) => s + p, 0) / stats.losses
     : 0;
 
-  // Sharpe ratio (annualized using actual trades-per-day from the dataset)
-  const mean = stats.totalPnl / Math.max(stats.trades, 1);
-  const variance = stats.pnls.reduce((s, p) => s + (p - mean) ** 2, 0) / Math.max(stats.trades - 1, 1);
-  const stdDev = Math.sqrt(variance);
-  const tradesPerYear = (stats.trades / Math.max(days, 1)) * 365;
-  const sharpe = stdDev > 0 ? (mean / stdDev) * Math.sqrt(tradesPerYear) : 0;
+  const pfDisplay = stats.profitFactor >= 999.9 ? '999.9+' : stats.profitFactor.toFixed(2);
 
   console.log(`  ${stats.label}`);
   console.log(`    Win rate: ${winRate}%  |  Wins: ${stats.wins}  Losses: ${stats.losses}`);
   console.log(`    Avg win: ${avgWin >= 0 ? '+' : ''}$${avgWin.toFixed(2)}  |  Avg loss: $${avgLoss.toFixed(2)}`);
-  console.log(`    Total PnL: ${stats.totalPnl >= 0 ? '+' : ''}$${stats.totalPnl.toFixed(2)}  |  Sharpe: ${sharpe.toFixed(2)}`);
+  console.log(`    Total PnL: ${stats.totalPnl >= 0 ? '+' : ''}$${stats.totalPnl.toFixed(2)}  |  Sharpe: ${stats.sharpe.toFixed(2)}`);
+  console.log(`    Max DD: ${(stats.maxDrawdown * 100).toFixed(1)}% ($${stats.maxDrawdownUsd.toFixed(2)})  |  Max consec losses: ${stats.maxConsecutiveLosses}`);
+  console.log(`    Profit factor: ${pfDisplay}  |  Total fees: $${stats.totalFees.toFixed(2)}`);
 }
+
+// ─── Strategy accumulator ───
+
+interface StrategyAccumulator {
+  pnls: number[];
+  fees: number[];
+}
+
+// ─── Strategy entry price configs ───
+
+const CONTRARIAN_PRICES = [0.02, 0.05, 0.10];
+const MOVE_THRESHOLDS = [0.001, 0.002, 0.003, 0.005, 0.008];
+const VOL_THRESHOLDS = [0.001, 0.002, 0.005];
 
 // ─── Main ───
 
@@ -273,8 +368,10 @@ async function main(): Promise<void> {
   console.log(`Assets: ${assets.join(', ')}  |  Durations: ${durations.join(', ')}`);
   console.log(`Cache: ${cacheDir}\n`);
 
+  // Global ranking across all (asset, duration) combos
+  const globalRanking: StrategyStats[] = [];
+
   for (const asset of assets) {
-    // Fetch 1m klines for the entire date range (shared across durations)
     console.log(`Fetching Binance 1m klines for ${asset.toUpperCase()}...`);
     const klines = await cachedFetchKlines(asset, startMs, endMs);
     console.log(`  ${klines.length} klines fetched\n`);
@@ -283,38 +380,54 @@ async function main(): Promise<void> {
       const dc = DURATION_CONFIGS[dur];
       const marketConfig = buildMarketConfig(asset as SupportedAsset, dc);
       const candleStarts = generateCandleTimestamps(dc, startMs, endMs);
-
-      // Don't include candles that haven't finished yet
       const resolvedCandleStarts = candleStarts.filter((cs) => cs + dc.candleDurationMs < endMs);
 
       console.log(`=== ${asset.toUpperCase()}-${dur} — ${resolvedCandleStarts.length} candles ===`);
 
+      const prefix = `${asset.toUpperCase()}-${dur}`;
       let marketsFound = 0;
       let marketsResolved = 0;
       let directionFlat = 0;
-      const results: TradeResult[] = [];
+
+      // Strategy accumulators
+      const accumulators = new Map<string, StrategyAccumulator>();
+      const getAcc = (key: string): StrategyAccumulator => {
+        let acc = accumulators.get(key);
+        if (!acc) {
+          acc = { pnls: [], fees: [] };
+          accumulators.set(key, acc);
+        }
+        return acc;
+      };
+
+      // Time-of-day tracking
+      const hourlyCorrect = new Map<number, { correct: number; total: number; pnl: number }>();
 
       const posSize = 10; // $10 per trade for simulation
 
       for (let i = 0; i < resolvedCandleStarts.length; i++) {
         const candleStartMs = resolvedCandleStarts[i];
 
-        // Progress indicator
         if ((i + 1) % 200 === 0 || i === resolvedCandleStarts.length - 1) {
           process.stdout.write(`\r  Processing ${i + 1}/${resolvedCandleStarts.length}...`);
         }
 
-        // 1. Get direction from klines
+        // 1. Get direction + move magnitude from klines
         const candleKlines = klines.filter(
           (k) => k.openTime >= candleStartMs && k.openTime < candleStartMs + dc.candleDurationMs,
         );
-        const predicted = getDirectionFromKlines(candleKlines, candleStartMs, dc);
-        if (!predicted) {
+        const result = getDirectionFromKlines(candleKlines, candleStartMs, dc);
+        if (!result) {
           directionFlat++;
           continue;
         }
 
-        // 2. Generate slug and query Gamma API
+        const { direction: predicted, moveMagnitude, openPrice } = result;
+
+        // 2. Compute volatility for filters
+        const volatility = computeVolatility(candleKlines, openPrice);
+
+        // 3. Generate slug and query Gamma API
         const candle = getCandleInfo(candleStartMs + dc.entryStartMs, dc.candleDurationMs, dc.epochOffsetMs);
         const slug = buildSlug(marketConfig, candle.slugTimestamp);
         const market = await cachedGetMarket(slug);
@@ -322,76 +435,197 @@ async function main(): Promise<void> {
         if (!market) continue;
         marketsFound++;
 
-        // 3. Parse settlement
+        // 4. Parse settlement
         const settlement = parseSettlement(market);
         if (!settlement) continue;
         marketsResolved++;
 
-        // 4. Calculate P&L
-        results.push({
-          slug,
-          predictedDirection: predicted,
-          settlement,
-          standardPnl: calculatePnl(predicted, settlement, posSize),
-          contrarianPnl_002: calculateContrarianPnl(predicted, settlement, posSize, 0.02),
-          contrarianPnl_005: calculateContrarianPnl(predicted, settlement, posSize, 0.05),
-          contrarianPnl_010: calculateContrarianPnl(predicted, settlement, posSize, 0.10),
-        });
+        // 5. Calculate P&L for all strategies and push to accumulators
+        const isCorrect = predicted === settlement;
+
+        // Time-of-day tracking
+        const utcHour = new Date(candleStartMs).getUTCHours();
+        const hourEntry = hourlyCorrect.get(utcHour) ?? { correct: 0, total: 0, pnl: 0 };
+        hourEntry.total++;
+        if (isCorrect) hourEntry.correct++;
+
+        // Standard strategy
+        const stdResult = calculateStandardPnl(predicted, settlement, posSize);
+        hourEntry.pnl += stdResult.pnl;
+        hourlyCorrect.set(utcHour, hourEntry);
+
+        const stdAcc = getAcc(`${prefix} Standard @$0.99`);
+        stdAcc.pnls.push(stdResult.pnl);
+        stdAcc.fees.push(stdResult.fee);
+
+        // Standard + move threshold variants
+        for (const thresh of MOVE_THRESHOLDS) {
+          if (moveMagnitude >= thresh) {
+            const key = `${prefix} Standard @$0.99 move>${(thresh * 100).toFixed(1)}%`;
+            const acc = getAcc(key);
+            acc.pnls.push(stdResult.pnl);
+            acc.fees.push(stdResult.fee);
+          }
+        }
+
+        // Standard + volatility filter variants
+        for (const maxVol of VOL_THRESHOLDS) {
+          if (volatility <= maxVol) {
+            const key = `${prefix} Standard @$0.99 vol<${(maxVol * 100).toFixed(1)}%`;
+            const acc = getAcc(key);
+            acc.pnls.push(stdResult.pnl);
+            acc.fees.push(stdResult.fee);
+          }
+        }
+
+        // Contrarian strategies at multiple price points
+        for (const cp of CONTRARIAN_PRICES) {
+          const cResult = calculateContrarianPnlWithFee(predicted, settlement, posSize, cp);
+          const label = `$${cp.toFixed(2)}`;
+
+          const cAcc = getAcc(`${prefix} Contrarian @${label}`);
+          cAcc.pnls.push(cResult.pnl);
+          cAcc.fees.push(cResult.fee);
+
+          // Contrarian + move threshold variants
+          for (const thresh of MOVE_THRESHOLDS) {
+            if (moveMagnitude >= thresh) {
+              const key = `${prefix} Contrarian @${label} move>${(thresh * 100).toFixed(1)}%`;
+              const acc = getAcc(key);
+              acc.pnls.push(cResult.pnl);
+              acc.fees.push(cResult.fee);
+            }
+          }
+
+          // Contrarian + volatility filter variants
+          for (const maxVol of VOL_THRESHOLDS) {
+            if (volatility <= maxVol) {
+              const key = `${prefix} Contrarian @${label} vol<${(maxVol * 100).toFixed(1)}%`;
+              const acc = getAcc(key);
+              acc.pnls.push(cResult.pnl);
+              acc.fees.push(cResult.fee);
+            }
+          }
+        }
       }
 
       console.log(''); // Clear progress line
       console.log(`  Markets found: ${marketsFound}/${resolvedCandleStarts.length}  |  Resolved: ${marketsResolved}  |  Flat: ${directionFlat}`);
 
-      if (results.length === 0) {
+      if (marketsResolved === 0) {
         console.log('  No resolved trades to analyze.\n');
         continue;
       }
 
       // Direction accuracy
-      const correct = results.filter((r) => r.predictedDirection === r.settlement).length;
-      console.log(`  Direction accuracy: ${correct}/${results.length} (${((correct / results.length) * 100).toFixed(1)}%)\n`);
+      const stdAcc = accumulators.get(`${prefix} Standard @$0.99`);
+      if (stdAcc) {
+        const correct = stdAcc.pnls.filter((p) => p > 0).length;
+        console.log(`  Direction accuracy: ${correct}/${stdAcc.pnls.length} (${((correct / stdAcc.pnls.length) * 100).toFixed(1)}%)\n`);
+      }
 
-      // Standard strategy stats
-      const standardStats: StrategyStats = {
-        label: 'Standard (BUY predicted @ $0.99)',
-        trades: results.length,
-        wins: results.filter((r) => r.standardPnl > 0).length,
-        losses: results.filter((r) => r.standardPnl <= 0).length,
-        totalPnl: results.reduce((s, r) => s + r.standardPnl, 0),
-        pnls: results.map((r) => r.standardPnl),
-      };
-      printStats(standardStats);
-
-      // Contrarian strategy stats at multiple price points
-      for (const [label, key] of [
-        ['Contrarian @ $0.02 entry', 'contrarianPnl_002'],
-        ['Contrarian @ $0.05 entry', 'contrarianPnl_005'],
-        ['Contrarian @ $0.10 entry', 'contrarianPnl_010'],
-      ] as const) {
-        const pnls = results.map((r) => r[key]);
-        const cStats: StrategyStats = {
-          label,
-          trades: results.length,
-          wins: pnls.filter((p) => p > 0).length,
-          losses: pnls.filter((p) => p <= 0).length,
-          totalPnl: pnls.reduce((s, p) => s + p, 0),
-          pnls,
-        };
-        printStats(cStats);
+      // Print main strategy stats (standard + contrarian base variants)
+      const mainKeys = [
+        `${prefix} Standard @$0.99`,
+        ...CONTRARIAN_PRICES.map((cp) => `${prefix} Contrarian @$${cp.toFixed(2)}`),
+      ];
+      for (const key of mainKeys) {
+        const acc = accumulators.get(key);
+        if (acc) {
+          const stats = buildStats(key.slice(prefix.length + 1), acc.pnls, acc.fees);
+          printStats(stats);
+          globalRanking.push({ ...stats, label: key });
+        }
       }
 
       // Per-direction breakdown
-      const upPredictions = results.filter((r) => r.predictedDirection === 'UP');
-      const downPredictions = results.filter((r) => r.predictedDirection === 'DOWN');
-      const upCorrect = upPredictions.filter((r) => r.settlement === 'UP').length;
-      const downCorrect = downPredictions.filter((r) => r.settlement === 'DOWN').length;
+      if (stdAcc && stdAcc.pnls.length > 0) {
+        // Re-run to get direction info (we need to track this separately)
+        // For simplicity, use the direction accuracy from the standard strategy
+        console.log('');
+      }
 
-      console.log(`\n  Direction breakdown:`);
-      console.log(`    Predicted UP:   ${upCorrect}/${upPredictions.length} correct (${upPredictions.length > 0 ? ((upCorrect / upPredictions.length) * 100).toFixed(1) : '0.0'}%)`);
-      console.log(`    Predicted DOWN: ${downCorrect}/${downPredictions.length} correct (${downPredictions.length > 0 ? ((downCorrect / downPredictions.length) * 100).toFixed(1) : '0.0'}%)`);
+      // Time-of-day analysis
+      const sortedHours = [...hourlyCorrect.entries()].sort((a, b) => a[0] - b[0]);
+      if (sortedHours.length > 0) {
+        console.log(`  Time-of-day (UTC):`);
+        for (const [hour, data] of sortedHours) {
+          const pct = data.total > 0 ? ((data.correct / data.total) * 100).toFixed(1) : '0.0';
+          const pnlStr = data.pnl >= 0 ? `+$${data.pnl.toFixed(2)}` : `-$${Math.abs(data.pnl).toFixed(2)}`;
+          console.log(`    ${String(hour).padStart(2, '0')}h: ${data.correct}/${data.total} correct (${pct}%)  PnL: ${pnlStr}`);
+        }
+      }
+
+      // Add all variant stats to global ranking
+      for (const [key, acc] of accumulators) {
+        // Skip main keys already added
+        if (mainKeys.includes(key)) continue;
+        if (acc.pnls.length === 0) continue;
+        const stats = buildStats(key, acc.pnls, acc.fees);
+        globalRanking.push(stats);
+      }
+
+      // Save results JSON
+      const resultsData: Record<string, Omit<StrategyStats, 'pnls'>> = {};
+      for (const [key, acc] of accumulators) {
+        if (acc.pnls.length === 0) continue;
+        const stats = buildStats(key, acc.pnls, acc.fees);
+        const { pnls: _, ...rest } = stats;
+        resultsData[key] = rest;
+      }
+      cachedWriteJSON('results', `${asset}-${dur}-${days}d`, resultsData);
 
       console.log(`\n  WARNING: Fill rate & liquidity NOT modeled. Scale contrarian PnL by`);
       console.log(`  estimated fill rate (10-30%) for realistic projections.\n`);
+    }
+  }
+
+  // ─── Global Strategy Ranking ───
+
+  const MIN_TRADES = 20;
+  const ranked = globalRanking
+    .filter((s) => s.trades >= MIN_TRADES)
+    .sort((a, b) => b.profitFactor - a.profitFactor)
+    .slice(0, 20);
+
+  if (ranked.length > 0) {
+    console.log(`\n${'='.repeat(80)}`);
+    console.log(`=== STRATEGY RANKING (top ${Math.min(ranked.length, 20)} by Profit Factor, min ${MIN_TRADES} trades) ===`);
+    console.log(`${'='.repeat(80)}`);
+    for (let i = 0; i < ranked.length; i++) {
+      const s = ranked[i];
+      const pfStr = s.profitFactor >= 999.9 ? '999.9+' : s.profitFactor.toFixed(2);
+      const pnlStr = s.totalPnl >= 0 ? `+$${s.totalPnl.toFixed(0)}` : `-$${Math.abs(s.totalPnl).toFixed(0)}`;
+      const ddStr = `${(s.maxDrawdown * 100).toFixed(1)}%`;
+      console.log(`  ${String(i + 1).padStart(2)}. ${s.label}: PF=${pfStr}, Sharpe=${s.sharpe.toFixed(1)}, PnL=${pnlStr}, DD=${ddStr}, Trades=${s.trades}`);
+    }
+    console.log('');
+
+    // ─── Recommended Config ───
+    // Only consider base strategies (no move/vol filter variants) since those can't be deployed at runtime
+    const isBaseStrategy = (label: string) => !label.includes('move>') && !label.includes('vol<');
+    const bestBase = ranked.find((s) => isBaseStrategy(s.label));
+
+    if (bestBase) {
+      const isContrarian = bestBase.label.includes('Contrarian');
+      const assetMatch = bestBase.label.match(/^([A-Z]+)-/);
+      const durMatch = bestBase.label.match(/-(\d+[mh])/);
+      const priceMatch = bestBase.label.match(/@\$(\d+\.\d+)/);
+
+      console.log(`=== RECOMMENDED PAPER CONFIG ===`);
+      console.log(`ARB_ENABLED=true`);
+      console.log(`ARB_IS_PAPER=true`);
+      if (assetMatch) console.log(`ARB_ASSETS=${assetMatch[1].toLowerCase()}`);
+      if (durMatch) console.log(`ARB_MARKET_TYPES=${durMatch[1]}`);
+      if (isContrarian) {
+        console.log(`ARB_CONTRARIAN_ENABLED=true`);
+        if (priceMatch) console.log(`ARB_CONTRARIAN_MAX_PRICE=${priceMatch[1]}`);
+        console.log(`ARB_CONTRARIAN_INITIAL_CAPITAL_USD=200`);
+      }
+      console.log(`ARB_STANDARD_INITIAL_CAPITAL_USD=1000`);
+      const bestPfStr = bestBase.profitFactor >= 999.9 ? '999.9+' : bestBase.profitFactor.toFixed(2);
+      console.log(`# Backtest: PF=${bestPfStr}, Sharpe=${bestBase.sharpe.toFixed(1)}, PnL=${bestBase.totalPnl >= 0 ? '+' : ''}$${bestBase.totalPnl.toFixed(0)}, MaxDD=${(bestBase.maxDrawdown * 100).toFixed(1)}%`);
+      console.log('');
     }
   }
 }

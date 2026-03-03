@@ -259,6 +259,53 @@ export async function getAllPositions(user: string): Promise<PositionData[]> {
   return all;
 }
 
+export async function getClosedPositionsSince(
+  user: string,
+  sinceTimestamp: number,
+): Promise<ClosedPositionData[]> {
+  const all: ClosedPositionData[] = [];
+  const pageSize = CLOSED_POSITIONS_PAGE_SIZE;
+  let offset = 0;
+
+  while (offset < CLOSED_POSITIONS_MAX_OFFSET) {
+    let batch: ClosedPositionData[];
+    try {
+      batch = await getClosedPositions({
+        user,
+        limit: pageSize,
+        offset,
+        sortBy: 'TIMESTAMP',
+        sortDirection: 'DESC',
+      });
+    } catch (err: any) {
+      if (offset > 0 && err.response?.status === 400) {
+        logger.warn(`Closed positions refresh hit API limit at offset ${offset} for ${user}`);
+        break;
+      }
+      throw err;
+    }
+    if (batch.length === 0) break;
+
+    let done = false;
+    for (const cp of batch) {
+      if (cp.timestamp > sinceTimestamp) {
+        all.push(cp);
+      } else {
+        done = true;
+        break;
+      }
+    }
+    if (done || batch.length < pageSize) break;
+    offset += batch.length;
+  }
+
+  if (offset >= CLOSED_POSITIONS_MAX_OFFSET) {
+    logger.warn(`Closed positions refresh reached max offset ${CLOSED_POSITIONS_MAX_OFFSET} for ${user}. Some recent settlements may be missing.`);
+  }
+
+  return all;
+}
+
 export async function getAllActivity(user: string): Promise<ActivityData[]> {
   const all: ActivityData[] = [];
   const pageSize = 500;

@@ -111,7 +111,7 @@ model Trade {
   price           Float
   timestamp       Int
   outcome         String
-  outcomeIndex    Int
+  outcomeIndex    Int?
   transactionHash String
   title           String?
   eventSlug       String?
@@ -388,6 +388,7 @@ model ArbCapital {
   currentCapital  Float                 // Available to deploy (auto-recycles on settlement)
   deployedCapital Float    @default(0)  // Locked in open arb positions
   isPaper         Boolean  @default(true)
+  strategy        String   @default("standard") // "standard" or "contrarian"
   totalPnl        Float    @default(0)  // Running cumulative P&L
   totalCycles     Int      @default(0)  // Total completed cycles
   totalWins       Int      @default(0)
@@ -395,7 +396,7 @@ model ArbCapital {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  @@unique([isPaper]) // One record per mode (paper vs live)
+  @@unique([isPaper, strategy]) // One record per (mode, strategy)
 }
 
 // ─── ArbCycle (per-candle arb cycle tracking) ───
@@ -448,6 +449,7 @@ model ArbCycle {
   status        ArbCycleStatus @default(PENDING)
   failReason    String?
   isPaper       Boolean @default(true)
+  strategy      String  @default("standard") // "standard" or "contrarian"
 
   // Timing
   enteredAt     DateTime?
@@ -455,11 +457,12 @@ model ArbCycle {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
-  @@unique([marketType, candleStartMs, isPaper]) // One cycle per candle per engine
+  @@unique([marketType, candleStartMs, isPaper, strategy]) // One cycle per candle per engine per strategy
   @@index([status])
   @@index([marketType, candleStartMs])
   @@index([createdAt(sort: Desc)])
   @@index([isPaper, status])
+  @@index([isPaper, strategy, status])
 }
 
 // ─── SystemHealth ───
