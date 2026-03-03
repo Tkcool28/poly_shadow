@@ -110,8 +110,11 @@ export async function sweepPositionSettlements(): Promise<void> {
       continue;
     }
 
-    const normalizedOutcome = meta.outcome.trim().toLowerCase();
-    const outcomeIndex = outcomes.findIndex(o => o.trim().toLowerCase() === normalizedOutcome);
+    // Strip punctuation before comparing — API outcome strings sometimes differ in apostrophes/quotes
+    // e.g. DB: "Anyones Legend" vs API: "Anyone's Legend" → both normalize to "anyones legend"
+    const stripPunct = (s: string) => s.replace(/[^\w\s]/g, '').trim().toLowerCase();
+    const normalizedOutcome = stripPunct(meta.outcome);
+    const outcomeIndex = outcomes.findIndex(o => stripPunct(o) === normalizedOutcome);
     if (outcomeIndex < 0 || outcomeIndex >= outcomePrices.length) {
       log.warn('Settlement: outcome not found in market', {
         outcome: meta.outcome,

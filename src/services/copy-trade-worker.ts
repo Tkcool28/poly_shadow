@@ -160,6 +160,9 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       copyAmountUsd = globalRemaining;
     }
   }
+  // Guard: skip if amount is effectively zero (can happen after position-cap trim on tiny signal trades)
+  if (copyAmountUsd <= 0) return;
+
   // Paper: pool if below paper pool threshold
   if (trade.side === 'BUY' && isPaper && copyAmountUsd < config.POOL_MIN_AMOUNT_USD) {
     await addToPool(trade, copyAmountUsd, { id: allocation.id, isPaper });
