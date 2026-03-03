@@ -119,9 +119,33 @@ export async function redeemWinningPositions(positions: ClaimablePosition[]): Pr
   }
 }
 
+// Poll for a transaction receipt directly instead of relying on ethers block-event listeners,
+// which break when the RPC has a block-height skew (e.g. some public nodes lag by millions of blocks).
+async function pollReceipt(
+  txHash: string,
+  timeoutMs = 120_000,
+  intervalMs = 4_000,
+): Promise<ethers.providers.TransactionReceipt> {
+  const p = getProvider();
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const receipt = await p.getTransactionReceipt(txHash);
+    if (receipt) return receipt;
+    await new Promise(r => setTimeout(r, intervalMs));
+  }
+  throw new Error(`Tx ${txHash} not mined within ${timeoutMs / 1000}s`);
+}
+
 async function claimOne(pos: ClaimablePosition): Promise<void> {
   const indexSets = [1 << pos.outcomeIndex]; // Yes=0→[1], No=1→[2]
   const s = getSigner();
+
+  // Polygon requires a minimum priority fee of 25 gwei.
+  // ethers v5 default (1.5 gwei) is too low — override explicitly.
+  const gasOverrides = {
+    maxPriorityFeePerGas: ethers.utils.parseUnits('30', 'gwei'),
+    maxFeePerGas: ethers.utils.parseUnits('60', 'gwei'),
+  };
 
   try {
     let txHash: string;
@@ -131,9 +155,10 @@ async function claimOne(pos: ClaimablePosition): Promise<void> {
       const ctf = new ethers.Contract(CTF_ADDRESS, CTF_ABI, s);
       const tx = await ctf.redeemPositions(
         USDC_ADDRESS, ethers.constants.HashZero, pos.conditionId, indexSets,
-        { gasLimit: 200_000 },
+        { gasLimit: 200_000, ...gasOverrides },
       );
-      txHash = (await tx.wait()).transactionHash;
+      txHash = tx.hash;
+      await pollReceipt(txHash);
     } else {
       // POLY_PROXY (type=1): route through ProxyWalletFactory
       const ctfIface = new ethers.utils.Interface(CTF_ABI);
@@ -143,9 +168,10 @@ async function claimOne(pos: ClaimablePosition): Promise<void> {
       const factory = new ethers.Contract(PROXY_FACTORY_ADDRESS, PROXY_FACTORY_ABI, s);
       const tx = await factory.proxy(
         [{ typeCode: 1, to: CTF_ADDRESS, value: 0, data: redeemData }],
-        { gasLimit: 500_000 },
+        { gasLimit: 500_000, ...gasOverrides },
       );
-      txHash = (await tx.wait()).transactionHash;
+      txHash = tx.hash;
+      await pollReceipt(txHash);
     }
 
     // Remove from retry queue on success

@@ -5,3 +5,4 @@ logs/
 *.log
 prisma/generated/
 .claude/
+src/scripts/backtest-cache/

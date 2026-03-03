@@ -6,6 +6,9 @@ const log = createJobLogger('arb-market-discovery');
 
 // Cache: slug → MarketInfo (token IDs don't change per market)
 const cache = new Map<string, MarketInfo>();
+// Tracks when each slug's prices were last refreshed (for contrarian TTL)
+const lastRefreshAt = new Map<string, number>();
+const PRICE_REFRESH_TTL_MS = 5_000; // 5 seconds between price refreshes
 
 // Full names used in hourly slugs
 const ASSET_FULL_NAMES: Record<string, string> = {
@@ -59,12 +62,21 @@ function buildHourlySlug(asset: string, slugTimestamp: number): string {
 }
 
 /**
- * Discover a BTC Up/Down market by slug, returning token IDs for Up and Down outcomes.
+ * Discover a crypto Up/Down market by slug, returning token IDs and outcome prices.
  * Results are cached since token IDs are immutable per market.
+ *
+ * @param refreshPrices - When true, refresh outcome prices from the API.
+ *   Throttled to once per 5 seconds per slug to avoid excessive API calls.
  */
-export async function discoverMarket(slug: string): Promise<MarketInfo | null> {
+export async function discoverMarket(slug: string, refreshPrices = false): Promise<MarketInfo | null> {
   const cached = cache.get(slug);
-  if (cached) return cached;
+  if (cached && !refreshPrices) return cached;
+
+  // Throttle price refreshes: return cached data if refreshed recently
+  if (cached && refreshPrices) {
+    const lastRefresh = lastRefreshAt.get(slug) ?? 0;
+    if (Date.now() - lastRefresh < PRICE_REFRESH_TTL_MS) return cached;
+  }
 
   const market = await getMarketBySlug(slug);
   if (!market) {
@@ -101,21 +113,39 @@ export async function discoverMarket(slug: string): Promise<MarketInfo | null> {
     return null;
   }
 
+  // Parse current outcome prices (for contrarian entry decisions)
+  let upPrice: number | undefined;
+  let downPrice: number | undefined;
+  if (typeof market.outcomePrices === 'string') {
+    try {
+      const prices: number[] = JSON.parse(market.outcomePrices).map(Number);
+      if (upIndex < prices.length && Number.isFinite(prices[upIndex])) upPrice = prices[upIndex];
+      if (downIndex < prices.length && Number.isFinite(prices[downIndex])) downPrice = prices[downIndex];
+    } catch { /* non-critical — prices are optional */ }
+  }
+
   const info: MarketInfo = {
     slug,
     upTokenId: clobTokenIds[upIndex],
     downTokenId: clobTokenIds[downIndex],
     conditionId: market.conditionId,
     negRisk: market.negRisk ?? false,
+    upPrice,
+    downPrice,
   };
 
   cache.set(slug, info);
-  log.info(`Discovered market: ${slug}`, {
-    conditionId: info.conditionId.slice(0, 16) + '...',
-    upToken: info.upTokenId.slice(0, 16) + '...',
-    downToken: info.downTokenId.slice(0, 16) + '...',
-    negRisk: info.negRisk,
-  });
+  if (refreshPrices) lastRefreshAt.set(slug, Date.now());
+
+  // Only log on first discovery (not price refreshes)
+  if (!cached) {
+    log.info(`Discovered market: ${slug}`, {
+      conditionId: info.conditionId.slice(0, 16) + '...',
+      upToken: info.upTokenId.slice(0, 16) + '...',
+      downToken: info.downTokenId.slice(0, 16) + '...',
+      negRisk: info.negRisk,
+    });
+  }
 
   return info;
 }
@@ -132,6 +162,7 @@ export function pruneCache(maxEntries = 500): void {
   for (const key of cache.keys()) {
     if (removed >= toRemove) break;
     cache.delete(key);
+    lastRefreshAt.delete(key);
     removed++;
   }
   log.debug(`Pruned ${removed} entries from market cache`);

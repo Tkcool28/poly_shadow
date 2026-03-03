@@ -142,9 +142,10 @@ export class ArbEngine {
     const candle = this.currentCandle!;
 
     // 1. Retry market discovery if it failed earlier (allow retry next tick)
-    if (!candle.marketInfo) {
+    //    Contrarian mode: always refresh prices (outcome prices change each tick)
+    if (!candle.marketInfo || config.ARB_CONTRARIAN_ENABLED) {
       const slug = buildSlug(this.marketConfig, candle.slugTimestamp);
-      candle.marketInfo = await discoverMarket(slug);
+      candle.marketInfo = await discoverMarket(slug, config.ARB_CONTRARIAN_ENABLED);
       if (!candle.marketInfo) {
         return; // No entered=true — retry next tick
       }
@@ -160,7 +161,10 @@ export class ArbEngine {
       }
 
       const capital = await this.getCapital();
-      if (!capital || capital.currentCapital < config.ARB_POSITION_SIZE_USD) {
+      const requiredCapital = config.ARB_CONTRARIAN_ENABLED
+        ? config.ARB_CONTRARIAN_POSITION_SIZE_USD
+        : config.ARB_POSITION_SIZE_USD;
+      if (!capital || capital.currentCapital < requiredCapital) {
         const reason = `insufficient capital: $${capital?.currentCapital.toFixed(2) ?? 0}`;
         candle.permanentSkipChecked = true;
         candle.permanentSkipReason = reason;
@@ -202,21 +206,51 @@ export class ArbEngine {
       return; // Low confidence — allow retry next tick
     }
 
-    const direction = confidence.direction;
+    const modelDirection = confidence.direction;
 
-    // Select token
-    const tokenId = direction === 'UP'
-      ? candle.marketInfo.upTokenId
-      : candle.marketInfo.downTokenId;
+    // Select token and sizing based on mode
+    let entryDirection: 'UP' | 'DOWN';
+    let tokenId: string;
+    let positionSize: number;
+    let detectedPrice: number;
+
+    if (config.ARB_CONTRARIAN_ENABLED) {
+      // Contrarian: buy the OPPOSITE token at low price
+      entryDirection = modelDirection === 'UP' ? 'DOWN' : 'UP';
+      tokenId = modelDirection === 'UP'
+        ? candle.marketInfo.downTokenId
+        : candle.marketInfo.upTokenId;
+
+      const oppositePrice = modelDirection === 'UP'
+        ? candle.marketInfo.downPrice
+        : candle.marketInfo.upPrice;
+
+      if (!oppositePrice || !Number.isFinite(oppositePrice)
+          || oppositePrice > config.ARB_CONTRARIAN_MAX_PRICE) {
+        return; // Too expensive or no price — retry next tick
+      }
+
+      positionSize = config.ARB_CONTRARIAN_POSITION_SIZE_USD;
+      detectedPrice = oppositePrice;
+    } else {
+      // Standard: buy predicted direction at high price
+      entryDirection = modelDirection;
+      tokenId = modelDirection === 'UP'
+        ? candle.marketInfo.upTokenId
+        : candle.marketInfo.downTokenId;
+      positionSize = config.ARB_POSITION_SIZE_USD;
+      detectedPrice = config.ARB_MAX_ENTRY_PRICE;
+    }
 
     // Optional order book check (only available with own wallet)
     const orderBook = await arbGetOrderBook(tokenId);
     if (orderBook) {
+      const maxPrice = config.ARB_CONTRARIAN_ENABLED ? detectedPrice : config.ARB_MAX_ENTRY_PRICE;
       const availableLiquidity = (orderBook.asks ?? [])
-        .filter((a: { price: string }) => parseFloat(a.price) <= config.ARB_MAX_ENTRY_PRICE)
+        .filter((a: { price: string }) => parseFloat(a.price) <= maxPrice)
         .reduce((sum: number, a: { size: string }) => sum + parseFloat(a.size), 0);
 
-      const requiredShares = config.ARB_POSITION_SIZE_USD / config.ARB_MAX_ENTRY_PRICE;
+      const requiredShares = positionSize / maxPrice;
       if (availableLiquidity < requiredShares) {
         await this.recordSkip(
           `low liquidity: ${availableLiquidity.toFixed(0)} < ${requiredShares.toFixed(0)} required`,
@@ -231,8 +265,8 @@ export class ArbEngine {
     const result = await arbExecuteOrder({
       tokenId,
       side: 'BUY',
-      amount: config.ARB_POSITION_SIZE_USD,
-      detectedPrice: config.ARB_MAX_ENTRY_PRICE,
+      amount: positionSize,
+      detectedPrice,
     });
 
     if (result.status !== 'FILLED' || !result.filledSize || !result.filledPrice) {
@@ -271,7 +305,7 @@ export class ArbEngine {
             conditionId: candle.marketInfo!.conditionId,
             btcOpenPrice: candle.openPrice,
             btcEntryPrice: this.priceFeed.lastPrice,
-            direction,
+            direction: entryDirection,
             tokenId,
             entryPrice: result.filledPrice,
             entryShares: result.filledSize,
@@ -279,7 +313,11 @@ export class ArbEngine {
             orderId: result.orderId,
             estimatedFee,
             confidenceScore: confidence.score,
-            confidenceSignals: JSON.stringify(confidence.signals),
+            confidenceSignals: JSON.stringify({
+              ...confidence.signals,
+              modelDirection,
+              contrarian: config.ARB_CONTRARIAN_ENABLED,
+            }),
             status: ArbCycleStatus.ENTERED,
             isPaper: this.isPaper,
             enteredAt: new Date(),
@@ -307,7 +345,7 @@ export class ArbEngine {
 
     // Update candle state
     candle.entered = true;
-    candle.entryDirection = direction;
+    candle.entryDirection = entryDirection;
     candle.entryTokenId = tokenId;
     candle.entryPrice = result.filledPrice;
     candle.entryShares = result.filledSize;
@@ -315,8 +353,10 @@ export class ArbEngine {
     candle.orderId = result.orderId;
     candle.cycleId = cycle.id;
 
-    this.log.info(`ENTERED ${direction}`, {
+    const modeLabel = config.ARB_CONTRARIAN_ENABLED ? 'CONTRARIAN' : 'ENTERED';
+    this.log.info(`${modeLabel} ${entryDirection}`, {
       market: this.marketConfig.type,
+      ...(config.ARB_CONTRARIAN_ENABLED ? { modelSaid: modelDirection } : {}),
       confidence: confidence.score.toFixed(3),
       price: result.filledPrice.toFixed(4),
       shares: result.filledSize.toFixed(2),

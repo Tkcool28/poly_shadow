@@ -62,7 +62,7 @@ const envSchema = z.object({
   POOL_BURN_TIMEOUT_MS: z.coerce.number().default(180000), // 3 min per-entry FIFO burn window
 
   // Auto-claim: on-chain redemption of won conditional tokens
-  POLYGON_RPC_URL: z.string().default('https://1rpc.io/matic'),
+  POLYGON_RPC_URL: z.string().default('https://polygon-bor-rpc.publicnode.com'),
   AUTO_CLAIM_ENABLED: z
     .string()
     .default('false')
@@ -122,6 +122,14 @@ const envSchema = z.object({
     .default('true')
     .transform((v) => v === 'true'),
   ARB_STOP_LOSS_PRICE: z.coerce.number().min(0.01).max(0.95).default(0.50),
+
+  // Contrarian mode (buy the opposite outcome token at low price)
+  ARB_CONTRARIAN_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+  ARB_CONTRARIAN_MAX_PRICE: z.coerce.number().min(0.01).max(0.20).default(0.10),
+  ARB_CONTRARIAN_POSITION_SIZE_USD: z.coerce.number().min(1).max(1000).default(10),
 
   // Settlement sweep (background, non-blocking)
   ARB_SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(10000),  // 10s sweep cadence

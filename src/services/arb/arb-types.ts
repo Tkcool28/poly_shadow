@@ -88,6 +88,8 @@ export interface MarketInfo {
   downTokenId: string;
   conditionId: string;
   negRisk: boolean;
+  upPrice?: number;    // Current UP outcome price (for contrarian entry)
+  downPrice?: number;  // Current DOWN outcome price (for contrarian entry)
 }
 
 // ─── Candle runtime state ───

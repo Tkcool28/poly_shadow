@@ -144,9 +144,12 @@ export async function sweepArbSettlements(): Promise<void> {
     // Market not yet resolved — check stop-loss, then timeout
 
     // Stop-loss: sell early if outcome price dropped too far
+    // Skip for contrarian/low-entry positions — max loss is already capped at entry price,
+    // and the token price will always be below the stop-loss threshold (e.g., entry $0.05 < stop $0.50)
     if (config.ARB_STOP_LOSS_ENABLED
         && market && !market.closed && market.outcomePrices
-        && cycle.tokenId && cycle.entryShares && cycle.entryShares > 0) {
+        && cycle.tokenId && cycle.entryShares && cycle.entryShares > 0
+        && cycle.entryPrice && cycle.entryPrice > config.ARB_STOP_LOSS_PRICE) {
       try {
         const outcomes: string[] = JSON.parse(market.outcomes);
         const prices: number[] = JSON.parse(market.outcomePrices).map(Number);
