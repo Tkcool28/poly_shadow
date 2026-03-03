@@ -237,28 +237,46 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
           ? makingAmount / takingAmount : null;
       }
     } else {
-      // SELL: makingAmount = USDC received, takingAmount = shares given
+      // SELL: standard convention: makingAmount = USDC received, takingAmount = shares given.
+      // NegRisk markets invert this: makingAmount = shares given, takingAmount = USDC received.
       filledSize = takingAmount > 0 ? takingAmount : null;
       filledPrice = takingAmount > 0 && makingAmount > 0
         ? makingAmount / takingAmount : null;
+      if (filledPrice !== null && filledPrice > 1.0) {
+        // NegRisk SELL: swap convention
+        filledSize = makingAmount > 0 ? makingAmount : null;
+        filledPrice = makingAmount > 0 && takingAmount > 0
+          ? takingAmount / makingAmount : null;
+      }
     }
 
-    // Guard: ghost fill (null/zero amounts) or impossible price for a prediction market
-    if (!filledSize || !filledPrice || filledPrice > 1.0) {
-      log.warn('Ghost fill detected: CLOB success but invalid fill data', {
+    // Guard: FOK order submitted but not matched (no fill amounts) — treat as SKIPPED
+    if (!filledSize || !filledPrice) {
+      log.info('FOK order unmatched (no fill amounts)', {
         orderId,
         side,
         makingAmount: response?.makingAmount,
         takingAmount: response?.takingAmount,
-        filledSize,
-        filledPrice,
       });
+      return {
+        orderId,
+        status: 'SKIPPED',
+        filledPrice: null,
+        filledSize: null,
+        failReason: 'no matching orders (FOK unmatched)',
+        transactionHashes: txHashes,
+      };
+    }
+
+    // Guard: impossible price for a prediction market (should not reach here after NegRisk flip)
+    if (filledPrice > 1.0) {
+      log.warn('Ghost fill: impossible price', { orderId, side, filledPrice });
       return {
         orderId,
         status: 'FAILED',
         filledPrice: null,
         filledSize: null,
-        failReason: `ghost fill: ${filledPrice != null && filledPrice > 1.0 ? `impossible price ${filledPrice}` : 'no fill amounts'}`,
+        failReason: `ghost fill: impossible price ${filledPrice.toFixed(6)}`,
         transactionHashes: txHashes,
       };
     }
@@ -283,6 +301,21 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
     };
   } catch (err: any) {
     const msg: string = err.message || String(err);
+
+    // Expired orderbook — market closed, tokenId no longer valid.
+    // Use exact string; broad 400 match would swallow legitimate CLOB errors.
+    if (msg.includes('orderbook does not exist')) {
+      metadataCache.delete(tokenId); // clear stale cache entry
+      log.info('Market expired: orderbook does not exist', { tokenId: tokenId.slice(0, 20) });
+      return {
+        orderId: null,
+        status: 'SKIPPED',
+        filledPrice: null,
+        filledSize: null,
+        failReason: 'market expired: orderbook does not exist',
+        transactionHashes: [],
+      };
+    }
 
     // Rate limit — retry once (non-recursive to avoid infinite loop)
     if ((msg.includes('429') || msg.includes('rate limit')) && !params._isRetry) {

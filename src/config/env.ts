@@ -51,14 +51,17 @@ const envSchema = z.object({
     .string()
     .default('false')
     .transform((v) => v === 'true'),
-  MAX_POSITION_USD: z.coerce.number().min(1).max(10000).default(50),
+  MAX_POSITION_USD: z.coerce.number().min(1).max(10000).default(2),
   MAX_DAILY_LOSS_USD: z.coerce.number().min(1).max(100000).default(200),
   MAX_TRADE_PERCENT: z.coerce.number().min(0.01).max(1.0).default(0.50), // Max 50% of allocation per trade
   PORTFOLIO_VALUE_REFRESH_MS: z.coerce.number().default(300000), // 5 min
   SLIPPAGE_BPS: z.coerce.number().min(10).max(1000).default(200), // 2% default
+  COPY_TRADE_PERCENT: z.coerce.number().min(0.01).max(1.0).default(0.10), // Copy 10% of trader's actual trade size
+  MIN_COMPOSITE_SCORE: z.coerce.number().min(0).max(1).default(0.60), // Skip BUY trades below this score (0 = disabled)
+  MIN_SIGNAL_TRADE_USD: z.coerce.number().min(0).default(10), // Skip BUY trades where trader's USD < this (0 = disabled)
 
   // Order aggregation pool
-  POOL_MIN_AMOUNT_USD: z.coerce.number().min(0.01).max(100).default(0.10), // min to execute (matches current threshold)
+  POOL_MIN_AMOUNT_USD: z.coerce.number().min(0.01).max(100).default(0.50), // min USD to pool paper trades
   POOL_BURN_TIMEOUT_MS: z.coerce.number().default(180000), // 3 min per-entry FIFO burn window
 
   // Auto-claim: on-chain redemption of won conditional tokens
@@ -104,6 +107,8 @@ const envSchema = z.object({
 
   // Capital (separate from copy-trade)
   ARB_INITIAL_CAPITAL_USD: z.coerce.number().min(1).default(1000),
+  ARB_STANDARD_INITIAL_CAPITAL_USD: z.coerce.number().min(1).optional(), // Falls back to ARB_INITIAL_CAPITAL_USD
+  ARB_CONTRARIAN_INITIAL_CAPITAL_USD: z.coerce.number().min(1).default(200),
   ARB_POSITION_SIZE_USD: z.coerce.number().min(1).max(50000).default(500),
   ARB_MAX_DAILY_LOSS_USD: z.coerce.number().min(1).default(500),
 

@@ -53,25 +53,11 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     return;
   }
 
-  // Check cached trader portfolio value
-  if (!allocation.traderPortfolioValue || allocation.traderPortfolioValue <= 0) {
-    await createSkippedRecord(trade, 'trader portfolio value unknown', allocation.id, isPaper);
-    return;
-  }
-
-  // Check portfolio value freshness (stale data = bad sizing)
-  const maxStaleMs = 30 * 60 * 1000; // 30 minutes
-  if (allocation.portfolioValueAt &&
-      Date.now() - allocation.portfolioValueAt.getTime() > maxStaleMs) {
-    await createSkippedRecord(trade, 'trader portfolio value stale', allocation.id, isPaper);
-    return;
-  }
-
   // ─── Sizing ───
 
   let copyAmountUsd: number;
   let sellShares: number | null = null;
-  let cappedPercent: number | null = null;
+  let traderTradeUsd: number | null = null;
 
   if (trade.side === 'SELL') {
     const heldShares = await getHeldShares(trade.asset, allocation.id, isPaper);
@@ -92,10 +78,27 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     // Guard: negative or zero capital means no buying power — skip silently
     if (allocation.currentCapital <= 0) return;
 
-    const tradeUsdValue = trade.size * trade.price;
-    const tradePercent = tradeUsdValue / allocation.traderPortfolioValue;
-    cappedPercent = Math.min(tradePercent, config.MAX_TRADE_PERCENT);
-    copyAmountUsd = cappedPercent * allocation.currentCapital;
+    traderTradeUsd = trade.size * trade.price;
+
+    // ─── Quality gates ───
+    if (trade.compositeScore !== null && trade.compositeScore < config.MIN_COMPOSITE_SCORE) {
+      await createSkippedRecord(trade,
+        `composite score ${trade.compositeScore.toFixed(4)} below minimum ${config.MIN_COMPOSITE_SCORE}`,
+        allocation.id, isPaper);
+      return;
+    }
+    if (config.MIN_SIGNAL_TRADE_USD > 0 && traderTradeUsd < config.MIN_SIGNAL_TRADE_USD) {
+      await createSkippedRecord(trade,
+        `signal trade size $${traderTradeUsd.toFixed(2)} below minimum $${config.MIN_SIGNAL_TRADE_USD}`,
+        allocation.id, isPaper);
+      return;
+    }
+
+    // ─── Trade-proportional sizing ───
+    copyAmountUsd = traderTradeUsd * config.COPY_TRADE_PERCENT;
+    // Cap at 2× percent (never exceed 20% of signal trade size)
+    copyAmountUsd = Math.min(copyAmountUsd, traderTradeUsd * (config.COPY_TRADE_PERCENT * 2));
+    // Absolute dollar cap
     copyAmountUsd = Math.min(copyAmountUsd, config.MAX_POSITION_USD);
   }
 
@@ -148,7 +151,15 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     }
   }
 
-  if (trade.side === 'BUY' && copyAmountUsd < CLOB_MIN_ORDER_USD) {
+  // Live: skip immediately if below CLOB $1 minimum (no pooling for live orders)
+  if (trade.side === 'BUY' && !isPaper && copyAmountUsd < CLOB_MIN_ORDER_USD) {
+    await createSkippedRecord(trade,
+      `live copy amount $${copyAmountUsd.toFixed(2)} below CLOB minimum $${CLOB_MIN_ORDER_USD}`,
+      allocation.id, isPaper);
+    return;
+  }
+  // Paper: pool if below paper pool threshold
+  if (trade.side === 'BUY' && isPaper && copyAmountUsd < config.POOL_MIN_AMOUNT_USD) {
     await addToPool(trade, copyAmountUsd, { id: allocation.id, isPaper });
     return;
   }
@@ -277,7 +288,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       side: trade.side,
       outcome: trade.outcome,
       title: trade.title?.slice(0, 50),
-      tradePercent: cappedPercent != null ? (cappedPercent * 100).toFixed(2) + '%' : 'full-close',
+      signalTradeUsd: traderTradeUsd != null ? `$${traderTradeUsd.toFixed(2)}` : undefined,
       copyAmountUsd: copyAmountUsd.toFixed(2),
       filledPrice: result.filledPrice,
       filledSize: result.filledSize,

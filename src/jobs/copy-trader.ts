@@ -121,6 +121,7 @@ async function main() {
         where: {
           copyTrade: null,
           detectedAt: { gte: staleCutoff },
+          timestamp: { gte: Math.floor(staleCutoff.getTime() / 1000) },
           proxyWallet: { in: activeWallets },
         },
         orderBy: { detectedAt: 'asc' },
