@@ -123,7 +123,7 @@ export async function redeemWinningPositions(positions: ClaimablePosition[]): Pr
 // which break when the RPC has a block-height skew (e.g. some public nodes lag by millions of blocks).
 async function pollReceipt(
   txHash: string,
-  timeoutMs = 120_000,
+  timeoutMs = 300_000,
   intervalMs = 4_000,
 ): Promise<ethers.providers.TransactionReceipt> {
   const p = getProvider();
@@ -141,11 +141,15 @@ async function claimOne(pos: ClaimablePosition): Promise<void> {
   const s = getSigner();
 
   // Polygon requires a minimum priority fee of 25 gwei.
-  // ethers v5 default (1.5 gwei) is too low — override explicitly.
-  const gasOverrides = {
-    maxPriorityFeePerGas: ethers.utils.parseUnits('30', 'gwei'),
-    maxFeePerGas: ethers.utils.parseUnits('60', 'gwei'),
-  };
+  // ethers v5 default (1.5 gwei) is too low, and hardcoded maxFeePerGas can undershoot
+  // when the baseFee spikes. Fetch current network fees and apply a 2× buffer.
+  const feeData = await getProvider().getFeeData();
+  const priorityFee = feeData.maxPriorityFeePerGas?.gt(ethers.utils.parseUnits('30', 'gwei'))
+    ? feeData.maxPriorityFeePerGas
+    : ethers.utils.parseUnits('30', 'gwei');
+  const baseFee = feeData.lastBaseFeePerGas ?? ethers.utils.parseUnits('100', 'gwei');
+  const maxFee = baseFee.mul(2).add(priorityFee); // 2× buffer over current baseFee
+  const gasOverrides = { maxPriorityFeePerGas: priorityFee, maxFeePerGas: maxFee };
 
   try {
     let txHash: string;
