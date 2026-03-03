@@ -49,6 +49,7 @@ async function bootstrapStrategyConfigs(): Promise<void> {
       positionSizeUsd: config.ARB_CONTRARIAN_POSITION_SIZE_USD,
       maxEntryPrice: config.ARB_CONTRARIAN_MAX_PRICE,
       initialCapitalUsd: config.ARB_CONTRARIAN_INITIAL_CAPITAL_USD,
+      everyNth: 3,
     },
     {
       strategy: 'contrarian-antimart',
@@ -56,6 +57,7 @@ async function bootstrapStrategyConfigs(): Promise<void> {
       positionSizeUsd: config.ARB_CONTRARIAN_POSITION_SIZE_USD,
       maxEntryPrice: config.ARB_CONTRARIAN_MAX_PRICE,
       initialCapitalUsd: config.ARB_CONTRARIAN_INITIAL_CAPITAL_USD,
+      antiMartingale: true,
     },
     {
       strategy: 'contrarian-cooldown',
@@ -63,6 +65,8 @@ async function bootstrapStrategyConfigs(): Promise<void> {
       positionSizeUsd: config.ARB_CONTRARIAN_POSITION_SIZE_USD,
       maxEntryPrice: config.ARB_CONTRARIAN_MAX_PRICE,
       initialCapitalUsd: config.ARB_CONTRARIAN_INITIAL_CAPITAL_USD,
+      cooldownLosses: 3,
+      cooldownSkip: 2,
     },
   ];
 
@@ -281,6 +285,10 @@ async function main() {
         engines.push(new ArbEngine(mc, feed, config.ARB_IS_PAPER, sc.strategy, {
           positionSizeUsd: sc.positionSizeUsd,
           maxEntryPrice: sc.maxEntryPrice,
+          everyNth: sc.everyNth ?? undefined,
+          cooldownLosses: sc.cooldownLosses ?? undefined,
+          cooldownSkip: sc.cooldownSkip ?? undefined,
+          antiMartingale: sc.antiMartingale,
         }));
       }
     }

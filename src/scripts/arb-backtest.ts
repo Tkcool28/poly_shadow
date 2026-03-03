@@ -712,14 +712,17 @@ async function main(): Promise<void> {
           accumulators.set(key, { pnls: filtPnls, fees: filtFees });
         }
 
-        // 8. Every3th + cooldown (skip by count + skip by streak)
-        {
+        // 8. Every-Nth + cooldown (skip by count + skip by streak) — expanded combos
+        for (const [nth, cooldownAfter, skipCount] of [
+          [3, 3, 2], [2, 3, 2], [2, 3, 5], [3, 3, 5],  // every-Nth × cool3L
+          [2, 5, 3], [3, 5, 3], [2, 5, 5], [3, 5, 5],  // every-Nth × cool5L
+        ] as const) {
           const filtPnls: number[] = [];
           const filtFees: number[] = [];
           let consecLosses = 0;
           let cooldownRemaining = 0;
           for (let j = 0; j < basePnls.length; j++) {
-            if (j % 3 !== 0) continue; // every-3rd filter
+            if (j % nth !== 0) continue;
             if (cooldownRemaining > 0) {
               cooldownRemaining--;
               continue;
@@ -728,15 +731,159 @@ async function main(): Promise<void> {
             filtFees.push(baseFees[j]);
             if (basePnls[j] < 0) {
               consecLosses++;
-              if (consecLosses >= 3) {
-                cooldownRemaining = 2;
+              if (consecLosses >= cooldownAfter) {
+                cooldownRemaining = skipCount;
                 consecLosses = 0;
               }
             } else {
               consecLosses = 0;
             }
           }
-          const key = `${baseKey} every3th+cool3L→skip2`;
+          const key = `${baseKey} every${nth}th+cool${cooldownAfter}L→skip${skipCount}`;
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+        }
+
+        // 9. Extended cooldown + antiMart combos (cool5L variants, cool2L, cool4L)
+        for (const [cooldownAfter, skipCount] of [[5, 3], [5, 5], [2, 2], [2, 3], [4, 3], [4, 5]] as const) {
+          const filtPnls: number[] = [];
+          const filtFees: number[] = [];
+          let consecLosses = 0;
+          let cooldownRemaining = 0;
+          let scale = 1.0;
+          for (let j = 0; j < basePnls.length; j++) {
+            if (cooldownRemaining > 0) {
+              cooldownRemaining--;
+              continue;
+            }
+            filtPnls.push(basePnls[j] * scale);
+            filtFees.push(baseFees[j] * scale);
+            if (basePnls[j] < 0) {
+              scale = Math.max(0.25, scale * 0.5);
+              consecLosses++;
+              if (consecLosses >= cooldownAfter) {
+                cooldownRemaining = skipCount;
+                consecLosses = 0;
+              }
+            } else {
+              scale = 1.0;
+              consecLosses = 0;
+            }
+          }
+          const key = `${baseKey} cool${cooldownAfter}L→skip${skipCount}+antiMart`;
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+        }
+
+        // 10. ddPause + antiMart combos
+        for (const [maxDdUsd, cooldownCandles] of DD_COOLDOWNS) {
+          const filtPnls: number[] = [];
+          const filtFees: number[] = [];
+          let cumPnl = 0;
+          let peak = 0;
+          let skipRemaining = 0;
+          let scale = 1.0;
+          for (let j = 0; j < basePnls.length; j++) {
+            if (skipRemaining > 0) {
+              skipRemaining--;
+              continue;
+            }
+            filtPnls.push(basePnls[j] * scale);
+            filtFees.push(baseFees[j] * scale);
+            cumPnl += basePnls[j] * scale;
+            if (cumPnl > peak) peak = cumPnl;
+            const ddUsd = peak - cumPnl;
+            if (ddUsd >= maxDdUsd) {
+              skipRemaining = cooldownCandles;
+            }
+            if (basePnls[j] < 0) {
+              scale = Math.max(0.25, scale * 0.5);
+            } else {
+              scale = 1.0;
+            }
+          }
+          const key = `${baseKey} ddPause$${maxDdUsd}+antiMart`;
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+        }
+
+        // 11. Every-Nth (extended: 4th, 5th) + antiMart
+        for (const nth of [4, 5]) {
+          const filtPnls: number[] = [];
+          const filtFees: number[] = [];
+          let scale = 1.0;
+          for (let j = 0; j < basePnls.length; j++) {
+            if (j % nth !== 0) continue;
+            filtPnls.push(basePnls[j] * scale);
+            filtFees.push(baseFees[j] * scale);
+            if (basePnls[j] < 0) {
+              scale = Math.max(0.25, scale * 0.5);
+            } else {
+              scale = 1.0;
+            }
+          }
+          const key = `${baseKey} every${nth}th+antiMart`;
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+        }
+
+        // 12. Triple combo: every-Nth + cooldown + antiMart
+        for (const [nth, cooldownAfter, skipCount] of [
+          [2, 3, 2], [2, 3, 5], [3, 3, 2], [3, 3, 5],
+          [2, 5, 3], [3, 5, 3],
+        ] as const) {
+          const filtPnls: number[] = [];
+          const filtFees: number[] = [];
+          let consecLosses = 0;
+          let cooldownRemaining = 0;
+          let scale = 1.0;
+          for (let j = 0; j < basePnls.length; j++) {
+            if (j % nth !== 0) continue;
+            if (cooldownRemaining > 0) {
+              cooldownRemaining--;
+              continue;
+            }
+            filtPnls.push(basePnls[j] * scale);
+            filtFees.push(baseFees[j] * scale);
+            if (basePnls[j] < 0) {
+              scale = Math.max(0.25, scale * 0.5);
+              consecLosses++;
+              if (consecLosses >= cooldownAfter) {
+                cooldownRemaining = skipCount;
+                consecLosses = 0;
+              }
+            } else {
+              scale = 1.0;
+              consecLosses = 0;
+            }
+          }
+          const key = `${baseKey} every${nth}th+cool${cooldownAfter}L→skip${skipCount}+antiMart`;
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+        }
+
+        // 13. Kelly + cooldown combos
+        for (const [cooldownAfter, skipCount] of [[3, 2], [3, 5]] as const) {
+          const filtPnls: number[] = [];
+          const filtFees: number[] = [];
+          let consecLosses = 0;
+          let cooldownRemaining = 0;
+          let scale = 1.0;
+          for (let j = 0; j < basePnls.length; j++) {
+            if (cooldownRemaining > 0) {
+              cooldownRemaining--;
+              continue;
+            }
+            filtPnls.push(basePnls[j] * scale);
+            filtFees.push(baseFees[j] * scale);
+            if (basePnls[j] >= 0) {
+              scale = Math.min(4.0, scale * 2.0);
+              consecLosses = 0;
+            } else {
+              scale = Math.max(0.25, scale * 0.5);
+              consecLosses++;
+              if (consecLosses >= cooldownAfter) {
+                cooldownRemaining = skipCount;
+                consecLosses = 0;
+              }
+            }
+          }
+          const key = `${baseKey} kelly+cool${cooldownAfter}L→skip${skipCount}`;
           accumulators.set(key, { pnls: filtPnls, fees: filtFees });
         }
       }
@@ -744,7 +891,7 @@ async function main(): Promise<void> {
       // Print drawdown-reduction strategy stats
       console.log('');
       const ddKeys = [...accumulators.keys()].filter((k) =>
-        k.includes('cool') || k.includes('ddPause') || k.includes('every') || k.includes('antiMart'),
+        k.includes('cool') || k.includes('ddPause') || k.includes('every') || k.includes('antiMart') || k.includes('kelly'),
       );
       if (ddKeys.length > 0) {
         console.log(`  --- Drawdown-Reduction Variants ---`);

@@ -33,6 +33,10 @@ export function calculateFee(shares: number, price: number): number {
 export interface StrategyParams {
   positionSizeUsd: number;
   maxEntryPrice: number;
+  everyNth?: number;         // enter every Nth candle (undefined = every candle)
+  cooldownLosses?: number;   // trigger cooldown after N consecutive losses
+  cooldownSkip?: number;     // skip N candles after cooldown triggers
+  antiMartingale?: boolean;  // halve position after loss, restore after win
 }
 
 export class ArbEngine {
@@ -43,9 +47,9 @@ export class ArbEngine {
   private strategy: string;
   private strategyParams: StrategyParams;
   private get isContrarian(): boolean { return this.strategy.startsWith('contrarian'); }
-  private get isEveryNth(): boolean { return this.strategy === 'contrarian-every3'; }
-  private get isAntiMart(): boolean { return this.strategy === 'contrarian-antimart'; }
-  private get isCooldown(): boolean { return this.strategy === 'contrarian-cooldown'; }
+  private get isEveryNth(): boolean { return (this.strategyParams.everyNth ?? 0) > 1; }
+  private get isAntiMart(): boolean { return this.strategyParams.antiMartingale === true; }
+  private get isCooldown(): boolean { return (this.strategyParams.cooldownLosses ?? 0) > 0; }
 
   // Current candle state
   private currentCandle: CandleState | null = null;
@@ -88,7 +92,7 @@ export class ArbEngine {
     }
 
     // Every-Nth: skip non-Nth candles entirely (no entry, no skip record)
-    if (this.isEveryNth && this.candleCount % 3 !== 0) {
+    if (this.isEveryNth && this.candleCount % (this.strategyParams.everyNth ?? 3) !== 0) {
       return;
     }
 
@@ -187,8 +191,10 @@ export class ArbEngine {
         || lastCycle?.status === ArbCycleStatus.STOPPED;
     }
 
-    // Cooldown: check if 3 consecutive losses should trigger a skip period
+    // Cooldown: check if N consecutive losses should trigger a skip period
     if (this.isCooldown) {
+      const cooldownLosses = this.strategyParams.cooldownLosses ?? 3;
+      const cooldownSkip = this.strategyParams.cooldownSkip ?? 2;
       const recentCycles = await prisma.arbCycle.findMany({
         where: {
           isPaper: this.isPaper,
@@ -196,16 +202,16 @@ export class ArbEngine {
           status: { in: [ArbCycleStatus.WON, ArbCycleStatus.LOST, ArbCycleStatus.STOPPED] },
         },
         orderBy: { createdAt: 'desc' },
-        take: 3,
+        take: cooldownLosses,
         select: { id: true, status: true },
       });
-      const allLosses = recentCycles.length >= 3
+      const allLosses = recentCycles.length >= cooldownLosses
         && recentCycles.every((c) => c.status === ArbCycleStatus.LOST || c.status === ArbCycleStatus.STOPPED);
-      const triggerCycleId = recentCycles[2]?.id ?? null;
+      const triggerCycleId = recentCycles[cooldownLosses - 1]?.id ?? null;
       if (allLosses && triggerCycleId !== this.lastCooldownTriggerCycleId) {
-        this.cooldownSkipRemaining = 2;
+        this.cooldownSkipRemaining = cooldownSkip;
         this.lastCooldownTriggerCycleId = triggerCycleId;
-        this.log.info('Cooldown triggered: 3 consecutive losses, skipping 2 candles', {
+        this.log.info(`Cooldown triggered: ${cooldownLosses} consecutive losses, skipping ${cooldownSkip} candles`, {
           market: this.marketConfig.type,
         });
       }

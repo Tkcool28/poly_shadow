@@ -393,6 +393,12 @@ model ArbStrategyConfig {
   maxEntryPrice     Float                   // max price to pay per share (standard: 0.99, contrarian: 0.10)
   initialCapitalUsd Float                   // starting capital when creating ArbCapital
 
+  // Composable strategy variant params (all optional, can combine)
+  everyNth          Int?                    // enter every Nth candle (null = every candle)
+  cooldownLosses    Int?                    // trigger cooldown after N consecutive losses
+  cooldownSkip      Int?                    // skip N candles after cooldown triggers
+  antiMartingale    Boolean  @default(false) // halve position after loss, restore after win
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
