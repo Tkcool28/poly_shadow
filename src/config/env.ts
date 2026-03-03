@@ -52,6 +52,7 @@ const envSchema = z.object({
     .default('false')
     .transform((v) => v === 'true'),
   MAX_POSITION_USD: z.coerce.number().min(1).max(10000).default(2),
+  MAX_PREDICTION_POSITION_USD: z.coerce.number().min(0).max(10000).default(2), // 0 = disabled; max net USD per prediction per allocation
   MAX_DAILY_LOSS_USD: z.coerce.number().min(1).max(100000).default(200),
   MAX_TRADE_PERCENT: z.coerce.number().min(0.01).max(1.0).default(0.50), // Max 50% of allocation per trade
   PORTFOLIO_VALUE_REFRESH_MS: z.coerce.number().default(300000), // 5 min
@@ -136,6 +137,20 @@ const envSchema = z.object({
     .transform((v) => v === 'true'),
   ARB_CONTRARIAN_MAX_PRICE: z.coerce.number().min(0.01).max(0.20).default(0.10),
   ARB_CONTRARIAN_POSITION_SIZE_USD: z.coerce.number().min(1).max(1000).default(10),
+
+  // Contrarian strategy variants (each runs as independent strategy with own capital)
+  ARB_CONTRARIAN_EVERY3_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+  ARB_CONTRARIAN_ANTIMART_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+  ARB_CONTRARIAN_COOLDOWN_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
 
   // Settlement sweep (background, non-blocking)
   ARB_SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(10000),  // 10s sweep cadence

@@ -644,6 +644,101 @@ async function main(): Promise<void> {
           const key = `${baseKey} antiMart`;
           accumulators.set(key, { pnls: filtPnls, fees: filtFees });
         }
+
+        // 5. Combination: every3th + antiMart (skip + sizing)
+        for (const nth of [2, 3]) {
+          const filtPnls: number[] = [];
+          const filtFees: number[] = [];
+          let scale = 1.0;
+          for (let j = 0; j < basePnls.length; j++) {
+            if (j % nth !== 0) continue; // every-Nth filter
+            filtPnls.push(basePnls[j] * scale);
+            filtFees.push(baseFees[j] * scale);
+            if (basePnls[j] < 0) {
+              scale = Math.max(0.25, scale * 0.5);
+            } else {
+              scale = 1.0;
+            }
+          }
+          const key = `${baseKey} every${nth}th+antiMart`;
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+        }
+
+        // 6. Combination: cooldown + antiMart (streak skip + sizing)
+        for (const [cooldownAfter, skipCount] of [[3, 2], [3, 5]] as const) {
+          const filtPnls: number[] = [];
+          const filtFees: number[] = [];
+          let consecLosses = 0;
+          let cooldownRemaining = 0;
+          let scale = 1.0;
+          for (let j = 0; j < basePnls.length; j++) {
+            if (cooldownRemaining > 0) {
+              cooldownRemaining--;
+              continue;
+            }
+            filtPnls.push(basePnls[j] * scale);
+            filtFees.push(baseFees[j] * scale);
+            if (basePnls[j] < 0) {
+              scale = Math.max(0.25, scale * 0.5);
+              consecLosses++;
+              if (consecLosses >= cooldownAfter) {
+                cooldownRemaining = skipCount;
+                consecLosses = 0;
+              }
+            } else {
+              scale = 1.0;
+              consecLosses = 0;
+            }
+          }
+          const key = `${baseKey} cool${cooldownAfter}L→skip${skipCount}+antiMart`;
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+        }
+
+        // 7. Reverse kelly: double after win, halve after loss (ride hot streaks)
+        {
+          const filtPnls: number[] = [];
+          const filtFees: number[] = [];
+          let scale = 1.0;
+          for (let j = 0; j < basePnls.length; j++) {
+            filtPnls.push(basePnls[j] * scale);
+            filtFees.push(baseFees[j] * scale);
+            if (basePnls[j] >= 0) {
+              scale = Math.min(4.0, scale * 2.0); // Cap at 4x base
+            } else {
+              scale = Math.max(0.25, scale * 0.5);
+            }
+          }
+          const key = `${baseKey} kelly`;
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+        }
+
+        // 8. Every3th + cooldown (skip by count + skip by streak)
+        {
+          const filtPnls: number[] = [];
+          const filtFees: number[] = [];
+          let consecLosses = 0;
+          let cooldownRemaining = 0;
+          for (let j = 0; j < basePnls.length; j++) {
+            if (j % 3 !== 0) continue; // every-3rd filter
+            if (cooldownRemaining > 0) {
+              cooldownRemaining--;
+              continue;
+            }
+            filtPnls.push(basePnls[j]);
+            filtFees.push(baseFees[j]);
+            if (basePnls[j] < 0) {
+              consecLosses++;
+              if (consecLosses >= 3) {
+                cooldownRemaining = 2;
+                consecLosses = 0;
+              }
+            } else {
+              consecLosses = 0;
+            }
+          }
+          const key = `${baseKey} every3th+cool3L→skip2`;
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+        }
       }
 
       // Print drawdown-reduction strategy stats

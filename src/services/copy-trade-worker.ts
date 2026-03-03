@@ -102,6 +102,38 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     copyAmountUsd = CLOB_MIN_ORDER_USD;
   }
 
+  // ─── Per-prediction position cap (BUY only) ───
+  // Prevents stacking beyond MAX_PREDICTION_POSITION_USD in a single tokenId.
+  // On partial room: trim to the gap rather than skip entirely.
+  // Net position = BUY fills minus SELL fills, so re-entries after exits are allowed.
+  if (trade.side === 'BUY' && config.MAX_PREDICTION_POSITION_USD > 0) {
+    const positionUsd = await getNetPositionUsd(trade.asset, allocation.id, isPaper);
+    const remaining = config.MAX_PREDICTION_POSITION_USD - positionUsd;
+    if (remaining <= 0) {
+      await createSkippedRecord(trade, 'prediction position limit reached', allocation.id, isPaper);
+      return;
+    }
+    if (copyAmountUsd > remaining) {
+      copyAmountUsd = remaining;
+      log.debug('Position cap: trimmed copy amount to remaining room', {
+        tokenId: trade.asset,
+        positionUsd: positionUsd.toFixed(2),
+        remaining: remaining.toFixed(2),
+        allocationId: allocation.id,
+      });
+      // After trimming: live order may now fall below CLOB $1 minimum — not executable
+      if (!isPaper && copyAmountUsd < CLOB_MIN_ORDER_USD) {
+        await createSkippedRecord(
+          trade,
+          `position gap $${remaining.toFixed(2)} below CLOB minimum $${CLOB_MIN_ORDER_USD}`,
+          allocation.id,
+          isPaper,
+        );
+        return;
+      }
+    }
+  }
+
   // ─── Global daily backstop (BUY only) ───
   // Per-allocation budget is managed via currentCapital; this is a cross-allocation safety net.
 
@@ -312,6 +344,33 @@ async function getHeldShares(
     }
   }
   return Math.max(netShares, 0);
+}
+
+async function getNetPositionUsd(
+  tokenId: string,
+  followAllocationId: string,
+  isPaper: boolean,
+): Promise<number> {
+  const fills = await prisma.copyTrade.findMany({
+    where: { tokenId, followAllocationId, isPaper, status: 'FILLED' },
+    select: { side: true, filledSize: true, filledPrice: true, requestedAmount: true },
+  });
+
+  let netUsd = 0;
+  for (const fill of fills) {
+    let usd: number;
+    if (fill.filledSize != null && fill.filledPrice != null) {
+      usd = fill.filledSize * fill.filledPrice;
+    } else {
+      usd = fill.requestedAmount;
+      log.warn('getNetPositionUsd: fill missing filledSize/filledPrice, using requestedAmount fallback', {
+        tokenId, side: fill.side, requestedAmount: fill.requestedAmount,
+      });
+    }
+    if (fill.side === 'BUY') netUsd += usd;
+    else netUsd -= usd;
+  }
+  return Math.max(netUsd, 0);
 }
 
 async function createSkippedRecord(

@@ -61,11 +61,17 @@ async function main() {
   }
 
   // Determine active strategies
-  const strategies = ['standard', ...(config.ARB_CONTRARIAN_ENABLED ? ['contrarian'] : [])];
+  const strategies = [
+    'standard',
+    ...(config.ARB_CONTRARIAN_ENABLED ? ['contrarian'] : []),
+    ...(config.ARB_CONTRARIAN_EVERY3_ENABLED ? ['contrarian-every3'] : []),
+    ...(config.ARB_CONTRARIAN_ANTIMART_ENABLED ? ['contrarian-antimart'] : []),
+    ...(config.ARB_CONTRARIAN_COOLDOWN_ENABLED ? ['contrarian-cooldown'] : []),
+  ];
 
   // Ensure ArbCapital record exists per strategy
   for (const strategy of strategies) {
-    const initialCapital = strategy === 'contrarian'
+    const initialCapital = strategy.startsWith('contrarian')
       ? config.ARB_CONTRARIAN_INITIAL_CAPITAL_USD
       : (config.ARB_STANDARD_INITIAL_CAPITAL_USD ?? config.ARB_INITIAL_CAPITAL_USD);
 

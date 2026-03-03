@@ -36,11 +36,20 @@ export class ArbEngine {
   private priceFeed: CryptoPriceFeed;
   private isPaper: boolean;
   private strategy: string;
-  private get isContrarian(): boolean { return this.strategy === 'contrarian'; }
+  private get isContrarian(): boolean { return this.strategy.startsWith('contrarian'); }
+  private get isEveryNth(): boolean { return this.strategy === 'contrarian-every3'; }
+  private get isAntiMart(): boolean { return this.strategy === 'contrarian-antimart'; }
+  private get isCooldown(): boolean { return this.strategy === 'contrarian-cooldown'; }
 
   // Current candle state
   private currentCandle: CandleState | null = null;
   private lastCandleStartMs = 0;
+
+  // Strategy variant state
+  private candleCount = 0;                              // every-Nth counter
+  private lastCycleWasLoss = false;                     // anti-martingale
+  private cooldownSkipRemaining = 0;                    // cooldown skip counter
+  private lastCooldownTriggerCycleId: string | null = null; // prevent re-triggering
 
   constructor(marketConfig: ArbMarketConfig, priceFeed: CryptoPriceFeed, isPaper: boolean, strategy = 'standard') {
     this.marketConfig = marketConfig;
@@ -62,6 +71,18 @@ export class ArbEngine {
     if (candle.candleStartMs !== this.lastCandleStartMs) {
       this.currentCandle = null;
       this.lastCandleStartMs = candle.candleStartMs;
+      this.candleCount++;
+    }
+
+    // Every-Nth: skip non-Nth candles entirely (no entry, no skip record)
+    if (this.isEveryNth && this.candleCount % 3 !== 0) {
+      return;
+    }
+
+    // Cooldown: skip candles after consecutive losses
+    if (this.isCooldown && this.cooldownSkipRemaining > 0) {
+      this.cooldownSkipRemaining--;
+      return;
     }
 
     // Phase 1: Begin candle (initialize if not yet done for this candle).
@@ -137,6 +158,45 @@ export class ArbEngine {
     if (!marketInfo) {
       this.log.debug(`Market not yet available for ${slug}, will retry`);
     }
+
+    // Anti-martingale: check once per candle if last cycle was a loss
+    if (this.isAntiMart) {
+      const lastCycle = await prisma.arbCycle.findFirst({
+        where: {
+          isPaper: this.isPaper,
+          strategy: this.strategy,
+          status: { in: [ArbCycleStatus.WON, ArbCycleStatus.LOST, ArbCycleStatus.STOPPED] },
+        },
+        orderBy: { createdAt: 'desc' },
+        select: { status: true },
+      });
+      this.lastCycleWasLoss = lastCycle?.status === ArbCycleStatus.LOST
+        || lastCycle?.status === ArbCycleStatus.STOPPED;
+    }
+
+    // Cooldown: check if 3 consecutive losses should trigger a skip period
+    if (this.isCooldown) {
+      const recentCycles = await prisma.arbCycle.findMany({
+        where: {
+          isPaper: this.isPaper,
+          strategy: this.strategy,
+          status: { in: [ArbCycleStatus.WON, ArbCycleStatus.LOST, ArbCycleStatus.STOPPED] },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 3,
+        select: { id: true, status: true },
+      });
+      const allLosses = recentCycles.length >= 3
+        && recentCycles.every((c) => c.status === ArbCycleStatus.LOST || c.status === ArbCycleStatus.STOPPED);
+      const triggerCycleId = recentCycles[2]?.id ?? null;
+      if (allLosses && triggerCycleId !== this.lastCooldownTriggerCycleId) {
+        this.cooldownSkipRemaining = 2;
+        this.lastCooldownTriggerCycleId = triggerCycleId;
+        this.log.info('Cooldown triggered: 3 consecutive losses, skipping 2 candles', {
+          market: this.marketConfig.type,
+        });
+      }
+    }
   }
 
   // ─── Phase 2: Evaluate and enter ───
@@ -164,9 +224,13 @@ export class ArbEngine {
       }
 
       const capital = await this.getCapital();
-      const requiredCapital = this.isContrarian
+      let requiredCapital = this.isContrarian
         ? config.ARB_CONTRARIAN_POSITION_SIZE_USD
         : config.ARB_POSITION_SIZE_USD;
+      // Anti-martingale: halve required capital when last cycle was a loss
+      if (this.isAntiMart && this.lastCycleWasLoss) {
+        requiredCapital = Math.max(1, requiredCapital / 2);
+      }
       if (!capital || capital.currentCapital < requiredCapital) {
         const reason = `insufficient capital: $${capital?.currentCapital.toFixed(2) ?? 0}`;
         candle.permanentSkipChecked = true;
@@ -234,6 +298,10 @@ export class ArbEngine {
       }
 
       positionSize = config.ARB_CONTRARIAN_POSITION_SIZE_USD;
+      // Anti-martingale: halve position after loss, restore after win
+      if (this.isAntiMart && this.lastCycleWasLoss) {
+        positionSize = Math.max(1, positionSize / 2);
+      }
       detectedPrice = oppositePrice;
     } else {
       // Standard: buy predicted direction at high price
