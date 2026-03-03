@@ -148,6 +148,19 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
     };
   }
 
+  // Guard: SELL share amount must be non-zero — floating-point residuals can survive
+  // the > 0 check in copy-trade-worker but round to 0 in CLOB integer conversion.
+  if (side === 'SELL' && amount < 0.000001) {
+    return {
+      orderId: null,
+      status: 'SKIPPED',
+      filledPrice: null,
+      filledSize: null,
+      failReason: `dust position (${amount.toExponential(2)} shares): CLOB would receive 0 amount`,
+      transactionHashes: [],
+    };
+  }
+
   const slippagePrice = calculateSlippagePrice(detectedPrice, side);
 
   log.info('Placing FOK market order', {

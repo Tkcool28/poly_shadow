@@ -61,7 +61,10 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
 
   if (trade.side === 'SELL') {
     const heldShares = await getHeldShares(trade.asset, allocation.id, isPaper);
-    if (heldShares <= 0) {
+    // Threshold of 0.000001 shares (1 micro-share) guards against floating-point residuals
+    // from the getHeldShares fallback path (requestedAmount / price) that pass > 0 but
+    // round to 0 in CLOB integer conversion → HTTP 400 "amounts must be > 0"
+    if (heldShares < 0.000001) {
       await createSkippedRecord(trade, 'no shares held to sell', allocation.id, isPaper);
       return;
     }
