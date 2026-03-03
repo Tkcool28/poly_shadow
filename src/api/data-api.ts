@@ -288,7 +288,7 @@ export async function getClosedPositionsSince(
 
     let done = false;
     for (const cp of batch) {
-      if (cp.timestamp > sinceTimestamp) {
+      if (cp.timestamp >= sinceTimestamp) {
         all.push(cp);
       } else {
         done = true;

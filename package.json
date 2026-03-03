@@ -12,6 +12,7 @@
     "scorer": "tsx src/jobs/score-calculator.ts",
     "monitor": "tsx src/jobs/trade-monitor.ts",
     "arb": "tsx src/jobs/arb-worker.ts",
+    "purge-detected": "tsx src/scripts/purge-old-detected-trades.ts",
     "test": "vitest run"
   },
   "repository": {

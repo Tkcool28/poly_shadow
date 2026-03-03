@@ -1,3 +1,4 @@
+import Bottleneck from 'bottleneck';
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { config } from '../config/env';
@@ -31,16 +32,19 @@ export async function calculateAllScores(): Promise<number> {
 
   if (staleMonitored.length > 0) {
     logger.info(`Refreshing closed positions for ${staleMonitored.length} stale traders`);
+    const limiter = new Bottleneck({ maxConcurrent: 10 });
     const refreshResults = await Promise.allSettled(
-      staleMonitored.map(async (t) => {
-        const sinceTs = t.lastPositionSync
-          ? Math.floor(t.lastPositionSync.getTime() / 1000)
-          : Math.floor(Date.now() / 1000) - BACKFILL_HISTORY_DAYS * 86400;
-        const refreshed = await refreshTraderClosedPositions(t.proxyWallet, sinceTs);
-        if (refreshed > 0) {
-          logger.info(`Refreshed ${refreshed} closed positions for ${t.proxyWallet.slice(0, 10)}`);
-        }
-      }),
+      staleMonitored.map((t) =>
+        limiter.schedule(async () => {
+          const sinceTs = t.lastPositionSync
+            ? Math.floor(t.lastPositionSync.getTime() / 1000)
+            : Math.floor(Date.now() / 1000) - BACKFILL_HISTORY_DAYS * 86400;
+          const refreshed = await refreshTraderClosedPositions(t.proxyWallet, sinceTs);
+          if (refreshed > 0) {
+            logger.info(`Refreshed ${refreshed} closed positions for ${t.proxyWallet.slice(0, 10)}`);
+          }
+        }),
+      ),
     );
     const failedRefreshes = refreshResults.filter((r) => r.status === 'rejected');
     if (failedRefreshes.length > 0) {
@@ -233,18 +237,14 @@ async function upsertScores(
     },
   });
 
-  // Delete old category scores for this trader, then insert fresh (Warning #5 fix)
-  await prisma.categoryScore.deleteMany({ where: { proxyWallet } });
-
-  const categoryScores = computeCategoryScores(closedPositions, markets);
-  for (const cs of categoryScores) {
-    await prisma.categoryScore.create({
-      data: {
-        proxyWallet,
-        ...cs,
-      },
-    });
-  }
+  // Delete old category scores and insert fresh atomically (prevents partial state on crash)
+  await prisma.$transaction(async (tx) => {
+    await tx.categoryScore.deleteMany({ where: { proxyWallet } });
+    const categoryScores = computeCategoryScores(closedPositions, markets);
+    for (const cs of categoryScores) {
+      await tx.categoryScore.create({ data: { proxyWallet, ...cs } });
+    }
+  });
 }
 
 async function updateMonitoredTraders() {
@@ -267,9 +267,9 @@ async function pruneData() {
   const retentionDays = config.DATA_RETENTION_DAYS;
   const cutoff = new Date(Date.now() - retentionDays * 86400 * 1000);
 
-  // Prune old detected trades
+  // Prune old detected trades that have no linked CopyTrade (FK-safe)
   const deletedTrades = await prisma.detectedTrade.deleteMany({
-    where: { detectedAt: { lt: cutoff } },
+    where: { detectedAt: { lt: cutoff }, copyTrade: { is: null } },
   });
   if (deletedTrades.count > 0) {
     logger.info(`Pruned ${deletedTrades.count} detected trades older than ${retentionDays} days`);

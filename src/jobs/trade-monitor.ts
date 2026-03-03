@@ -45,7 +45,8 @@ async function startWithWebSocket(): Promise<void> {
   });
 
   // Initialize monitored wallets cache (used by WS handler)
-  startCacheRefresh(60000);
+  // Await so trackedWallets is populated before WS messages can arrive
+  await startCacheRefresh(60000);
 
   // Start WebSocket stream
   wsStream = new RtdsTradeStream(async (payload) => {

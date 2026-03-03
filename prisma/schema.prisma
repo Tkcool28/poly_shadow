@@ -318,6 +318,7 @@ model FollowAllocation {
   updatedAt            DateTime  @updatedAt
 
   @@index([isActive])
+  @@index([isActive, updatedAt(sort: Desc)])
 }
 
 // ─── DetectedTrade (logged by trade monitor) ───
@@ -345,6 +346,7 @@ model DetectedTrade {
   @@unique([transactionHash, proxyWallet, asset])
   @@index([detectedAt(sort: Desc)])
   @@index([proxyWallet])
+  @@index([proxyWallet, detectedAt(sort: Desc)])
 }
 
 // ─── CopyTrade (executed copy of a detected trade) ───

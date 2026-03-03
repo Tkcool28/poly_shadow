@@ -46,10 +46,7 @@ export function computeActivity(
 
   // Active days (unique days with trades)
   const uniqueDays = new Set(
-    trades.map(t => {
-      const d = new Date(t.timestamp * 1000);
-      return `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`;
-    }),
+    trades.map(t => new Date(t.timestamp * 1000).toISOString().slice(0, 10)),
   );
   const activeDays = uniqueDays.size;
 
