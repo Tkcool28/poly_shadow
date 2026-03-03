@@ -10,14 +10,17 @@ export async function initialize(): Promise<void> {
 }
 
 /**
- * Simulate slippage: half of SLIPPAGE_BPS as expected average.
+ * Simulate fill price: BUY fills at half the upside-fraction tolerance (expected average).
+ * SELL fills at detected price — no slippage floor, consistent with live executor.
  */
 function simulateSlippagePrice(detectedPrice: number, side: 'BUY' | 'SELL'): number {
-  const avgSlippage = (config.SLIPPAGE_BPS / 2) / 10000;
   if (side === 'BUY') {
-    return Math.min(detectedPrice * (1 + avgSlippage), 0.99);
+    const avgFraction = config.SLIPPAGE_UPSIDE_FRACTION / 2;
+    const limit = detectedPrice + (1 - detectedPrice) * avgFraction;
+    return Math.min(limit, 0.99);
   }
-  return Math.max(detectedPrice * (1 - avgSlippage), 0.01);
+  // SELL: simulate filling at detected price (no downward slippage — exit at signal price)
+  return detectedPrice;
 }
 
 /**

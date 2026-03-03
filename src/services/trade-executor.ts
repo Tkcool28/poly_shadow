@@ -117,11 +117,16 @@ async function getMarketMetadata(tokenId: string): Promise<{ tickSize: TickSize;
 }
 
 function calculateSlippagePrice(detectedPrice: number, side: 'BUY' | 'SELL'): number {
-  const slippageMultiplier = config.SLIPPAGE_BPS / 10000;
   if (side === 'BUY') {
-    return Math.min(detectedPrice * (1 + slippageMultiplier), 0.99);
+    // Upside-fraction: sacrifice a fixed fraction of remaining upside (distance to $1) for
+    // execution certainty. Scales naturally — cheap tokens get ~$0.02 absolute tolerance,
+    // mid tokens ~$0.01, expensive tokens < $0.001 (protects expected returns near resolution).
+    const limit = detectedPrice + (1 - detectedPrice) * config.SLIPPAGE_UPSIDE_FRACTION;
+    return Math.min(limit, 0.99);
   }
-  return Math.max(detectedPrice * (1 - slippageMultiplier), 0.01);
+  // SELL: accept any market price — we want to exit whenever the signal says sell.
+  // A slippage floor would block cut-loss exits during dumps, defeating the copy strategy.
+  return 0.01; // CLOB minimum — effectively market order behavior
 }
 
 export const CLOB_MIN_ORDER_USD = 1.0; // Polymarket hard minimum per live order

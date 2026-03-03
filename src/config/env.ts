@@ -56,7 +56,7 @@ const envSchema = z.object({
   MAX_DAILY_LOSS_USD: z.coerce.number().min(1).max(100000).default(200),
   MAX_TRADE_PERCENT: z.coerce.number().min(0.01).max(1.0).default(0.50), // Max 50% of allocation per trade
   PORTFOLIO_VALUE_REFRESH_MS: z.coerce.number().default(300000), // 5 min
-  SLIPPAGE_BPS: z.coerce.number().min(10).max(1000).default(200), // 2% default
+  SLIPPAGE_UPSIDE_FRACTION: z.coerce.number().min(0).max(0.5).default(0.02), // BUY: fraction of (1-P) upside sacrificed; 0.02 → ~$0.02 at cheap, ~$0.01 at mid, <$0.001 at expensive
   COPY_TRADE_PERCENT: z.coerce.number().min(0.01).max(1.0).default(0.10), // Copy 10% of trader's actual trade size
   MIN_COMPOSITE_SCORE: z.coerce.number().min(0).max(1).default(0), // Skip BUY trades below this score (0 = disabled)
   MIN_SIGNAL_TRADE_USD: z.coerce.number().min(0).default(0), // Skip BUY trades where trader's USD < this (0 = disabled)
