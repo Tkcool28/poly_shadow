@@ -55,10 +55,22 @@ async function main() {
       continue;
     }
 
+    // Compute real net shares so MIN_CLAIM_USD threshold works correctly
+    const fills = await prisma.copyTrade.findMany({
+      where: { tokenId: r.tokenId, followAllocationId: r.followAllocationId, isPaper: false, status: 'SETTLED' },
+      select: { side: true, filledSize: true, requestedAmount: true, filledPrice: true },
+    });
+    let totalBuy = 0, totalSell = 0;
+    for (const f of fills) {
+      if (f.side === 'BUY') totalBuy += f.filledSize ?? (f.requestedAmount / (f.filledPrice ?? 1));
+      else totalSell += f.filledSize ?? 0;
+    }
+    const netShares = Math.max(totalBuy - totalSell, 0);
+
     claimable.push({
       conditionId: r.conditionId,
       outcomeIndex,
-      netShares: 0, // not needed for the actual claim
+      netShares,
       tokenId: r.tokenId,
       followAllocationId: r.followAllocationId,
     });

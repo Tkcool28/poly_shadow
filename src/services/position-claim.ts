@@ -105,8 +105,16 @@ export async function redeemWinningPositions(positions: ClaimablePosition[]): Pr
     return;
   }
 
-  // Merge new positions into retry queue (new positions overwrite stale retries)
+  // Merge new positions into retry queue, skipping dust below MIN_CLAIM_USD
   for (const p of positions) {
+    if (p.netShares < config.MIN_CLAIM_USD) {
+      log.info('Auto-claim skipped: below MIN_CLAIM_USD threshold', {
+        conditionId: p.conditionId,
+        netShares: p.netShares.toFixed(4),
+        minClaimUsd: config.MIN_CLAIM_USD,
+      });
+      continue;
+    }
     pendingRetries.set(p.conditionId, p);
   }
 

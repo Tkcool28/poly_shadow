@@ -67,6 +67,8 @@ const envSchema = z.object({
     .string()
     .default('false')
     .transform((v) => v === 'true'),
+  // Min USD value to trigger auto-claim (netShares == USD for price=1.0 wins; skips gas-inefficient dust)
+  MIN_CLAIM_USD: z.coerce.number().min(0).default(1.00),
 
   // Position settlement
   SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(300000), // 5 minutes
