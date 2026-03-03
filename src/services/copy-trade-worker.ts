@@ -96,34 +96,18 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     copyAmountUsd = Math.min(copyAmountUsd, config.MAX_POSITION_USD);
   }
 
-  // ─── Per-allocation daily spend check (BUY only) ───
-  // Done before pool routing so pool entries also respect daily limits.
-  // Caps copyAmountUsd to remaining budget rather than hard-blocking, so
-  // traders with large single-trade sizes (vs small allocation) can still execute.
+  // Live: bump to CLOB $1 minimum before backstop checks — ensures the backstop sees the true
+  // intended order size, preventing it from capping below the exchange minimum.
+  if (trade.side === 'BUY' && !isPaper && copyAmountUsd < CLOB_MIN_ORDER_USD) {
+    copyAmountUsd = CLOB_MIN_ORDER_USD;
+  }
+
+  // ─── Global daily backstop (BUY only) ───
+  // Per-allocation budget is managed via currentCapital; this is a cross-allocation safety net.
 
   if (trade.side === 'BUY') {
     const todayStart = new Date();
     todayStart.setUTCHours(0, 0, 0, 0);
-
-    const todayBuySpend = await prisma.copyTrade.aggregate({
-      where: {
-        status: { in: ['FILLED', 'POOLED'] },
-        side: 'BUY',
-        createdAt: { gte: todayStart },
-        followAllocationId: allocation.id,
-      },
-      _sum: { requestedAmount: true },
-    });
-    const spent = todayBuySpend._sum.requestedAmount ?? 0;
-    const dailyLimit = allocation.initialCapital * 0.20;
-    const remaining = dailyLimit - spent;
-    if (remaining <= 0) {
-      await createSkippedRecord(trade, 'per-allocation daily limit reached', allocation.id, isPaper);
-      return;
-    }
-    if (copyAmountUsd > remaining) {
-      copyAmountUsd = remaining; // cap to remaining budget, execute at reduced size
-    }
 
     // Global daily backstop (across all allocations, scoped by paper/live)
     const globalSpend = await prisma.copyTrade.aggregate({
@@ -143,14 +127,6 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     if (copyAmountUsd > globalRemaining) {
       copyAmountUsd = globalRemaining;
     }
-  }
-
-  // Live: skip immediately if below CLOB $1 minimum (no pooling for live orders)
-  if (trade.side === 'BUY' && !isPaper && copyAmountUsd < CLOB_MIN_ORDER_USD) {
-    await createSkippedRecord(trade,
-      `live copy amount $${copyAmountUsd.toFixed(2)} below CLOB minimum $${CLOB_MIN_ORDER_USD}`,
-      allocation.id, isPaper);
-    return;
   }
   // Paper: pool if below paper pool threshold
   if (trade.side === 'BUY' && isPaper && copyAmountUsd < config.POOL_MIN_AMOUNT_USD) {
