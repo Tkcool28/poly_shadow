@@ -1,6 +1,7 @@
 import { prisma } from '../lib/prisma';
 import { createJobLogger } from '../lib/logger';
 import { getMarketsByConditionIds } from '../api/gamma-api';
+import { redeemWinningPositions, type ClaimablePosition } from './position-claim';
 
 const log = createJobLogger('position-settlement');
 
@@ -89,6 +90,7 @@ export async function sweepPositionSettlements(): Promise<void> {
   // Step 4-5: Settle resolved positions
   let settledCount = 0;
   let totalPositionsSettled = 0;
+  const claimablePositions: ClaimablePosition[] = [];
 
   for (const pos of openPositions) {
     const meta = tokenMeta.get(pos.tokenId);
@@ -211,6 +213,17 @@ export async function sweepPositionSettlements(): Promise<void> {
     settledCount++;
     totalPositionsSettled += fills.length;
 
+    // Collect for on-chain claiming after all DB work is done
+    if (!pos.isPaper && settlementPrice === 1.0) {
+      claimablePositions.push({
+        conditionId: meta.conditionId,
+        outcomeIndex,
+        netShares,
+        tokenId: pos.tokenId,
+        followAllocationId: pos.followAllocationId,
+      });
+    }
+
     log.info(`SETTLEMENT: ${pos.tokenId.slice(0, 20)}...`, {
       settlementPrice,
       netShares: netShares.toFixed(4),
@@ -220,6 +233,11 @@ export async function sweepPositionSettlements(): Promise<void> {
       isPaper: pos.isPaper,
     });
   }
+
+  // Trigger on-chain redemption for winning positions (non-blocking on failure)
+  await redeemWinningPositions(claimablePositions).catch((err: any) =>
+    log.warn('Auto-claim batch failed', { error: err.message }),
+  );
 
   log.info('Settlement sweep complete', {
     marketsChecked: uniqueConditionIds.length,

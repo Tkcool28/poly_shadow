@@ -61,6 +61,13 @@ const envSchema = z.object({
   POOL_MIN_AMOUNT_USD: z.coerce.number().min(0.01).max(100).default(0.10), // min to execute (matches current threshold)
   POOL_BURN_TIMEOUT_MS: z.coerce.number().default(180000), // 3 min per-entry FIFO burn window
 
+  // Auto-claim: on-chain redemption of won conditional tokens
+  POLYGON_RPC_URL: z.string().default('https://1rpc.io/matic'),
+  AUTO_CLAIM_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+
   // Position settlement
   SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(300000), // 5 minutes
   STALE_TRADE_CUTOFF_MS: z.coerce.number().default(600000), // 10 min (was hardcoded 5 min)
