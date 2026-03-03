@@ -30,12 +30,18 @@ export function calculateFee(shares: number, price: number): number {
   return shares * config.ARB_FEE_RATE * Math.pow(price * (1 - price), config.ARB_FEE_EXPONENT);
 }
 
+export interface StrategyParams {
+  positionSizeUsd: number;
+  maxEntryPrice: number;
+}
+
 export class ArbEngine {
   private log;
   private marketConfig: ArbMarketConfig;
   private priceFeed: CryptoPriceFeed;
   private isPaper: boolean;
   private strategy: string;
+  private strategyParams: StrategyParams;
   private get isContrarian(): boolean { return this.strategy.startsWith('contrarian'); }
   private get isEveryNth(): boolean { return this.strategy === 'contrarian-every3'; }
   private get isAntiMart(): boolean { return this.strategy === 'contrarian-antimart'; }
@@ -51,11 +57,18 @@ export class ArbEngine {
   private cooldownSkipRemaining = 0;                    // cooldown skip counter
   private lastCooldownTriggerCycleId: string | null = null; // prevent re-triggering
 
-  constructor(marketConfig: ArbMarketConfig, priceFeed: CryptoPriceFeed, isPaper: boolean, strategy = 'standard') {
+  constructor(
+    marketConfig: ArbMarketConfig,
+    priceFeed: CryptoPriceFeed,
+    isPaper: boolean,
+    strategy = 'standard',
+    strategyParams: StrategyParams = { positionSizeUsd: 500, maxEntryPrice: 0.99 },
+  ) {
     this.marketConfig = marketConfig;
     this.priceFeed = priceFeed;
     this.isPaper = isPaper;
     this.strategy = strategy;
+    this.strategyParams = strategyParams;
     this.log = createJobLogger(`arb-engine-${marketConfig.type}-${strategy}`);
   }
 
@@ -224,9 +237,7 @@ export class ArbEngine {
       }
 
       const capital = await this.getCapital();
-      let requiredCapital = this.isContrarian
-        ? config.ARB_CONTRARIAN_POSITION_SIZE_USD
-        : config.ARB_POSITION_SIZE_USD;
+      let requiredCapital = this.strategyParams.positionSizeUsd;
       // Anti-martingale: halve required capital when last cycle was a loss
       if (this.isAntiMart && this.lastCycleWasLoss) {
         requiredCapital = Math.max(1, requiredCapital / 2);
@@ -293,11 +304,11 @@ export class ArbEngine {
         : candle.marketInfo.upPrice;
 
       if (!oppositePrice || !Number.isFinite(oppositePrice)
-          || oppositePrice > config.ARB_CONTRARIAN_MAX_PRICE) {
+          || oppositePrice > this.strategyParams.maxEntryPrice) {
         return; // Too expensive or no price — retry next tick
       }
 
-      positionSize = config.ARB_CONTRARIAN_POSITION_SIZE_USD;
+      positionSize = this.strategyParams.positionSizeUsd;
       // Anti-martingale: halve position after loss, restore after win
       if (this.isAntiMart && this.lastCycleWasLoss) {
         positionSize = Math.max(1, positionSize / 2);
@@ -309,14 +320,14 @@ export class ArbEngine {
       tokenId = modelDirection === 'UP'
         ? candle.marketInfo.upTokenId
         : candle.marketInfo.downTokenId;
-      positionSize = config.ARB_POSITION_SIZE_USD;
-      detectedPrice = config.ARB_MAX_ENTRY_PRICE;
+      positionSize = this.strategyParams.positionSizeUsd;
+      detectedPrice = this.strategyParams.maxEntryPrice;
     }
 
-    // Optional order book check (only available with own wallet)
+    // Optional order book check (available with own wallet or read-only client in paper mode)
     const orderBook = await arbGetOrderBook(tokenId);
     if (orderBook) {
-      const maxPrice = this.isContrarian ? detectedPrice : config.ARB_MAX_ENTRY_PRICE;
+      const maxPrice = detectedPrice;
       const availableLiquidity = (orderBook.asks ?? [])
         .filter((a: { price: string }) => parseFloat(a.price) <= maxPrice)
         .reduce((sum: number, a: { size: string }) => sum + parseFloat(a.size), 0);

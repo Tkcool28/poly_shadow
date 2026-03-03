@@ -382,6 +382,21 @@ model CopyTrade {
   @@index([status, side, createdAt])                        // daily spend check
 }
 
+// ─── ArbStrategyConfig (per-strategy runtime config — replaces per-strategy env vars) ───
+
+model ArbStrategyConfig {
+  strategy          String   @id           // "standard", "contrarian", "contrarian-every3", etc.
+  enabled           Boolean  @default(false)
+  assets            String?                 // comma-sep override, e.g. "sol,eth" (null = use global ARB_ASSETS)
+  durations         String?                 // comma-sep override, e.g. "5m" (null = use global ARB_MARKET_TYPES)
+  positionSizeUsd   Float                   // per-trade position size in USD
+  maxEntryPrice     Float                   // max price to pay per share (standard: 0.99, contrarian: 0.10)
+  initialCapitalUsd Float                   // starting capital when creating ArbCapital
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
 // ─── ArbCapital (arb worker's independent capital ledger) ───
 
 model ArbCapital {

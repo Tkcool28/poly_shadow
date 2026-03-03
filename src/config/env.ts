@@ -105,14 +105,14 @@ const envSchema = z.object({
   ARB_ASSETS: z.string().default('btc'),      // comma-sep: btc,eth,sol,xrp
   ARB_MARKET_TYPES: z.string().default('5m'), // comma-sep: 5m,15m,1h,4h
 
-  // Capital (separate from copy-trade)
+  // Capital — legacy: used for one-time DB bootstrap only (ArbStrategyConfig is source of truth)
   ARB_INITIAL_CAPITAL_USD: z.coerce.number().min(1).default(1000),
-  ARB_STANDARD_INITIAL_CAPITAL_USD: z.coerce.number().min(1).optional(), // Falls back to ARB_INITIAL_CAPITAL_USD
+  ARB_STANDARD_INITIAL_CAPITAL_USD: z.coerce.number().min(1).optional(),
   ARB_CONTRARIAN_INITIAL_CAPITAL_USD: z.coerce.number().min(1).default(200),
   ARB_POSITION_SIZE_USD: z.coerce.number().min(1).max(50000).default(500),
   ARB_MAX_DAILY_LOSS_USD: z.coerce.number().min(1).default(500),
 
-  // Strategy
+  // Strategy — legacy: maxEntryPrice now lives in ArbStrategyConfig
   ARB_MAX_ENTRY_PRICE: z.coerce.number().min(0.90).max(0.999).default(0.99),
   ARB_MIN_PRICE_CHANGE: z.coerce.number().default(0.0001), // 0.01% min BTC move (FLAT floor)
   ARB_MAX_CONSECUTIVE_LOSSES: z.coerce.number().min(1).default(5),
@@ -130,7 +130,7 @@ const envSchema = z.object({
     .transform((v) => v === 'true'),
   ARB_STOP_LOSS_PRICE: z.coerce.number().min(0.01).max(0.95).default(0.50),
 
-  // Contrarian mode (buy the opposite outcome token at low price)
+  // Contrarian — legacy: enable/disable + sizing now live in ArbStrategyConfig table
   ARB_CONTRARIAN_ENABLED: z
     .string()
     .default('false')
@@ -138,7 +138,7 @@ const envSchema = z.object({
   ARB_CONTRARIAN_MAX_PRICE: z.coerce.number().min(0.01).max(0.20).default(0.10),
   ARB_CONTRARIAN_POSITION_SIZE_USD: z.coerce.number().min(1).max(1000).default(10),
 
-  // Contrarian strategy variants (each runs as independent strategy with own capital)
+  // Contrarian strategy variants — legacy: used for one-time DB bootstrap only
   ARB_CONTRARIAN_EVERY3_ENABLED: z
     .string()
     .default('false')

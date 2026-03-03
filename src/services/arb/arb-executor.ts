@@ -16,9 +16,16 @@ const log = createJobLogger('arb-executor');
 let ownClient: ClobClient | null = null;
 let usingOwnWallet = false;
 
+// Read-only CLOB client for paper mode order book checks (no auth needed)
+let readOnlyClient: ClobClient | null = null;
+
 // Market metadata cache (tickSize + negRisk) — pruned at 500 entries
 const metadataCache = new Map<string, { tickSize: TickSize; negRisk: boolean }>();
 const METADATA_CACHE_MAX = 500;
+
+// Order book cache — prevents redundant API calls across engines ticking in the same second
+const orderBookCache = new Map<string, { data: OrderBookSummary; fetchedAt: number }>();
+const ORDER_BOOK_CACHE_TTL_MS = 3000; // 3s per token
 
 /**
  * Initialize the arb executor.
@@ -28,7 +35,9 @@ const METADATA_CACHE_MAX = 500;
  */
 export async function initArbExecutor(): Promise<void> {
   if (config.ARB_IS_PAPER) {
-    log.info('Arb executor ready (paper mode — no wallet needed)');
+    // getOrderBook is a public GET — no signer or API keys needed
+    readOnlyClient = new ClobClient('https://clob.polymarket.com', 137);
+    log.info('Arb executor ready (paper mode + real order book validation)');
     return;
   }
 
@@ -95,7 +104,9 @@ export function isUsingOwnWallet(): boolean {
  */
 export async function arbExecuteOrder(params: ExecuteOrderParams): Promise<ExecuteOrderResult> {
   if (config.ARB_IS_PAPER) {
-    return paperExecuteOrder(params);
+    // Fetch real order book for paper FOK validation (BUY only — don't gate stop-loss SELLs)
+    const orderBook = params.side === 'BUY' ? await arbGetOrderBook(params.tokenId) : null;
+    return paperExecuteOrder(params, orderBook);
   }
 
   if (ownClient) {
@@ -108,20 +119,32 @@ export async function arbExecuteOrder(params: ExecuteOrderParams): Promise<Execu
 
 /**
  * Get order book for a token (for liquidity checks before entry).
+ * Works in both live mode (ownClient) and paper mode (readOnlyClient).
  * Returns null if no CLOB client is available.
  */
 export async function arbGetOrderBook(tokenId: string): Promise<OrderBookSummary | null> {
-  if (config.ARB_IS_PAPER) return null; // No order book in paper mode
+  const client = ownClient ?? readOnlyClient;
+  if (!client) return null;
 
-  const client = ownClient;
-  if (!client) {
-    // For shared mode, we can't easily access the shared client's getOrderBook
-    // Skip liquidity check when using shared client
-    return null;
+  // Check cache
+  const cached = orderBookCache.get(tokenId);
+  if (cached && Date.now() - cached.fetchedAt < ORDER_BOOK_CACHE_TTL_MS) {
+    return cached.data;
   }
 
   try {
-    return await client.getOrderBook(tokenId);
+    const book = await client.getOrderBook(tokenId);
+    orderBookCache.set(tokenId, { data: book, fetchedAt: Date.now() });
+
+    // Prune stale entries (> 30s) when cache grows large
+    if (orderBookCache.size > 100) {
+      const cutoff = Date.now() - 30_000;
+      for (const [key, val] of orderBookCache) {
+        if (val.fetchedAt < cutoff) orderBookCache.delete(key);
+      }
+    }
+
+    return book;
   } catch (err: any) {
     log.warn(`Failed to fetch order book: ${err.message}`);
     return null;

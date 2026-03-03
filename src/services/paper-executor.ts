@@ -1,5 +1,6 @@
 import { createJobLogger } from '../lib/logger';
 import { config } from '../config/env';
+import type { OrderBookSummary } from '@polymarket/clob-client';
 import type { ExecuteOrderParams, ExecuteOrderResult } from './trade-executor';
 
 const log = createJobLogger('paper-executor');
@@ -32,8 +33,38 @@ function calculateFee(shares: number, price: number): number {
   return shares * config.PAPER_TRADE_FEE_RATE * Math.pow(price * (1 - price), config.PAPER_TRADE_FEE_EXPONENT);
 }
 
-export async function executeMarketOrder(params: ExecuteOrderParams): Promise<ExecuteOrderResult> {
+export async function executeMarketOrder(
+  params: ExecuteOrderParams,
+  orderBook?: OrderBookSummary | null,
+): Promise<ExecuteOrderResult> {
   const { tokenId, side, amount, detectedPrice } = params;
+
+  // Paper FOK validation: check real order book liquidity before filling
+  if (side === 'BUY' && orderBook) {
+    const maxPrice = detectedPrice;
+    const availableShares = (orderBook.asks ?? [])
+      .filter((a) => parseFloat(a.price) <= maxPrice)
+      .reduce((sum, a) => sum + parseFloat(a.size), 0);
+
+    const requiredShares = amount / maxPrice;
+    if (availableShares < requiredShares) {
+      log.info('Paper FOK rejected: insufficient liquidity', {
+        tokenId: tokenId.slice(0, 20) + '...',
+        side, amount, detectedPrice,
+        availableShares: availableShares.toFixed(0),
+        requiredShares: requiredShares.toFixed(0),
+      });
+      return {
+        orderId: null,
+        status: 'SKIPPED',
+        filledPrice: null,
+        filledSize: null,
+        failReason: `paper FOK: insufficient liquidity (${availableShares.toFixed(0)} < ${requiredShares.toFixed(0)} shares at ≤$${maxPrice})`,
+        transactionHashes: [],
+      };
+    }
+  }
+
   const simulatedPrice = simulateSlippagePrice(detectedPrice, side);
 
   let filledSize: number;

@@ -20,6 +20,61 @@ const TICK_INTERVAL_MS = 1000; // 1-second engine tick
 // Module-level so cleanup handler can access them
 const priceFeeds: CryptoPriceFeed[] = [];
 
+/**
+ * One-time seed: populate ArbStrategyConfig from env vars if the table is empty.
+ * This preserves backward compat for existing deployments.
+ */
+async function bootstrapStrategyConfigs(): Promise<void> {
+  const existing = await prisma.arbStrategyConfig.count();
+  if (existing > 0) return;
+
+  const seeds = [
+    {
+      strategy: 'standard',
+      enabled: true,
+      positionSizeUsd: config.ARB_POSITION_SIZE_USD,
+      maxEntryPrice: config.ARB_MAX_ENTRY_PRICE,
+      initialCapitalUsd: config.ARB_STANDARD_INITIAL_CAPITAL_USD ?? config.ARB_INITIAL_CAPITAL_USD,
+    },
+    {
+      strategy: 'contrarian',
+      enabled: config.ARB_CONTRARIAN_ENABLED,
+      positionSizeUsd: config.ARB_CONTRARIAN_POSITION_SIZE_USD,
+      maxEntryPrice: config.ARB_CONTRARIAN_MAX_PRICE,
+      initialCapitalUsd: config.ARB_CONTRARIAN_INITIAL_CAPITAL_USD,
+    },
+    {
+      strategy: 'contrarian-every3',
+      enabled: config.ARB_CONTRARIAN_EVERY3_ENABLED,
+      positionSizeUsd: config.ARB_CONTRARIAN_POSITION_SIZE_USD,
+      maxEntryPrice: config.ARB_CONTRARIAN_MAX_PRICE,
+      initialCapitalUsd: config.ARB_CONTRARIAN_INITIAL_CAPITAL_USD,
+    },
+    {
+      strategy: 'contrarian-antimart',
+      enabled: config.ARB_CONTRARIAN_ANTIMART_ENABLED,
+      positionSizeUsd: config.ARB_CONTRARIAN_POSITION_SIZE_USD,
+      maxEntryPrice: config.ARB_CONTRARIAN_MAX_PRICE,
+      initialCapitalUsd: config.ARB_CONTRARIAN_INITIAL_CAPITAL_USD,
+    },
+    {
+      strategy: 'contrarian-cooldown',
+      enabled: config.ARB_CONTRARIAN_COOLDOWN_ENABLED,
+      positionSizeUsd: config.ARB_CONTRARIAN_POSITION_SIZE_USD,
+      maxEntryPrice: config.ARB_CONTRARIAN_MAX_PRICE,
+      initialCapitalUsd: config.ARB_CONTRARIAN_INITIAL_CAPITAL_USD,
+    },
+  ];
+
+  const { count } = await prisma.arbStrategyConfig.createMany({
+    data: seeds,
+    skipDuplicates: true,
+  });
+  if (count > 0) {
+    log.info(`Bootstrapped ${count} strategy configs from env vars`);
+  }
+}
+
 async function main() {
   // Shutdown handler
   let shuttingDown = false;
@@ -60,36 +115,67 @@ async function main() {
     }
   }
 
-  // Determine active strategies
-  const strategies = [
-    'standard',
-    ...(config.ARB_CONTRARIAN_ENABLED ? ['contrarian'] : []),
-    ...(config.ARB_CONTRARIAN_EVERY3_ENABLED ? ['contrarian-every3'] : []),
-    ...(config.ARB_CONTRARIAN_ANTIMART_ENABLED ? ['contrarian-antimart'] : []),
-    ...(config.ARB_CONTRARIAN_COOLDOWN_ENABLED ? ['contrarian-cooldown'] : []),
-  ];
+  // Bootstrap strategy configs from env vars on first run (backward compat)
+  await bootstrapStrategyConfigs();
+
+  // Load enabled strategies from DB
+  const strategyConfigs = await prisma.arbStrategyConfig.findMany({
+    where: { enabled: true },
+  });
+
+  if (strategyConfigs.length === 0) {
+    log.info('No enabled strategies in ArbStrategyConfig, exiting');
+    return;
+  }
+
+  // Parse global assets/durations (fallback for strategies with null overrides)
+  const globalAssets = config.ARB_ASSETS.split(',').map((a) => a.trim().toLowerCase())
+    .filter((a): a is SupportedAsset => (SUPPORTED_ASSETS as readonly string[]).includes(a));
+  const globalDurations = config.ARB_MARKET_TYPES.split(',').map((t) => t.trim())
+    .filter((t) => DURATION_CONFIGS[t]);
+
+  // Resolve per-strategy markets
+  const resolvedStrategies = strategyConfigs.map((sc) => {
+    const assets = sc.assets
+      ? sc.assets.split(',').map((a) => a.trim().toLowerCase())
+          .filter((a): a is SupportedAsset => (SUPPORTED_ASSETS as readonly string[]).includes(a))
+      : globalAssets;
+    const durations = sc.durations
+      ? sc.durations.split(',').map((t) => t.trim()).filter((t) => DURATION_CONFIGS[t])
+      : globalDurations;
+    return { ...sc, resolvedAssets: assets, resolvedDurations: durations };
+  }).filter((sc) => {
+    if (sc.resolvedAssets.length === 0 || sc.resolvedDurations.length === 0) {
+      log.warn(`Strategy ${sc.strategy} has no valid markets, skipping`, {
+        assets: sc.assets, durations: sc.durations,
+      });
+      return false;
+    }
+    return true;
+  });
+
+  if (resolvedStrategies.length === 0) {
+    log.error('All strategies resolved to zero valid markets, exiting');
+    return;
+  }
 
   // Ensure ArbCapital record exists per strategy
-  for (const strategy of strategies) {
-    const initialCapital = strategy.startsWith('contrarian')
-      ? config.ARB_CONTRARIAN_INITIAL_CAPITAL_USD
-      : (config.ARB_STANDARD_INITIAL_CAPITAL_USD ?? config.ARB_INITIAL_CAPITAL_USD);
-
-    const capitalKey = { isPaper_strategy: { isPaper: config.ARB_IS_PAPER, strategy } };
+  for (const sc of resolvedStrategies) {
+    const capitalKey = { isPaper_strategy: { isPaper: config.ARB_IS_PAPER, strategy: sc.strategy } };
     const existingCapital = await prisma.arbCapital.findUnique({ where: capitalKey });
     if (!existingCapital) {
       await prisma.arbCapital.create({
         data: {
-          initialCapital,
-          currentCapital: initialCapital,
+          initialCapital: sc.initialCapitalUsd,
+          currentCapital: sc.initialCapitalUsd,
           deployedCapital: 0,
           isPaper: config.ARB_IS_PAPER,
-          strategy,
+          strategy: sc.strategy,
         },
       });
-      log.info(`Created ArbCapital [${strategy}]`, { initialCapital, isPaper: config.ARB_IS_PAPER });
+      log.info(`Created ArbCapital [${sc.strategy}]`, { initialCapital: sc.initialCapitalUsd, isPaper: config.ARB_IS_PAPER });
     } else {
-      log.info(`ArbCapital [${strategy}] loaded`, {
+      log.info(`ArbCapital [${sc.strategy}] loaded`, {
         currentCapital: existingCapital.currentCapital.toFixed(2),
         deployedCapital: existingCapital.deployedCapital.toFixed(2),
         totalPnl: existingCapital.totalPnl.toFixed(2),
@@ -148,24 +234,15 @@ async function main() {
     }
   }
 
-  // Parse assets and durations
-  const assets = config.ARB_ASSETS.split(',').map((a) => a.trim().toLowerCase())
-    .filter((a): a is SupportedAsset => (SUPPORTED_ASSETS as readonly string[]).includes(a));
-  const durations = config.ARB_MARKET_TYPES.split(',').map((t) => t.trim())
-    .filter((t) => DURATION_CONFIGS[t]);
-
-  if (assets.length === 0) {
-    log.error(`No valid assets in ARB_ASSETS="${config.ARB_ASSETS}". Valid: ${SUPPORTED_ASSETS.join(', ')}`);
-    return;
-  }
-  if (durations.length === 0) {
-    log.error(`No valid durations in ARB_MARKET_TYPES="${config.ARB_MARKET_TYPES}". Valid: ${Object.keys(DURATION_CONFIGS).join(', ')}`);
-    return;
+  // Collect union of all assets across strategies for price feeds
+  const allAssets = new Set<SupportedAsset>();
+  for (const sc of resolvedStrategies) {
+    for (const a of sc.resolvedAssets) allAssets.add(a);
   }
 
   // Create one price feed per unique asset
   const feedMap = new Map<string, CryptoPriceFeed>();
-  for (const asset of assets) {
+  for (const asset of allAssets) {
     const feed = new CryptoPriceFeed(asset, config.ARB_SNAP_BUFFER_SIZE);
     feed.connect();
     feedMap.set(asset, feed);
@@ -187,32 +264,35 @@ async function main() {
     }
   }
 
-  // Create one engine per (asset, duration, strategy) combination
+  // Create engines per-strategy, per-market
   const engines: ArbEngine[] = [];
-  for (const asset of assets) {
-    const feed = feedMap.get(asset)!;
-    for (const duration of durations) {
-      const dc = DURATION_CONFIGS[duration];
-      const mc = buildMarketConfig(asset, dc);
-      for (const strategy of strategies) {
-        log.info(`Starting engine: ${mc.type}-${strategy}`, {
+  for (const sc of resolvedStrategies) {
+    for (const asset of sc.resolvedAssets) {
+      const feed = feedMap.get(asset)!;
+      for (const duration of sc.resolvedDurations) {
+        const dc = DURATION_CONFIGS[duration];
+        const mc = buildMarketConfig(asset, dc);
+        log.info(`Starting engine: ${mc.type}-${sc.strategy}`, {
           duration: `${mc.candleDurationMs / 1000}s`,
           entryWindow: `${mc.entryStartMs / 1000}s-${mc.entryEndMs / 1000}s`,
-          strategy,
+          positionSize: `$${sc.positionSizeUsd}`,
+          maxEntryPrice: sc.maxEntryPrice,
         });
-        engines.push(new ArbEngine(mc, feed, config.ARB_IS_PAPER, strategy));
+        engines.push(new ArbEngine(mc, feed, config.ARB_IS_PAPER, sc.strategy, {
+          positionSizeUsd: sc.positionSizeUsd,
+          maxEntryPrice: sc.maxEntryPrice,
+        }));
       }
     }
   }
 
-  log.info(`Arb worker started`, {
+  log.info('Arb worker started', {
     mode: config.ARB_IS_PAPER ? 'PAPER' : 'LIVE',
-    assets: assets.join(','),
-    durations: durations.join(','),
-    strategies: strategies.join(','),
+    strategies: resolvedStrategies.map((sc) => {
+      const count = sc.resolvedAssets.length * sc.resolvedDurations.length;
+      return `${sc.strategy}(${sc.resolvedAssets.join(',')}×${sc.resolvedDurations.join(',')} $${sc.positionSizeUsd}@${sc.maxEntryPrice} ×${count})`;
+    }).join(' | '),
     engines: engines.length,
-    positionSize: `$${config.ARB_POSITION_SIZE_USD}`,
-    maxEntryPrice: config.ARB_MAX_ENTRY_PRICE,
   });
 
   // Main loop: tick all engines every second
