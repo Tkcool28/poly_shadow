@@ -99,18 +99,25 @@ export class RtdsTradeStream {
       this.messagesReceived++;
       this.lastMessageAt = new Date();
 
-      // Ignore PONG responses
-      const raw = data.toString();
-      if (raw === 'PONG') return;
-
       try {
+        const raw = data.toString();
         const msg = JSON.parse(raw);
         if (msg.topic === 'activity' && msg.type === 'trades' && msg.payload) {
           this.onTrade(msg.payload as RtdsTradePayload);
         }
       } catch {
-        log.debug('Failed to parse RTDS message', { raw: raw.slice(0, 200) });
+        // Non-JSON messages (server-specific text frames) are ignored
       }
+    });
+
+    // Protocol-level pong: server acknowledges our ws.ping() — update liveness timestamp
+    ws.on('pong', () => {
+      this.lastMessageAt = new Date();
+    });
+
+    // Protocol-level ping from server: ws library auto-replies with pong, just track liveness
+    ws.on('ping', () => {
+      this.lastMessageAt = new Date();
     });
 
     ws.on('close', (code: number, reason: Buffer) => {
@@ -130,14 +137,15 @@ export class RtdsTradeStream {
     this.clearHeartbeat();
     this.heartbeatTimer = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
-        // Detect stale connection: no message (including PONG) in 3 heartbeat intervals
+        // Detect stale connection: no pong/message/ping in 3 heartbeat intervals
         if (this.lastMessageAt &&
             Date.now() - this.lastMessageAt.getTime() > HEARTBEAT_INTERVAL_MS * 3) {
-          log.warn('RTDS connection stale (no messages in 15s), forcing reconnect');
+          log.warn('RTDS connection stale (no activity in 15s), forcing reconnect');
           ws.terminate(); // force-close → 'close' event → scheduleReconnect
           return;
         }
-        ws.send('PING');
+        // Use WebSocket protocol-level ping — server responds with protocol pong (not text)
+        ws.ping();
       }
     }, HEARTBEAT_INTERVAL_MS);
   }
