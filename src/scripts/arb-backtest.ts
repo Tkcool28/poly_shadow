@@ -415,7 +415,7 @@ async function main(): Promise<void> {
 
         // 1. Get direction + move magnitude from klines (pre-entry only — no future data)
         const preEntryKlines = klines.filter(
-          (k) => k.openTime >= candleStartMs && k.openTime < candleStartMs + dc.entryStartMs,
+          (k) => k.openTime >= candleStartMs && k.openTime <= candleStartMs + dc.entryStartMs,
         );
         const result = getDirectionFromKlines(preEntryKlines, candleStartMs, dc);
         if (!result) {
