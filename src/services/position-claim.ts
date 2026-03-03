@@ -138,7 +138,10 @@ async function pollReceipt(
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const receipt = await p.getTransactionReceipt(txHash);
-    if (receipt) return receipt;
+    if (receipt) {
+      if (receipt.status === 0) throw new Error(`Tx ${txHash} reverted on-chain`);
+      return receipt;
+    }
     await new Promise(r => setTimeout(r, intervalMs));
   }
   throw new Error(`Tx ${txHash} not mined within ${timeoutMs / 1000}s`);
