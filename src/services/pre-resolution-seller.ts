@@ -97,7 +97,7 @@ export async function sweepPreResolutionSells(): Promise<void> {
     if (netShares <= 0 || lastPrice <= 0) continue;
 
     const estimatedUsd = netShares * lastPrice;
-    if (estimatedUsd < config.MIN_SELL_USD) continue;
+    if (estimatedUsd < 0.01) continue;
 
     // Execute sell
     const executeFn = pos.isPaper ? paperExecute : executeMarketOrder;

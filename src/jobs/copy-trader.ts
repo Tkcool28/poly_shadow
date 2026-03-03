@@ -116,17 +116,24 @@ async function main() {
       }
 
       // Fetch unprocessed detected trades (no linked CopyTrade, within stale cutoff window)
+      // SELLs are processed first — exits are time-sensitive and must not wait behind a BUY backlog
       const staleCutoff = new Date(Date.now() - config.STALE_TRADE_CUTOFF_MS);
-      const pending = await prisma.detectedTrade.findMany({
-        where: {
-          copyTrade: null,
-          detectedAt: { gte: staleCutoff },
-          timestamp: { gte: Math.floor(staleCutoff.getTime() / 1000) },
-          proxyWallet: { in: activeWallets },
-        },
+      const baseWhere = {
+        copyTrade: null,
+        detectedAt: { gte: staleCutoff },
+        timestamp: { gte: Math.floor(staleCutoff.getTime() / 1000) },
+        proxyWallet: { in: activeWallets },
+      };
+      const pendingSells = await prisma.detectedTrade.findMany({
+        where: { ...baseWhere, side: 'SELL' },
+        orderBy: { detectedAt: 'asc' },
+      });
+      const pendingBuys = await prisma.detectedTrade.findMany({
+        where: { ...baseWhere, side: 'BUY' },
         orderBy: { detectedAt: 'asc' },
         take: 10,
       });
+      const pending = [...pendingSells, ...pendingBuys];
 
       for (const trade of pending) {
         if (shuttingDown || isShuttingDown()) break;

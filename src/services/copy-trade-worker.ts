@@ -68,12 +68,6 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     // Full position close — when trader sells, we exit entirely
     sellShares = heldShares;
     copyAmountUsd = sellShares * trade.price;
-
-    // Skip dust sells (rounding remnants)
-    if (copyAmountUsd < config.MIN_SELL_USD) {
-      await createSkippedRecord(trade, `dust sell: $${copyAmountUsd.toFixed(4)} below minimum`, allocation.id, isPaper);
-      return;
-    }
   } else {
     // Guard: negative or zero capital means no buying power — skip silently
     if (allocation.currentCapital <= 0) return;

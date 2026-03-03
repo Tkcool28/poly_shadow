@@ -57,8 +57,8 @@ const envSchema = z.object({
   PORTFOLIO_VALUE_REFRESH_MS: z.coerce.number().default(300000), // 5 min
   SLIPPAGE_BPS: z.coerce.number().min(10).max(1000).default(200), // 2% default
   COPY_TRADE_PERCENT: z.coerce.number().min(0.01).max(1.0).default(0.10), // Copy 10% of trader's actual trade size
-  MIN_COMPOSITE_SCORE: z.coerce.number().min(0).max(1).default(0.60), // Skip BUY trades below this score (0 = disabled)
-  MIN_SIGNAL_TRADE_USD: z.coerce.number().min(0).default(10), // Skip BUY trades where trader's USD < this (0 = disabled)
+  MIN_COMPOSITE_SCORE: z.coerce.number().min(0).max(1).default(0), // Skip BUY trades below this score (0 = disabled)
+  MIN_SIGNAL_TRADE_USD: z.coerce.number().min(0).default(0), // Skip BUY trades where trader's USD < this (0 = disabled)
 
   // Order aggregation pool
   POOL_MIN_AMOUNT_USD: z.coerce.number().min(0.01).max(100).default(0.50), // min USD to pool paper trades
@@ -76,7 +76,6 @@ const envSchema = z.object({
   // Position settlement
   SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(300000), // 5 minutes
   STALE_TRADE_CUTOFF_MS: z.coerce.number().default(600000), // 10 min (was hardcoded 5 min)
-  MIN_SELL_USD: z.coerce.number().min(0).default(0.01), // Skip dust sells below this
 
   // CLOB reconciliation & balance check
   BALANCE_CHECK_INTERVAL_MS: z.coerce.number().default(600000), // 10 min
