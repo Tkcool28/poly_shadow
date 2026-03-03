@@ -583,10 +583,10 @@ async function main(): Promise<void> {
   // ─── Global Strategy Ranking ───
 
   const MIN_TRADES = 20;
-  const ranked = globalRanking
+  const allRanked = globalRanking
     .filter((s) => s.trades >= MIN_TRADES)
-    .sort((a, b) => b.profitFactor - a.profitFactor)
-    .slice(0, 20);
+    .sort((a, b) => b.profitFactor - a.profitFactor);
+  const ranked = allRanked.slice(0, 20);
 
   if (ranked.length > 0) {
     console.log(`\n${'='.repeat(80)}`);
@@ -604,7 +604,7 @@ async function main(): Promise<void> {
     // ─── Recommended Config ───
     // Only consider base strategies (no move/vol filter variants) since those can't be deployed at runtime
     const isBaseStrategy = (label: string) => !label.includes('move>') && !label.includes('vol<');
-    const bestBase = ranked.find((s) => isBaseStrategy(s.label));
+    const bestBase = allRanked.find((s) => isBaseStrategy(s.label) && s.profitFactor > 1);
 
     if (bestBase) {
       const isContrarian = bestBase.label.includes('Contrarian');
