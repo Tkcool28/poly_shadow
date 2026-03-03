@@ -63,6 +63,7 @@ async function upsertToTradeTable(data: {
 // Polling fallback in detectNewTrades() uses isMonitored (= all COMPLETED traders).
 
 let trackedWallets: Set<string> = new Set();
+let liveAllocationWallets: Set<string> = new Set();
 let scoreCache: Map<string, number> = new Map(); // proxyWallet → compositeScore
 let userNameCache: Map<string, string | null> = new Map();
 let cacheRefreshTimer: ReturnType<typeof setInterval> | null = null;
@@ -82,10 +83,11 @@ export async function refreshTrackedWallets(): Promise<void> {
   const names = new Map<string, string | null>();
 
   for (const t of traders) {
-    wallets.add(t.proxyWallet);
-    names.set(t.proxyWallet, t.userName);
+    const wallet = t.proxyWallet.toLowerCase();
+    wallets.add(wallet);
+    names.set(wallet, t.userName);
     if (t.scores[0]) {
-      scores.set(t.proxyWallet, t.scores[0].compositeScore);
+      scores.set(wallet, t.scores[0].compositeScore);
     }
   }
 
@@ -93,6 +95,13 @@ export async function refreshTrackedWallets(): Promise<void> {
   scoreCache = scores;
   userNameCache = names;
   logger.debug(`Refreshed tracked wallets cache: ${wallets.size} wallets (all COMPLETED traders)`);
+
+  // Also refresh live-allocation wallet set for ChainTradeWatcher
+  const liveAllocs = await prisma.followAllocation.findMany({
+    where: { isPaper: false, isActive: true },
+    select: { proxyWallet: true },
+  });
+  liveAllocationWallets = new Set(liveAllocs.map(a => a.proxyWallet.toLowerCase()));
 }
 
 export async function startCacheRefresh(intervalMs = 60000): Promise<void> {
@@ -108,20 +117,29 @@ export function stopCacheRefresh(): void {
   }
 }
 
+/** Returns the live-allocation wallet set (~7 wallets) — used by ChainTradeWatcher */
+export function getLiveAllocationWallets(): Set<string> {
+  return liveAllocationWallets;
+}
+
 /**
  * Handle a real-time trade from the RTDS WebSocket.
  * Returns true if the trade was inserted (new detection), false if skipped/duplicate.
  */
 export async function handleRealtimeTrade(payload: RtdsTradePayload): Promise<boolean> {
-  if (!trackedWallets.has(payload.proxyWallet)) return false;
+  const normalizedWallet = payload.proxyWallet.toLowerCase();
+  if (!trackedWallets.has(normalizedWallet)) {
+    logger.debug('WS trade from untracked wallet', { wallet: payload.proxyWallet.slice(0, 10) });
+    return false;
+  }
 
-  const compositeScore = scoreCache.get(payload.proxyWallet) ?? null;
-  const userName = userNameCache.get(payload.proxyWallet) ?? payload.name ?? null;
+  const compositeScore = scoreCache.get(normalizedWallet) ?? null;
+  const userName = userNameCache.get(normalizedWallet) ?? payload.name ?? null;
 
   try {
     await prisma.detectedTrade.create({
       data: {
-        proxyWallet: payload.proxyWallet,
+        proxyWallet: normalizedWallet,
         userName,
         side: payload.side,
         conditionId: payload.conditionId,
@@ -139,7 +157,7 @@ export async function handleRealtimeTrade(payload: RtdsTradePayload): Promise<bo
 
     // Dual-write to Trade table for scoring freshness (fire-and-forget)
     void upsertToTradeTable({
-      proxyWallet: payload.proxyWallet,
+      proxyWallet: normalizedWallet,
       side: payload.side,
       asset: payload.asset,
       conditionId: payload.conditionId,
@@ -221,6 +239,7 @@ async function checkTraderForNewTrades(
   userName: string | null,
   lastSync: Date | null,
   compositeScore: number | null,
+  logSuffix = '',
 ): Promise<number> {
   // Fetch recent trades (limit 100 should be enough for a 2-min window)
   const recentTrades = await getTrades({
@@ -288,7 +307,7 @@ async function checkTraderForNewTrades(
 
       // Log the detected trade
       const usdValue = (trade.size * trade.price).toFixed(2);
-      logger.info(`NEW TRADE DETECTED`, {
+      logger.info(`NEW TRADE DETECTED${logSuffix}`, {
         trader: proxyWallet.slice(0, 10),
         userName,
         side: trade.side,
@@ -319,4 +338,67 @@ async function checkTraderForNewTrades(
   }
 
   return insertedCount;
+}
+
+/**
+ * Immediately check a single live-allocation wallet for new trades.
+ * Called by ChainTradeWatcher on Polygon OrderFilled event (hot path).
+ * Uses case-insensitive lookup: chain events produce lowercase addresses;
+ * DB may store EIP-55 checksummed values.
+ */
+export async function detectLiveTradeForWallet(proxyWallet: string): Promise<number> {
+  const trader = await prisma.trader.findFirst({
+    where: { proxyWallet: { equals: proxyWallet, mode: 'insensitive' } },
+    select: {
+      proxyWallet: true,
+      userName: true,
+      lastTradeSync: true,
+      scores: { select: { compositeScore: true }, take: 1 },
+    },
+  });
+  if (!trader) return 0;
+  return checkTraderForNewTrades(
+    trader.proxyWallet,
+    trader.userName,
+    trader.lastTradeSync,
+    trader.scores[0]?.compositeScore ?? null,
+    ' (CHAIN)',
+  );
+}
+
+/**
+ * Fast-poll detection for all live-allocation traders.
+ * Backup for ChainTradeWatcher — runs every LIVE_TRADERS_POLL_MS (10s).
+ */
+export async function detectLiveTrades(): Promise<number> {
+  const liveAllocations = await prisma.followAllocation.findMany({
+    where: { isPaper: false, isActive: true },
+    select: { proxyWallet: true },
+  });
+  if (liveAllocations.length === 0) return 0;
+
+  const wallets = liveAllocations.map(a => a.proxyWallet);
+  const traders = await prisma.trader.findMany({
+    where: { proxyWallet: { in: wallets } },
+    select: {
+      proxyWallet: true,
+      userName: true,
+      lastTradeSync: true,
+      scores: { select: { compositeScore: true }, take: 1 },
+    },
+  });
+  if (traders.length === 0) return 0;
+
+  const results = await Promise.all(
+    traders.map(t =>
+      checkTraderForNewTrades(
+        t.proxyWallet, t.userName, t.lastTradeSync,
+        t.scores[0]?.compositeScore ?? null, ' (LIVE)',
+      ).catch((err: any) => {
+        logger.warn(`Live poll: failed for ${t.proxyWallet.slice(0, 10)}: ${err.message}`);
+        return 0;
+      }),
+    ),
+  );
+  return results.reduce((sum, n) => sum + n, 0);
 }

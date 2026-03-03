@@ -37,6 +37,12 @@ const envSchema = z.object({
     .transform((v) => v === 'true'),
   WS_RECONNECT_MAX_MS: z.coerce.number().default(30000),
   WS_FALLBACK_POLL_MS: z.coerce.number().default(300000), // 5 min
+  LIVE_TRADERS_POLL_MS: z.coerce.number().default(10000), // 10s fast-poll backup for live-allocation traders
+  POLYGON_WS_RPC_URL: z.string().default('wss://polygon-bor-rpc.publicnode.com'),
+  CHAIN_WATCHER_ENABLED: z
+    .string()
+    .default('false') // default off; enable explicitly after verifying WS works
+    .transform((v) => v === 'true'),
 
   // Copy-trade wallet credentials (required when COPY_TRADE_ENABLED=true)
   PRIVATE_KEY: z.string().optional(),

@@ -3,17 +3,37 @@ import { isShuttingDown } from '../lib/shutdown';
 import { createJobLogger } from '../lib/logger';
 import { prisma } from '../lib/prisma';
 import { config } from '../config/env';
-import { detectNewTrades, handleRealtimeTrade, startCacheRefresh, stopCacheRefresh } from '../services/trade-detector';
+import { detectNewTrades, detectLiveTrades, detectLiveTradeForWallet, handleRealtimeTrade, startCacheRefresh, stopCacheRefresh, getLiveAllocationWallets } from '../services/trade-detector';
 import { RtdsTradeStream } from '../services/ws-trade-stream';
+import { ChainTradeWatcher } from '../services/chain-trade-watcher';
 
 const JOB_NAME = 'trade-monitor';
 const log = createJobLogger(JOB_NAME);
 
 let wsStream: RtdsTradeStream | null = null;
 let wsDetectedCount = 0;
+let chainWatcher: ChainTradeWatcher | null = null;
+let chainDetectedCount = 0;
+// Dedup: prevent concurrent REST calls for the same wallet from rapid-fire chain events
+const pendingWalletChecks = new Set<string>();
 
 async function runPollingCycle(): Promise<number> {
   return await detectNewTrades();
+}
+
+async function startLivePoll(): Promise<void> {
+  log.info('Starting live-trader fast-poll', { intervalMs: config.LIVE_TRADERS_POLL_MS });
+  while (!isShuttingDown()) {
+    try {
+      const detected = await detectLiveTrades();
+      if (detected > 0) log.info(`Live poll: ${detected} new trades detected`);
+    } catch (err: any) {
+      log.error(`Live poll error: ${err.message}`, { stack: err.stack });
+    }
+    if (!isShuttingDown()) {
+      await new Promise(resolve => setTimeout(resolve, config.LIVE_TRADERS_POLL_MS));
+    }
+  }
 }
 
 async function main() {
@@ -25,6 +45,7 @@ async function main() {
     log.info(`Received ${signal}, cleaning up...`);
     stopCacheRefresh();
     if (wsStream) wsStream.close();
+    if (chainWatcher) chainWatcher.close();
     await prisma.$disconnect();
     process.exit(0);
   };
@@ -32,6 +53,35 @@ async function main() {
   process.on('SIGTERM', () => cleanup('SIGTERM'));
   process.on('SIGINT', () => cleanup('SIGINT'));
 
+  // Always populate wallet caches before starting chain watcher or WS/polling.
+  // startCacheRefresh has a guard so the call from startWithWebSocket() below is a no-op.
+  await startCacheRefresh(60000);
+
+  // Layer 1: Blockchain event-driven detection for live-allocation wallets
+  if (config.CHAIN_WATCHER_ENABLED) {
+    chainWatcher = new ChainTradeWatcher(
+      async (wallet) => {
+        // Dedup: skip if a check for this wallet is already in flight
+        if (pendingWalletChecks.has(wallet)) return;
+        pendingWalletChecks.add(wallet);
+        try {
+          const detected = await detectLiveTradeForWallet(wallet);
+          if (detected > 0) chainDetectedCount += detected;
+        } catch (err: any) {
+          log.error(`Chain watcher handler error: ${err.message}`, { stack: err.stack });
+        } finally {
+          pendingWalletChecks.delete(wallet);
+        }
+      },
+      getLiveAllocationWallets,
+    );
+    chainWatcher.connect();
+  }
+
+  // Layer 2: 10s polling backup for live-allocation wallets (always runs)
+  void startLivePoll();
+
+  // Bulk detection for all monitored traders
   if (config.WS_ENABLED) {
     await startWithWebSocket();
   } else {
@@ -43,10 +93,6 @@ async function startWithWebSocket(): Promise<void> {
   log.info('Trade monitor starting with WebSocket (RTDS) + polling fallback', {
     fallbackPollInterval: config.WS_FALLBACK_POLL_MS,
   });
-
-  // Initialize monitored wallets cache (used by WS handler)
-  // Await so trackedWallets is populated before WS messages can arrive
-  await startCacheRefresh(60000);
 
   // Start WebSocket stream
   wsStream = new RtdsTradeStream(async (payload) => {
@@ -86,7 +132,7 @@ async function startWithPolling(intervalMs: number): Promise<void> {
 
     // Update system health
     const duration = Date.now() - start;
-    const totalDetected = detectedCount + wsDetectedCount;
+    const totalDetected = detectedCount + wsDetectedCount + chainDetectedCount;
     try {
       await prisma.systemHealth.upsert({
         where: { jobName: JOB_NAME },
@@ -108,8 +154,17 @@ async function startWithPolling(intervalMs: number): Promise<void> {
       });
     } catch {}
 
-    // Reset WS counter after reporting
+    if (wsDetectedCount > 0) {
+      log.info(`WS real-time: ${wsDetectedCount} trades detected since last poll`);
+    }
+
+    if (chainDetectedCount > 0) {
+      log.info(`Chain watcher: ${chainDetectedCount} trades detected since last poll`);
+    }
+
+    // Reset counters after reporting
     wsDetectedCount = 0;
+    chainDetectedCount = 0;
 
     if (detectedCount > 0) {
       log.info(`Polling cycle: detected ${detectedCount} new trades`, { durationMs: duration });
@@ -122,6 +177,15 @@ async function startWithPolling(intervalMs: number): Promise<void> {
         state: wsStream.state,
         messagesReceived: wsStream.messagesReceived,
         lastMessageAt: wsStream.lastMessageAt?.toISOString(),
+      });
+    }
+
+    if (config.CHAIN_WATCHER_ENABLED && chainWatcher) {
+      log.debug('Chain watcher status', {
+        state: chainWatcher.state,
+        eventsReceived: chainWatcher.eventsReceived,
+        triggeredDetections: chainWatcher.triggeredDetections,
+        lastEventAt: chainWatcher.lastEventAt?.toISOString(),
       });
     }
 
