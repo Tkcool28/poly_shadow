@@ -1,5 +1,6 @@
 import { prisma } from '../lib/prisma';
 import { createJobLogger } from '../lib/logger';
+import { normalizeOutcome } from '../lib/normalize';
 import { getMarketsByConditionIds } from '../api/gamma-api';
 
 const log = createJobLogger('unrealized-pnl');
@@ -125,8 +126,8 @@ export async function calculateUnrealizedPnl(
     }
 
     // Find outcome price
-    const normalizedOutcome = meta.outcome.trim().toLowerCase();
-    const outcomeIndex = marketData.outcomes.findIndex(o => o.trim().toLowerCase() === normalizedOutcome);
+    const normalizedOutcome = normalizeOutcome(meta.outcome);
+    const outcomeIndex = marketData.outcomes.findIndex(o => normalizeOutcome(o) === normalizedOutcome);
     if (outcomeIndex < 0 || outcomeIndex >= marketData.outcomePrices.length) {
       log.debug('Outcome not found in market', { outcome: meta.outcome, tokenId: pos.tokenId.slice(0, 20) });
       continue;

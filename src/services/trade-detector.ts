@@ -243,6 +243,8 @@ async function checkTraderForNewTrades(
   logSuffix = '',
   source: string = 'POLL',
 ): Promise<number> {
+  const normalizedWallet = proxyWallet.toLowerCase();
+
   // Fetch recent trades (limit 100 should be enough for a 2-min window)
   const recentTrades = await getTrades({
     user: proxyWallet,
@@ -275,7 +277,7 @@ async function checkTraderForNewTrades(
     try {
       await prisma.detectedTrade.create({
         data: {
-          proxyWallet,
+          proxyWallet: normalizedWallet,
           userName,
           side: trade.side,
           conditionId: trade.conditionId,
@@ -295,7 +297,7 @@ async function checkTraderForNewTrades(
 
       // Dual-write to Trade table for scoring freshness (fire-and-forget)
       void upsertToTradeTable({
-        proxyWallet,
+        proxyWallet: normalizedWallet,
         side: trade.side,
         asset: trade.asset,
         conditionId: trade.conditionId,

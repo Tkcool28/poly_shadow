@@ -1,5 +1,6 @@
 import { prisma } from '../lib/prisma';
 import { createJobLogger } from '../lib/logger';
+import { normalizeOutcome } from '../lib/normalize';
 import { getMarketsByConditionIds } from '../api/gamma-api';
 import { redeemWinningPositions, type ClaimablePosition } from './position-claim';
 
@@ -110,11 +111,10 @@ export async function sweepPositionSettlements(): Promise<void> {
       continue;
     }
 
-    // Strip punctuation before comparing — API outcome strings sometimes differ in apostrophes/quotes
+    // Normalize before comparing — API outcome strings sometimes differ in apostrophes/quotes
     // e.g. DB: "Anyones Legend" vs API: "Anyone's Legend" → both normalize to "anyones legend"
-    const stripPunct = (s: string) => s.replace(/[^\w\s]/g, '').trim().toLowerCase();
-    const normalizedOutcome = stripPunct(meta.outcome);
-    const outcomeIndex = outcomes.findIndex(o => stripPunct(o) === normalizedOutcome);
+    const normalizedOutcome = normalizeOutcome(meta.outcome);
+    const outcomeIndex = outcomes.findIndex(o => normalizeOutcome(o) === normalizedOutcome);
     if (outcomeIndex < 0 || outcomeIndex >= outcomePrices.length) {
       log.warn('Settlement: outcome not found in market', {
         outcome: meta.outcome,
@@ -199,17 +199,31 @@ export async function sweepPositionSettlements(): Promise<void> {
         },
       });
 
+      // Settle BUY fills with resolution metadata
       await tx.copyTrade.updateMany({
         where: {
           tokenId: pos.tokenId,
           followAllocationId: pos.followAllocationId,
           isPaper: pos.isPaper,
           status: 'FILLED',
+          side: 'BUY',
         },
         data: {
           status: 'SETTLED',
           failReason: `market resolved: price=${settlementPrice.toFixed(4)}, value=$${settlementValue.toFixed(2)}, pnl=${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`,
         },
+      });
+
+      // Close SELL fills — mark settled without overwriting their original failReason
+      await tx.copyTrade.updateMany({
+        where: {
+          tokenId: pos.tokenId,
+          followAllocationId: pos.followAllocationId,
+          isPaper: pos.isPaper,
+          status: 'FILLED',
+          side: 'SELL',
+        },
+        data: { status: 'SETTLED' },
       });
     });
 

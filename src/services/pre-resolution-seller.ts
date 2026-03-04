@@ -89,7 +89,15 @@ export async function sweepPreResolutionSells(): Promise<void> {
         netShares += fill.filledSize ?? (fill.requestedAmount / (fill.filledPrice ?? 1));
         lastPrice = fill.filledPrice ?? lastPrice;
       } else {
-        netShares -= fill.filledSize ?? 0;
+        if (fill.filledSize != null) {
+          netShares -= fill.filledSize;
+        } else {
+          const price = fill.filledPrice ?? 1;
+          netShares -= fill.requestedAmount / price;
+          log.warn('Pre-resolution: SELL fill missing filledSize, using fallback', {
+            tokenId: pos.tokenId.slice(0, 20), fillPrice: price,
+          });
+        }
       }
     }
     netShares = Math.max(netShares, 0);
@@ -99,22 +107,78 @@ export async function sweepPreResolutionSells(): Promise<void> {
     const estimatedUsd = netShares * lastPrice;
     if (estimatedUsd < 0.01) continue;
 
+    // Guard: skip if a SELL is currently in-flight for this position
+    const pendingSell = await prisma.copyTrade.findFirst({
+      where: {
+        tokenId: pos.tokenId,
+        followAllocationId: pos.followAllocationId,
+        isPaper: pos.isPaper,
+        side: 'SELL',
+        status: 'PENDING',
+      },
+    });
+    if (pendingSell) {
+      log.debug('Pre-resolution: skipping, SELL already in-flight', {
+        tokenId: pos.tokenId.slice(0, 20),
+        pendingSellId: pendingSell.id,
+      });
+      continue;
+    }
+
     // Execute sell
     const executeFn = pos.isPaper ? paperExecute : executeMarketOrder;
 
-    // Create PENDING record (synthetic detectedTradeId — no real DetectedTrade)
-    const copyTrade = await prisma.copyTrade.create({
-      data: {
-        detectedTradeId: `pre-resolution-${pos.tokenId}-${pos.followAllocationId}-${Date.now()}`,
-        tokenId: pos.tokenId,
-        side: 'SELL',
-        requestedAmount: estimatedUsd,
-        requestedPrice: lastPrice,
-        status: 'PENDING',
-        isPaper: pos.isPaper,
-        followAllocationId: pos.followAllocationId,
-      },
+    // Look up allocation's proxyWallet for the DetectedTrade record
+    const allocation = await prisma.followAllocation.findUnique({
+      where: { id: pos.followAllocationId },
+      select: { proxyWallet: true },
     });
+    if (!allocation) continue;
+
+    // Create a synthetic DetectedTrade to satisfy FK constraint
+    // (CopyTrade.detectedTradeId → DetectedTrade.id).
+    // Date.now() in transactionHash ensures uniqueness across retries after FAILED attempts.
+    const syntheticTxHash = `pre-resolution-${pos.tokenId.slice(0, 20)}-${pos.followAllocationId}-${Date.now()}`;
+    let syntheticDetected;
+    try {
+      syntheticDetected = await prisma.detectedTrade.create({
+        data: {
+          proxyWallet: allocation.proxyWallet,
+          side: 'SELL',
+          conditionId: meta.conditionId,
+          asset: pos.tokenId,
+          size: netShares,
+          price: lastPrice,
+          outcome: meta.outcome,
+          transactionHash: syntheticTxHash,
+          timestamp: Math.floor(Date.now() / 1000),
+          detectionSource: 'PRE_RESOLUTION',
+        },
+      });
+    } catch (err: any) {
+      if (err.code === 'P2002') continue;
+      throw err;
+    }
+
+    // Create PENDING CopyTrade with real FK reference
+    let copyTrade;
+    try {
+      copyTrade = await prisma.copyTrade.create({
+        data: {
+          detectedTradeId: syntheticDetected.id,
+          tokenId: pos.tokenId,
+          side: 'SELL',
+          requestedAmount: estimatedUsd,
+          requestedPrice: lastPrice,
+          status: 'PENDING',
+          isPaper: pos.isPaper,
+          followAllocationId: pos.followAllocationId,
+        },
+      });
+    } catch (err: any) {
+      if (err.code === 'P2002') continue;
+      throw err;
+    }
 
     try {
       const result = await executeFn({

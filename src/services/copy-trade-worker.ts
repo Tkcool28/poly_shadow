@@ -102,8 +102,6 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
 
     // ─── Trade-proportional sizing ───
     copyAmountUsd = traderTradeUsd * config.COPY_TRADE_PERCENT;
-    // Cap at 2× percent (never exceed 20% of signal trade size)
-    copyAmountUsd = Math.min(copyAmountUsd, traderTradeUsd * (config.COPY_TRADE_PERCENT * 2));
     // Absolute dollar cap
     copyAmountUsd = Math.min(copyAmountUsd, config.MAX_POSITION_USD);
   }
@@ -197,18 +195,26 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   // ─── Execute ───
 
   // Create PENDING record (always store requestedAmount as USD)
-  const copyTrade = await prisma.copyTrade.create({
-    data: {
-      detectedTradeId: trade.id,
-      tokenId: trade.asset,
-      side: trade.side,
-      requestedAmount: copyAmountUsd,
-      requestedPrice: trade.price,
-      status: 'PENDING',
-      isPaper,
-      followAllocationId: allocation.id,
-    },
-  });
+  // P2002 guard: if another concurrent call already claimed this detectedTradeId,
+  // silently return — the unique constraint on detectedTradeId prevents duplicate CLOB orders.
+  let copyTrade;
+  try {
+    copyTrade = await prisma.copyTrade.create({
+      data: {
+        detectedTradeId: trade.id,
+        tokenId: trade.asset,
+        side: trade.side,
+        requestedAmount: copyAmountUsd,
+        requestedPrice: trade.price,
+        status: 'PENDING',
+        isPaper,
+        followAllocationId: allocation.id,
+      },
+    });
+  } catch (err: any) {
+    if (err.code === 'P2002') return; // Another call already claimed this trade
+    throw err;
+  }
 
   const executeFn = isPaper ? paperExecute : realExecute;
 
@@ -358,8 +364,19 @@ async function getHeldShares(
         log.warn('getHeldShares: BUY fill missing filledSize, using fallback', { tokenId, fillPrice: price });
       }
     } else {
-      netShares -= fill.filledSize ?? 0;
+      if (fill.filledSize != null) {
+        netShares -= fill.filledSize;
+      } else {
+        const price = fill.filledPrice ?? 1;
+        netShares -= fill.requestedAmount / price;
+        log.warn('getHeldShares: SELL fill missing filledSize, using fallback', { tokenId, fillPrice: price });
+      }
     }
+  }
+  if (netShares < 0) {
+    log.warn('getHeldShares: negative net shares (data inconsistency)', {
+      tokenId, followAllocationId, isPaper, netShares,
+    });
   }
   return Math.max(netShares, 0);
 }
@@ -387,6 +404,11 @@ async function getNetPositionUsd(
     }
     if (fill.side === 'BUY') netUsd += usd;
     else netUsd -= usd;
+  }
+  if (netUsd < 0) {
+    log.warn('getNetPositionUsd: negative net USD (data inconsistency)', {
+      tokenId, followAllocationId, isPaper, netUsd,
+    });
   }
   return Math.max(netUsd, 0);
 }
