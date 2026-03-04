@@ -163,6 +163,36 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
 
   const slippagePrice = calculateSlippagePrice(detectedPrice, side);
 
+  // Stale-signal guard (BUY only): if the current market mid-price has fallen >70% from the
+  // signal price, the market outcome is likely already determined (e.g. near-expiry 5-min band).
+  // Filling at a collapsed price means buying a near-certain loser — skip instead.
+  // Threshold: currentMid < detectedPrice * 0.30 → >70% price drop since signal.
+  // Only applies when detectedPrice > 0.05 to avoid triggering on intentional penny-price signals.
+  // Fail-open: if the midpoint check itself errors, proceed normally (don't block valid trades).
+  if (side === 'BUY' && detectedPrice > 0.05) {
+    try {
+      const midpointResp = await client.getMidpoint(tokenId);
+      const currentMid = parseFloat(midpointResp?.mid ?? '1');
+      if (currentMid < detectedPrice * 0.30) {
+        log.warn('Stale signal: market price collapsed vs signal — skipping', {
+          detectedPrice,
+          currentMid,
+          dropPct: (((detectedPrice - currentMid) / detectedPrice) * 100).toFixed(1),
+        });
+        return {
+          orderId: null,
+          status: 'SKIPPED',
+          filledPrice: null,
+          filledSize: null,
+          failReason: `stale signal: market mid ${currentMid.toFixed(4)} is ${(((detectedPrice - currentMid) / detectedPrice) * 100).toFixed(0)}% below signal ${detectedPrice.toFixed(4)}`,
+          transactionHashes: [],
+        };
+      }
+    } catch {
+      // Midpoint check failed — proceed with order (fail-open)
+    }
+  }
+
   log.info('Placing FOK market order', {
     tokenId: tokenId.slice(0, 20) + '...',
     side,
