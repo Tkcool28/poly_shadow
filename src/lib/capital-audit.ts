@@ -32,11 +32,12 @@ export async function auditAllocation(allocationId: string): Promise<AllocationA
     where: { id: allocationId },
   });
 
-  // Get all trades ordered chronologically
+  // Get all trades ordered chronologically (filter by allocation's current mode)
   const trades = await prisma.copyTrade.findMany({
     where: {
       followAllocationId: allocationId,
       status: { in: ['FILLED', 'SETTLED'] },
+      isPaper: allocation.isPaper,
     },
     select: {
       id: true,
@@ -97,7 +98,7 @@ export async function auditAllocation(allocationId: string): Promise<AllocationA
 
   // Also account for POOLED trades (capital reserved but not yet executed)
   const pooledSum = await prisma.copyTrade.aggregate({
-    where: { followAllocationId: allocationId, side: 'BUY', status: 'POOLED' },
+    where: { followAllocationId: allocationId, side: 'BUY', status: 'POOLED', isPaper: allocation.isPaper },
     _sum: { requestedAmount: true },
   });
   const pooled = pooledSum._sum.requestedAmount ?? 0;
@@ -106,11 +107,11 @@ export async function auditAllocation(allocationId: string): Promise<AllocationA
   // Compute deployed from aggregates (cross-check)
   const [filledBuySum, filledSellSum] = await Promise.all([
     prisma.copyTrade.aggregate({
-      where: { followAllocationId: allocationId, side: 'BUY', status: 'FILLED' },
+      where: { followAllocationId: allocationId, side: 'BUY', status: 'FILLED', isPaper: allocation.isPaper },
       _sum: { requestedAmount: true },
     }),
     prisma.copyTrade.aggregate({
-      where: { followAllocationId: allocationId, side: 'SELL', status: 'FILLED' },
+      where: { followAllocationId: allocationId, side: 'SELL', status: 'FILLED', isPaper: allocation.isPaper },
       _sum: { requestedAmount: true },
     }),
   ]);

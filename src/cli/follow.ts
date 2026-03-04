@@ -51,6 +51,25 @@ export async function followTrader(identifier: string, capital: number, isPaper 
       return;
     }
 
+    // When switching from paper to live, void any FILLED/POOLED paper trades
+    // (they don't exist on-chain and shouldn't count as deployed capital)
+    if (existing.isPaper && !isPaper) {
+      const voided = await prisma.copyTrade.updateMany({
+        where: {
+          followAllocationId: existing.id,
+          status: { in: ['FILLED', 'POOLED'] },
+          isPaper: true,
+        },
+        data: {
+          status: 'SKIPPED',
+          failReason: '[voided] paper trade on live allocation, does not exist on-chain',
+        },
+      });
+      if (voided.count > 0) {
+        console.log(`  Voided ${voided.count} paper trades (don't exist on-chain)`);
+      }
+    }
+
     // Re-follow or re-activate: reset capital, recalculate deployedCapital from open positions
     const deployedCapital = await recalcDeployedCapital(existing.id, isPaper);
 
