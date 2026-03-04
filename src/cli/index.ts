@@ -123,4 +123,27 @@ program
     await prisma.$disconnect();
   });
 
+program
+  .command('reset-follows')
+  .description('Reset all live follow allocations to fresh capital')
+  .option('-c, --capital <amount>', 'Capital per allocation (USD)', '30')
+  .option('--dry-run', 'Preview changes without executing')
+  .option('--reactivate', 'Re-activate inactive allocations (e.g. mmrm2)')
+  .action(async (opts) => {
+    const { parseCapital } = await import('./follow.js');
+    const amount = parseCapital(opts.capital);
+    if (amount === null) {
+      console.error('Capital must be a valid positive number');
+      await prisma.$disconnect();
+      return;
+    }
+    const { resetFollows } = await import('./reset-follows.js');
+    await resetFollows({
+      capital: amount,
+      dryRun: opts.dryRun ?? false,
+      reactivate: opts.reactivate ?? false,
+    });
+    await prisma.$disconnect();
+  });
+
 program.parse();
