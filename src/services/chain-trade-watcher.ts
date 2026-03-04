@@ -11,9 +11,20 @@ const CTF_EXCHANGE_ADDRESSES = [
 ];
 // keccak256('OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)')
 const ORDER_FILLED_TOPIC = '0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6';
-const HEARTBEAT_INTERVAL_MS = 20000;
-const STALE_THRESHOLD_MS = HEARTBEAT_INTERVAL_MS * 3; // 60s without heartbeat response → reconnect
+const HEARTBEAT_INTERVAL_MS = 45_000;  // keepalive cadence (was 20s; reduced to save dRPC CU)
+const STALE_THRESHOLD_MS = HEARTBEAT_INTERVAL_MS * 3; // 135s without heartbeat response → reconnect
 const INITIAL_RECONNECT_MS = 1000;
+
+/** Left-pad 20-byte address to 32-byte indexed-topic value */
+function padAddress(addr: string): string {
+  return '0x' + addr.slice(2).toLowerCase().padStart(64, '0');
+}
+
+function setsEqual(a: Set<string>, b: Set<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const v of a) if (!b.has(v)) return false;
+  return true;
+}
 
 export type WalletDetectedCallback = (proxyWallet: string) => Promise<void>;
 export type ChainWatcherState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
@@ -27,6 +38,9 @@ export class ChainTradeWatcher {
   private lastHeartbeatAt: Date | null = null;
   private onWalletDetected: WalletDetectedCallback;
   private getLiveWallets: () => Set<string>; // returns only live-allocation wallets (~7)
+  private subscribedWallets: Set<string> = new Set();
+  private recentTxHashes: Set<string> = new Set(); // dedup across maker/taker subs
+  private heartbeatCount = 0;
 
   state: ChainWatcherState = 'disconnected';
   lastEventAt: Date | null = null;
@@ -70,15 +84,7 @@ export class ChainTradeWatcher {
       this.lastHeartbeatAt = new Date();
       log.info('Connected, subscribing to CTF Exchange OrderFilled events');
 
-      // Subscribe to both standard and NegRisk CTF Exchange contracts in one call
-      ws.send(JSON.stringify({
-        jsonrpc: '2.0', id: 1, method: 'eth_subscribe',
-        params: ['logs', {
-          address: CTF_EXCHANGE_ADDRESSES,
-          topics: [ORDER_FILLED_TOPIC],
-        }],
-      }));
-
+      this.subscribe(ws);
       this.startHeartbeat(ws);
     });
 
@@ -92,9 +98,21 @@ export class ChainTradeWatcher {
           return;
         }
 
-        // Subscription confirmed
-        if (msg.id === 1 && msg.result) {
-          log.info('Subscribed to OrderFilled events', { subscriptionId: msg.result });
+        // Subscription confirmed (id=1 maker, id=2 taker)
+        if ((msg.id === 1 || msg.id === 2) && msg.result) {
+          log.info('Subscribed to OrderFilled events', {
+            subscriptionId: msg.result,
+            filter: msg.id === 1 ? 'maker' : 'taker',
+          });
+          return;
+        }
+
+        // Subscription error
+        if ((msg.id === 1 || msg.id === 2) && msg.error) {
+          log.error('Subscription failed — falling back to REST polling only', {
+            filter: msg.id === 1 ? 'maker' : 'taker',
+            error: msg.error,
+          });
           return;
         }
 
@@ -102,6 +120,14 @@ export class ChainTradeWatcher {
         if (msg.method === 'eth_subscription' && msg.params?.result?.topics?.length >= 4) {
           // Skip reorg'd events (chain reorganization invalidated this log)
           if (msg.params.result.removed === true) return;
+
+          // Dedup: both maker/taker subs can deliver the same event for self-trades
+          const dedupKey = `${msg.params.result.transactionHash}:${msg.params.result.logIndex}`;
+          if (this.recentTxHashes.has(dedupKey)) return;
+          this.recentTxHashes.add(dedupKey);
+          if (this.recentTxHashes.size > 200) {
+            this.recentTxHashes.delete(this.recentTxHashes.values().next().value!);
+          }
 
           this.eventsReceived++;
           this.lastEventAt = new Date();
@@ -152,6 +178,41 @@ export class ChainTradeWatcher {
     });
   }
 
+  /** Subscribe with wallet-specific topic filters so dRPC only delivers our events */
+  private subscribe(ws: WebSocket): void {
+    const wallets = this.getLiveWallets();
+    this.subscribedWallets = new Set(wallets);
+    const paddedWallets = [...wallets].map(padAddress);
+
+    if (paddedWallets.length === 0) {
+      log.warn('No live wallets to watch — skipping subscription');
+      return;
+    }
+
+    // Sub 1: our wallets as maker (topics[2])
+    ws.send(JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'eth_subscribe',
+      params: ['logs', {
+        address: CTF_EXCHANGE_ADDRESSES,
+        topics: [ORDER_FILLED_TOPIC, null, paddedWallets],
+      }],
+    }));
+
+    // Sub 2: our wallets as taker (topics[3])
+    ws.send(JSON.stringify({
+      jsonrpc: '2.0', id: 2, method: 'eth_subscribe',
+      params: ['logs', {
+        address: CTF_EXCHANGE_ADDRESSES,
+        topics: [ORDER_FILLED_TOPIC, null, null, paddedWallets],
+      }],
+    }));
+
+    log.info('Subscribed to OrderFilled for live wallets', {
+      walletCount: paddedWallets.length,
+      wallets: [...wallets].map(w => w.slice(0, 10)),
+    });
+  }
+
   private startHeartbeat(ws: WebSocket): void {
     this.clearHeartbeat();
     this.heartbeatTimer = setInterval(() => {
@@ -160,19 +221,31 @@ export class ChainTradeWatcher {
       // Stale detection: force reconnect if no heartbeat response for STALE_THRESHOLD_MS
       if (this.lastHeartbeatAt &&
           Date.now() - this.lastHeartbeatAt.getTime() > STALE_THRESHOLD_MS) {
-        log.warn('Connection stale (no heartbeat response in 60s), forcing reconnect');
+        log.warn(`Connection stale (no heartbeat response in ${STALE_THRESHOLD_MS / 1000}s), forcing reconnect`);
         ws.terminate(); // → 'close' event → scheduleReconnect
         return;
       }
 
-      // Periodic status log (every 5th heartbeat = every ~100s)
-      if (this.eventsReceived % 5 === 0 || this.eventsReceived < 5) {
+      // Periodic status log (every 5th heartbeat ≈ every ~225s)
+      this.heartbeatCount++;
+      if (this.heartbeatCount % 5 === 1) {
         log.info('Chain watcher heartbeat', {
           eventsReceived: this.eventsReceived,
           triggeredDetections: this.triggeredDetections,
           liveWallets: this.getLiveWallets().size,
           lastEventAt: this.lastEventAt?.toISOString() ?? 'never',
         });
+      }
+
+      // Detect wallet set changes → reconnect with updated topic filters
+      const currentWallets = this.getLiveWallets();
+      if (!setsEqual(currentWallets, this.subscribedWallets)) {
+        log.info('Live wallet set changed, reconnecting with new filters', {
+          oldCount: this.subscribedWallets.size,
+          newCount: currentWallets.size,
+        });
+        ws.terminate(); // → 'close' → scheduleReconnect with new wallet filters
+        return;
       }
 
       // Keepalive: Polygon WS RPC uses JSON-RPC responses, not WebSocket protocol pings
