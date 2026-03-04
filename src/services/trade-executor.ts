@@ -315,6 +315,23 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
       }
     }
 
+    // NegRisk normalization: raw CLOB token counts → standard share denomination.
+    // After convention swap, NegRisk fills can still have very low price with very high
+    // share count (e.g. 222 shares @ $0.009 instead of 3.85 @ $0.52).
+    // At settlement, raw counts would compute 222 × $1.0 = $222 instead of $3.85.
+    if (negRisk && filledPrice !== null && filledSize !== null
+        && filledPrice < 0.05 && detectedPrice >= 0.05) {
+      const rawUsdCost = filledSize * filledPrice;
+      const normalizedSize = rawUsdCost / detectedPrice;
+      log.info('NegRisk normalization applied', {
+        rawSize: filledSize, rawPrice: filledPrice,
+        normalizedSize: normalizedSize.toFixed(6), normalizedPrice: detectedPrice,
+        usdCost: rawUsdCost.toFixed(4),
+      });
+      filledSize = normalizedSize;
+      filledPrice = detectedPrice;
+    }
+
     // Guard: FOK order submitted but not matched (no fill amounts) — treat as SKIPPED
     if (!filledSize || !filledPrice) {
       log.info('FOK order unmatched (no fill amounts)', {

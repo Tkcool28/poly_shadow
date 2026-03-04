@@ -146,4 +146,15 @@ program
     await prisma.$disconnect();
   });
 
+program
+  .command('reconcile')
+  .description('Audit and reconcile allocation capital across all copy trades')
+  .option('--fix', 'Auto-correct capital discrepancies')
+  .option('--verbose', 'Show all allocations including those without discrepancies')
+  .action(async (opts) => {
+    const { reconcileCapital } = await import('./reconcile.js');
+    await reconcileCapital({ fix: opts.fix ?? false, verbose: opts.verbose ?? false });
+    await prisma.$disconnect();
+  });
+
 program.parse();

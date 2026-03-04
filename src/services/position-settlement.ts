@@ -199,20 +199,29 @@ export async function sweepPositionSettlements(): Promise<void> {
         },
       });
 
-      // Settle BUY fills with resolution metadata
-      await tx.copyTrade.updateMany({
-        where: {
-          tokenId: pos.tokenId,
-          followAllocationId: pos.followAllocationId,
-          isPaper: pos.isPaper,
-          status: 'FILLED',
-          side: 'BUY',
-        },
-        data: {
-          status: 'SETTLED',
-          failReason: `market resolved: price=${settlementPrice.toFixed(4)}, value=$${settlementValue.toFixed(2)}, pnl=${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`,
-        },
-      });
+      // Settle BUY fills with per-trade pro-rated PnL (eliminates duplication when aggregating)
+      const buyFills = fills.filter(f => f.side === 'BUY');
+      const now = new Date();
+      for (const fill of buyFills) {
+        const fillCost = (fill.filledSize != null && fill.filledPrice != null)
+          ? fill.filledSize * fill.filledPrice
+          : fill.requestedAmount;
+        const costProportion = totalBuyCost > 0 ? fillCost / totalBuyCost : 0;
+        const tradeValue = settlementValue * costProportion;
+        const tradePnl = pnl * costProportion;
+
+        await tx.copyTrade.update({
+          where: { id: fill.id },
+          data: {
+            status: 'SETTLED',
+            settlementPrice,
+            settlementValue: tradeValue,
+            settlementPnl: tradePnl,
+            settledAt: now,
+            failReason: `market resolved: price=${settlementPrice.toFixed(4)}, value=$${tradeValue.toFixed(2)}, pnl=${tradePnl >= 0 ? '+' : ''}$${tradePnl.toFixed(2)}`,
+          },
+        });
+      }
 
       // Close SELL fills — mark settled without overwriting their original failReason
       await tx.copyTrade.updateMany({
@@ -223,7 +232,7 @@ export async function sweepPositionSettlements(): Promise<void> {
           status: 'FILLED',
           side: 'SELL',
         },
-        data: { status: 'SETTLED' },
+        data: { status: 'SETTLED', settledAt: now },
       });
     });
 

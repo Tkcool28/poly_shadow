@@ -10,10 +10,12 @@ import { rehydratePool, sweepPool } from '../services/order-pool';
 import { sweepPositionSettlements } from '../services/position-settlement';
 import { reconcileStalePending } from '../services/clob-reconciler';
 import { sweepPreResolutionSells } from '../services/pre-resolution-seller';
+import { auditAllAllocations } from '../lib/capital-audit';
 
 const JOB_NAME = 'copy-trader';
 const log = createJobLogger(JOB_NAME);
 const POLL_INTERVAL_MS = 2000; // 2s drain interval
+const CAPITAL_AUDIT_INTERVAL_MS = 3_600_000; // 1 hour
 
 async function main() {
   // Custom shutdown handler (no setupGracefulShutdown — we handle it here)
@@ -90,6 +92,7 @@ async function main() {
   let lastSettlementSweep = 0;
   let lastBalanceCheck = 0;
   let lastPreResolutionSweep = 0;
+  let lastCapitalAudit = 0;
 
   // Main loop: drain DetectedTrade queue
   while (!shuttingDown && !isShuttingDown()) {
@@ -190,6 +193,16 @@ async function main() {
           lastBalanceCheck = Date.now();
         } catch (err: any) {
           log.warn(`Balance check failed: ${err.message}`);
+        }
+      }
+
+      // Capital audit: periodic reconciliation check (warn-only, no auto-fix)
+      if (Date.now() - lastCapitalAudit >= CAPITAL_AUDIT_INTERVAL_MS) {
+        try {
+          await auditAllAllocations({ isPaper: false, threshold: 1.0 });
+          lastCapitalAudit = Date.now();
+        } catch (err: any) {
+          log.warn(`Capital audit failed: ${err.message}`);
         }
       }
 

@@ -373,6 +373,10 @@ model CopyTrade {
   followAllocation   FollowAllocation? @relation(fields: [followAllocationId], references: [id])
   createdAt          DateTime  @default(now())
   filledAt           DateTime?
+  settlementPrice    Float?
+  settlementValue    Float?
+  settlementPnl      Float?
+  settledAt          DateTime?
 
   @@index([status])
   @@index([createdAt(sort: Desc)])
