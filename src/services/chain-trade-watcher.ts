@@ -120,7 +120,7 @@ export class ChainTradeWatcher {
 
           if (matchedWallet) {
             this.triggeredDetections++;
-            log.debug('Live wallet OrderFilled detected', {
+            log.info('Live wallet OrderFilled detected', {
               wallet: matchedWallet.slice(0, 10),
               role: matchedWallet === makerAddress ? 'maker' : 'taker',
               txHash: msg.params.result.transactionHash?.slice(0, 18),
@@ -163,6 +163,16 @@ export class ChainTradeWatcher {
         log.warn('Connection stale (no heartbeat response in 60s), forcing reconnect');
         ws.terminate(); // → 'close' event → scheduleReconnect
         return;
+      }
+
+      // Periodic status log (every 5th heartbeat = every ~100s)
+      if (this.eventsReceived % 5 === 0 || this.eventsReceived < 5) {
+        log.info('Chain watcher heartbeat', {
+          eventsReceived: this.eventsReceived,
+          triggeredDetections: this.triggeredDetections,
+          liveWallets: this.getLiveWallets().size,
+          lastEventAt: this.lastEventAt?.toISOString() ?? 'never',
+        });
       }
 
       // Keepalive: Polygon WS RPC uses JSON-RPC responses, not WebSocket protocol pings

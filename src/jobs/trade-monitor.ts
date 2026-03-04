@@ -65,8 +65,33 @@ async function main() {
         if (pendingWalletChecks.has(wallet)) return;
         pendingWalletChecks.add(wallet);
         try {
-          const detected = await detectLiveTradeForWallet(wallet);
-          if (detected > 0) chainDetectedCount += detected;
+          // Retry schedule: REST API has 2-4min indexing lag after on-chain events.
+          // Try immediately, then retry at 3s, 8s, 20s, 45s to cover the lag window.
+          const retryDelays = [0, 3000, 5000, 12000, 25000];
+          for (let i = 0; i < retryDelays.length; i++) {
+            if (retryDelays[i] > 0) {
+              await new Promise(r => setTimeout(r, retryDelays[i]));
+            }
+            const detected = await detectLiveTradeForWallet(wallet);
+            if (detected > 0) {
+              chainDetectedCount += detected;
+              log.info('Chain watcher detected trade', {
+                wallet: wallet.slice(0, 10),
+                detected,
+                attempt: i + 1,
+                totalDelayMs: retryDelays.slice(0, i + 1).reduce((a, b) => a + b, 0),
+              });
+              break;
+            }
+            // Last attempt — log that REST API didn't have the trade yet
+            if (i === retryDelays.length - 1) {
+              log.warn('Chain watcher: REST API did not index trade after retries', {
+                wallet: wallet.slice(0, 10),
+                attempts: retryDelays.length,
+                totalDelayMs: retryDelays.reduce((a, b) => a + b, 0),
+              });
+            }
+          }
         } catch (err: any) {
           log.error(`Chain watcher handler error: ${err.message}`, { stack: err.stack });
         } finally {

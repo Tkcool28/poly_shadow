@@ -99,6 +99,14 @@ export class RtdsTradeStream {
       this.messagesReceived++;
       this.lastMessageAt = new Date();
 
+      // Periodic status log (every 500th message) to track RTDS health
+      if (this.messagesReceived % 500 === 1) {
+        log.info('RTDS message status', {
+          messagesReceived: this.messagesReceived,
+          lastMessageAt: this.lastMessageAt?.toISOString(),
+        });
+      }
+
       try {
         const raw = data.toString();
         const msg = JSON.parse(raw);
