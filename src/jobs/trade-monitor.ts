@@ -3,7 +3,7 @@ import { isShuttingDown } from '../lib/shutdown';
 import { createJobLogger } from '../lib/logger';
 import { prisma } from '../lib/prisma';
 import { config } from '../config/env';
-import { detectNewTrades, detectLiveTrades, detectLiveTradeForWallet, handleRealtimeTrade, startCacheRefresh, stopCacheRefresh, getLiveAllocationWallets } from '../services/trade-detector';
+import { detectNewTrades, handleRealtimeTrade, startCacheRefresh, stopCacheRefresh, getLiveAllocationWallets, createDetectedTradeFromChain } from '../services/trade-detector';
 import { RtdsTradeStream } from '../services/ws-trade-stream';
 import { ChainTradeWatcher } from '../services/chain-trade-watcher';
 
@@ -14,26 +14,9 @@ let wsStream: RtdsTradeStream | null = null;
 let wsDetectedCount = 0;
 let chainWatcher: ChainTradeWatcher | null = null;
 let chainDetectedCount = 0;
-// Dedup: prevent concurrent REST calls for the same wallet from rapid-fire chain events
-const pendingWalletChecks = new Set<string>();
 
 async function runPollingCycle(): Promise<number> {
   return await detectNewTrades();
-}
-
-async function startLivePoll(): Promise<void> {
-  log.info('Starting live-trader fast-poll', { intervalMs: config.LIVE_TRADERS_POLL_MS });
-  while (!isShuttingDown()) {
-    try {
-      const detected = await detectLiveTrades();
-      if (detected > 0) log.info(`Live poll: ${detected} new trades detected`);
-    } catch (err: any) {
-      log.error(`Live poll error: ${err.message}`, { stack: err.stack });
-    }
-    if (!isShuttingDown()) {
-      await new Promise(resolve => setTimeout(resolve, config.LIVE_TRADERS_POLL_MS));
-    }
-  }
 }
 
 async function main() {
@@ -58,53 +41,30 @@ async function main() {
   await startCacheRefresh(60000);
 
   // Layer 1: Blockchain event-driven detection for live-allocation wallets
+  // Decodes OrderFilled events on-chain and creates DetectedTrade records directly (~2s latency)
   if (config.CHAIN_WATCHER_ENABLED) {
     chainWatcher = new ChainTradeWatcher(
-      async (wallet) => {
-        // Dedup: skip if a check for this wallet is already in flight
-        if (pendingWalletChecks.has(wallet)) return;
-        pendingWalletChecks.add(wallet);
+      async (data) => {
         try {
-          // Retry schedule: REST API has 2-4min indexing lag after on-chain events.
-          // Try immediately, then retry at 3s, 8s, 20s, 45s to cover the lag window.
-          const retryDelays = [0, 3000, 5000, 12000, 25000];
-          for (let i = 0; i < retryDelays.length; i++) {
-            if (retryDelays[i] > 0) {
-              await new Promise(r => setTimeout(r, retryDelays[i]));
-            }
-            const detected = await detectLiveTradeForWallet(wallet);
-            if (detected > 0) {
-              chainDetectedCount += detected;
-              log.info('Chain watcher detected trade', {
-                wallet: wallet.slice(0, 10),
-                detected,
-                attempt: i + 1,
-                totalDelayMs: retryDelays.slice(0, i + 1).reduce((a, b) => a + b, 0),
-              });
-              break;
-            }
-            // Last attempt — log that REST API didn't have the trade yet
-            if (i === retryDelays.length - 1) {
-              log.warn('Chain watcher: REST API did not index trade after retries', {
-                wallet: wallet.slice(0, 10),
-                attempts: retryDelays.length,
-                totalDelayMs: retryDelays.reduce((a, b) => a + b, 0),
-              });
-            }
+          const inserted = await createDetectedTradeFromChain(data);
+          if (inserted) {
+            chainDetectedCount++;
+            log.info('Chain trade recorded', {
+              wallet: data.proxyWallet.slice(0, 10),
+              side: data.side,
+              tokenId: data.tokenId.slice(0, 16),
+              price: data.price.toFixed(4),
+              txHash: data.transactionHash.slice(0, 18),
+            });
           }
         } catch (err: any) {
-          log.error(`Chain watcher handler error: ${err.message}`, { stack: err.stack });
-        } finally {
-          pendingWalletChecks.delete(wallet);
+          log.error(`Chain trade handler error: ${err.message}`, { stack: err.stack });
         }
       },
       getLiveAllocationWallets,
     );
     chainWatcher.connect();
   }
-
-  // Layer 2: 10s polling backup for live-allocation wallets (always runs)
-  void startLivePoll();
 
   // Bulk detection for all monitored traders
   if (config.WS_ENABLED) {

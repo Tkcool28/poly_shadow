@@ -1,7 +1,9 @@
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
 import { getTrades } from '../api/data-api';
+import { ClobClient } from '@polymarket/clob-client';
 import type { RtdsTradePayload } from './ws-trade-stream';
+import type { ChainTradeData } from './chain-trade-watcher';
 
 // ─── Trade table sync helper ───
 
@@ -120,6 +122,117 @@ export function stopCacheRefresh(): void {
 /** Returns the live-allocation wallet set (~7 wallets) — used by ChainTradeWatcher */
 export function getLiveAllocationWallets(): Set<string> {
   return liveAllocationWallets;
+}
+
+// ─── On-chain trade detection (ChainTradeWatcher path) ───
+
+// Read-only CLOB client for metadata lookups (no signer needed)
+// Pattern matches arb-executor.ts:39
+const readOnlyClobClient = new ClobClient('https://clob.polymarket.com', 137);
+
+// In-memory cache: tokenId → { conditionId, outcome }
+const tokenMetadataCache = new Map<string, { conditionId: string; outcome: string }>();
+
+async function resolveTokenMetadata(
+  tokenId: string,
+): Promise<{ conditionId: string; outcome: string }> {
+  // 1. In-memory cache
+  const cached = tokenMetadataCache.get(tokenId);
+  if (cached) return cached;
+
+  // 2. DB: check DetectedTrade table for prior records with this tokenId
+  const existing = await prisma.detectedTrade.findFirst({
+    where: { asset: tokenId },
+    select: { conditionId: true, outcome: true },
+  });
+  if (existing) {
+    const result = { conditionId: existing.conditionId, outcome: existing.outcome };
+    tokenMetadataCache.set(tokenId, result);
+    return result;
+  }
+
+  // 3. CLOB API fallback: getOrderBook(tokenId).market = conditionId
+  //    getMarket(conditionId).tokens[].outcome for outcome name
+  const orderBook = await readOnlyClobClient.getOrderBook(tokenId);
+  const conditionId = orderBook.market;
+  if (!conditionId) {
+    throw new Error(`getOrderBook returned no market for tokenId ${tokenId.slice(0, 16)}`);
+  }
+  const market = await readOnlyClobClient.getMarket(conditionId);
+  const tokens: Array<{ token_id: string; outcome: string }> = market?.tokens ?? [];
+  const tokenEntry = tokens.find((t) => t.token_id === tokenId);
+  const outcome = tokenEntry?.outcome ?? 'Unknown';
+
+  const result = { conditionId, outcome };
+  tokenMetadataCache.set(tokenId, result);
+  return result;
+}
+
+/**
+ * Create a DetectedTrade directly from on-chain OrderFilled event data.
+ * Called by ChainTradeWatcher callback — bypasses REST API entirely.
+ * Returns true if inserted, false if duplicate.
+ */
+export async function createDetectedTradeFromChain(
+  data: ChainTradeData,
+): Promise<boolean> {
+  const normalizedWallet = data.proxyWallet.toLowerCase();
+  const { conditionId, outcome } = await resolveTokenMetadata(data.tokenId);
+  const compositeScore = scoreCache.get(normalizedWallet) ?? null;
+  const userName = userNameCache.get(normalizedWallet) ?? null;
+  const timestamp = Math.floor(Date.now() / 1000);
+
+  try {
+    await prisma.detectedTrade.create({
+      data: {
+        proxyWallet: normalizedWallet,
+        userName,
+        side: data.side,
+        conditionId,
+        asset: data.tokenId,
+        size: data.size,
+        price: data.price,
+        outcome,
+        title: null,
+        eventSlug: null,
+        transactionHash: data.transactionHash,
+        timestamp,
+        compositeScore,
+        detectionSource: 'CHAIN',
+      },
+    });
+
+    // Dual-write to Trade table (fire-and-forget)
+    void upsertToTradeTable({
+      proxyWallet: normalizedWallet,
+      side: data.side,
+      asset: data.tokenId,
+      conditionId,
+      size: data.size,
+      price: data.price,
+      outcome,
+      transactionHash: data.transactionHash,
+      timestamp,
+    });
+
+    const usdValue = (data.size * data.price).toFixed(2);
+    logger.info('NEW TRADE DETECTED (CHAIN)', {
+      trader: normalizedWallet.slice(0, 10),
+      userName,
+      side: data.side,
+      outcome,
+      tokenId: data.tokenId.slice(0, 16),
+      usdValue: `$${usdValue}`,
+      price: data.price.toFixed(4),
+      compositeScore,
+      txHash: data.transactionHash.slice(0, 18),
+    });
+
+    return true;
+  } catch (err: any) {
+    if (err.code === 'P2002') return false; // dedup: @@unique([transactionHash, proxyWallet, asset])
+    throw err;
+  }
 }
 
 /**
@@ -345,66 +458,3 @@ async function checkTraderForNewTrades(
   return insertedCount;
 }
 
-/**
- * Immediately check a single live-allocation wallet for new trades.
- * Called by ChainTradeWatcher on Polygon OrderFilled event (hot path).
- * Uses case-insensitive lookup: chain events produce lowercase addresses;
- * DB may store EIP-55 checksummed values.
- */
-export async function detectLiveTradeForWallet(proxyWallet: string): Promise<number> {
-  const trader = await prisma.trader.findFirst({
-    where: { proxyWallet: { equals: proxyWallet, mode: 'insensitive' } },
-    select: {
-      proxyWallet: true,
-      userName: true,
-      lastTradeSync: true,
-      scores: { select: { compositeScore: true }, take: 1 },
-    },
-  });
-  if (!trader) return 0;
-  return checkTraderForNewTrades(
-    trader.proxyWallet,
-    trader.userName,
-    trader.lastTradeSync,
-    trader.scores[0]?.compositeScore ?? null,
-    ' (CHAIN)',
-    'CHAIN',
-  );
-}
-
-/**
- * Fast-poll detection for all live-allocation traders.
- * Backup for ChainTradeWatcher — runs every LIVE_TRADERS_POLL_MS (10s).
- */
-export async function detectLiveTrades(): Promise<number> {
-  const liveAllocations = await prisma.followAllocation.findMany({
-    where: { isPaper: false, isActive: true },
-    select: { proxyWallet: true },
-  });
-  if (liveAllocations.length === 0) return 0;
-
-  const wallets = liveAllocations.map(a => a.proxyWallet);
-  const traders = await prisma.trader.findMany({
-    where: { proxyWallet: { in: wallets } },
-    select: {
-      proxyWallet: true,
-      userName: true,
-      lastTradeSync: true,
-      scores: { select: { compositeScore: true }, take: 1 },
-    },
-  });
-  if (traders.length === 0) return 0;
-
-  const results = await Promise.all(
-    traders.map(t =>
-      checkTraderForNewTrades(
-        t.proxyWallet, t.userName, t.lastTradeSync,
-        t.scores[0]?.compositeScore ?? null, ' (LIVE)', 'LIVE_POLL',
-      ).catch((err: any) => {
-        logger.warn(`Live poll: failed for ${t.proxyWallet.slice(0, 10)}: ${err.message}`);
-        return 0;
-      }),
-    ),
-  );
-  return results.reduce((sum, n) => sum + n, 0);
-}

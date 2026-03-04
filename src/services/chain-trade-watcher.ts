@@ -1,4 +1,5 @@
 import WebSocket from 'ws';
+import { ethers } from 'ethers';
 import { createJobLogger } from '../lib/logger';
 import { config } from '../config/env';
 
@@ -15,6 +16,10 @@ const HEARTBEAT_INTERVAL_MS = 45_000;  // keepalive cadence (was 20s; reduced to
 const STALE_THRESHOLD_MS = HEARTBEAT_INTERVAL_MS * 3; // 135s without heartbeat response → reconnect
 const INITIAL_RECONNECT_MS = 1000;
 
+// ABI types for decoding OrderFilled event data (non-indexed params only)
+// [makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled, fee]
+const ORDER_FILLED_DATA_TYPES = ['uint256', 'uint256', 'uint256', 'uint256', 'uint256'];
+
 /** Left-pad 20-byte address to 32-byte indexed-topic value */
 function padAddress(addr: string): string {
   return '0x' + addr.slice(2).toLowerCase().padStart(64, '0');
@@ -26,7 +31,18 @@ function setsEqual(a: Set<string>, b: Set<string>): boolean {
   return true;
 }
 
-export type WalletDetectedCallback = (proxyWallet: string) => Promise<void>;
+export interface ChainTradeData {
+  proxyWallet: string;
+  tokenId: string;       // conditional token ERC1155 ID
+  side: 'BUY' | 'SELL';
+  size: number;          // shares (6-decimal precision)
+  price: number;         // USDC per share
+  transactionHash: string;
+  isNegRisk: boolean;
+  contract: string;      // exchange contract address
+}
+
+export type ChainTradeCallback = (data: ChainTradeData) => Promise<void>;
 export type ChainWatcherState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
 
 export class ChainTradeWatcher {
@@ -36,7 +52,7 @@ export class ChainTradeWatcher {
   private reconnectDelayMs = INITIAL_RECONNECT_MS;
   private shouldReconnect = true;
   private lastHeartbeatAt: Date | null = null;
-  private onWalletDetected: WalletDetectedCallback;
+  private onTradeDetected: ChainTradeCallback;
   private getLiveWallets: () => Set<string>; // returns only live-allocation wallets (~7)
   private subscribedWallets: Set<string> = new Set();
   private recentTxHashes: Set<string> = new Set(); // dedup across maker/taker subs
@@ -47,8 +63,8 @@ export class ChainTradeWatcher {
   eventsReceived = 0;
   triggeredDetections = 0;
 
-  constructor(onWalletDetected: WalletDetectedCallback, getLiveWallets: () => Set<string>) {
-    this.onWalletDetected = onWalletDetected;
+  constructor(onTradeDetected: ChainTradeCallback, getLiveWallets: () => Set<string>) {
+    this.onTradeDetected = onTradeDetected;
     this.getLiveWallets = getLiveWallets;
   }
 
@@ -146,15 +162,88 @@ export class ChainTradeWatcher {
 
           if (matchedWallet) {
             this.triggeredDetections++;
-            log.info('Live wallet OrderFilled detected', {
-              wallet: matchedWallet.slice(0, 10),
-              role: matchedWallet === makerAddress ? 'maker' : 'taker',
-              txHash: msg.params.result.transactionHash?.slice(0, 18),
-              contract: msg.params.result.address,
-            });
-            void this.onWalletDetected(matchedWallet).catch((err: any) =>
-              log.error('Wallet detection handler error', { error: err.message }),
-            );
+
+            // Decode non-indexed params from data field to extract trade details
+            try {
+              const decoded = ethers.utils.defaultAbiCoder.decode(
+                ORDER_FILLED_DATA_TYPES,
+                msg.params.result.data,
+              );
+              const [makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled] = decoded;
+              const makerAmt = parseFloat(ethers.utils.formatUnits(makerAmountFilled, 6));
+              const takerAmt = parseFloat(ethers.utils.formatUnits(takerAmountFilled, 6));
+              const isMaker = matchedWallet === makerAddress;
+              const makerIsUsdc = makerAssetId.isZero();
+              const takerIsUsdc = takerAssetId.isZero();
+              const isNegRisk = msg.params.result.address.toLowerCase() ===
+                '0xc5d563a36ae78145c45a50134d48a1215220f80a';
+
+              // Guard: both non-zero means token-to-token swap — not a standard CTF fill
+              if (!makerIsUsdc && !takerIsUsdc) {
+                log.warn('Unexpected token-to-token fill (no USDC side), skipping', {
+                  wallet: matchedWallet.slice(0, 10),
+                  makerAssetId: makerAssetId.toString().slice(0, 16),
+                  takerAssetId: takerAssetId.toString().slice(0, 16),
+                });
+                return;
+              }
+
+              let side: 'BUY' | 'SELL';
+              let tokenId: string;
+              let size: number;  // shares
+              let price: number; // USDC per share
+
+              if (isMaker) {
+                // Maker offered makerAsset, received takerAsset
+                side = makerIsUsdc ? 'BUY' : 'SELL';
+                tokenId = makerIsUsdc ? takerAssetId.toString() : makerAssetId.toString();
+                // BUY: paid USDC (makerAmt), received shares (takerAmt) → price = USDC/shares
+                // SELL: gave shares (makerAmt), received USDC (takerAmt) → price = USDC/shares
+                size = makerIsUsdc ? takerAmt : makerAmt;
+                price = size > 0
+                  ? (makerIsUsdc ? makerAmt / takerAmt : takerAmt / makerAmt)
+                  : 0;
+              } else {
+                // Taker offered takerAsset, received makerAsset
+                side = takerIsUsdc ? 'BUY' : 'SELL';
+                tokenId = takerIsUsdc ? makerAssetId.toString() : takerAssetId.toString();
+                // BUY: paid USDC (takerAmt), received shares (makerAmt) → price = USDC/shares
+                // SELL: gave shares (takerAmt), received USDC (makerAmt) → price = USDC/shares
+                size = takerIsUsdc ? makerAmt : takerAmt;
+                price = size > 0
+                  ? (takerIsUsdc ? takerAmt / makerAmt : makerAmt / takerAmt)
+                  : 0;
+              }
+
+              log.info('OrderFilled decoded', {
+                wallet: matchedWallet.slice(0, 10),
+                side,
+                tokenId: tokenId.slice(0, 16),
+                size: size.toFixed(4),
+                price: price.toFixed(4),
+                txHash: msg.params.result.transactionHash?.slice(0, 18),
+                contract: isNegRisk ? 'NegRisk' : 'Standard',
+              });
+
+              void this.onTradeDetected({
+                proxyWallet: matchedWallet,
+                tokenId,
+                side,
+                size,
+                price,
+                transactionHash: msg.params.result.transactionHash,
+                isNegRisk,
+                contract: msg.params.result.address,
+              }).catch((err: any) =>
+                log.error('Trade detection handler error', { error: err.message }),
+              );
+            } catch (err: any) {
+              log.warn('Failed to decode OrderFilled data, skipping', {
+                wallet: matchedWallet.slice(0, 10),
+                error: err.message,
+                txHash: msg.params.result.transactionHash?.slice(0, 18),
+              });
+            }
           }
         }
       } catch {
