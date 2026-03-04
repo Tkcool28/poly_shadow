@@ -118,14 +118,15 @@ async function getMarketMetadata(tokenId: string): Promise<{ tickSize: TickSize;
 
 function calculateSlippagePrice(detectedPrice: number, side: 'BUY' | 'SELL'): number {
   if (side === 'BUY') {
-    // Upside-fraction: sacrifice a fixed fraction of remaining upside (distance to $1) for
-    // execution certainty. Scales naturally — cheap tokens get ~$0.02 absolute tolerance,
-    // mid tokens ~$0.01, expensive tokens < $0.001 (protects expected returns near resolution).
-    const limit = detectedPrice + (1 - detectedPrice) * config.SLIPPAGE_UPSIDE_FRACTION;
+    // Fractional: sacrifice a fraction of remaining upside (distance to $1) for execution certainty
+    const fractionalSlippage = (1 - detectedPrice) * config.SLIPPAGE_UPSIDE_FRACTION;
+    // Absolute floor: ensures minimum tolerance even at high prices where fractional is tiny
+    // (e.g., at 0.90 with fraction=0.05: fractional=0.5¢, floor=1¢ → uses 1¢)
+    const slippage = Math.max(fractionalSlippage, config.SLIPPAGE_MIN_ABSOLUTE);
+    const limit = detectedPrice + slippage;
     return Math.min(limit, 0.99);
   }
   // SELL: accept any market price — we want to exit whenever the signal says sell.
-  // A slippage floor would block cut-loss exits during dumps, defeating the copy strategy.
   return 0.01; // CLOB minimum — effectively market order behavior
 }
 
