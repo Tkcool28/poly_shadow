@@ -83,6 +83,7 @@ const envSchema = z.object({
   // Position settlement
   SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(300000), // 5 minutes
   STALE_TRADE_CUTOFF_MS: z.coerce.number().default(600000), // 10 min (was hardcoded 5 min)
+  MARKET_END_GATEKEEP_ENABLED: z.string().default('true').transform((v) => v === 'true'),
 
   // CLOB reconciliation & balance check
   BALANCE_CHECK_INTERVAL_MS: z.coerce.number().default(600000), // 10 min

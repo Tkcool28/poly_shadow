@@ -339,7 +339,8 @@ model DetectedTrade {
   timestamp       Int
   compositeScore  Float?
 
-  detectedAt DateTime @default(now())
+  detectedAt      DateTime @default(now())
+  detectionSource String?  // "WS", "CHAIN", "LIVE_POLL", "POLL"
 
   copyTrade CopyTrade?
 

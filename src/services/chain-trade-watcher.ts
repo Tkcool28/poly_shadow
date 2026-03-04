@@ -99,7 +99,7 @@ export class ChainTradeWatcher {
         }
 
         // Subscription event
-        if (msg.method === 'eth_subscription' && msg.params?.result?.topics?.length >= 3) {
+        if (msg.method === 'eth_subscription' && msg.params?.result?.topics?.length >= 4) {
           // Skip reorg'd events (chain reorganization invalidated this log)
           if (msg.params.result.removed === true) return;
 
@@ -107,17 +107,26 @@ export class ChainTradeWatcher {
           this.lastEventAt = new Date();
 
           const topics: string[] = msg.params.result.topics;
-          // topics[2] = maker address, padded to 32 bytes → extract last 40 hex chars
+          // topics[2] = maker address, topics[3] = taker address, padded to 32 bytes
           const makerAddress = '0x' + topics[2].slice(26).toLowerCase();
+          const takerAddress = '0x' + topics[3].slice(26).toLowerCase();
 
-          if (this.getLiveWallets().has(makerAddress)) {
+          const liveWallets = this.getLiveWallets();
+          const matchedWallet = liveWallets.has(makerAddress)
+            ? makerAddress
+            : liveWallets.has(takerAddress)
+              ? takerAddress
+              : null;
+
+          if (matchedWallet) {
             this.triggeredDetections++;
             log.debug('Live wallet OrderFilled detected', {
-              maker: makerAddress.slice(0, 10),
+              wallet: matchedWallet.slice(0, 10),
+              role: matchedWallet === makerAddress ? 'maker' : 'taker',
               txHash: msg.params.result.transactionHash?.slice(0, 18),
               contract: msg.params.result.address,
             });
-            void this.onWalletDetected(makerAddress).catch((err: any) =>
+            void this.onWalletDetected(matchedWallet).catch((err: any) =>
               log.error('Wallet detection handler error', { error: err.message }),
             );
           }

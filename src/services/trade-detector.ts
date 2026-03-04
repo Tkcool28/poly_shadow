@@ -152,6 +152,7 @@ export async function handleRealtimeTrade(payload: RtdsTradePayload): Promise<bo
         transactionHash: payload.transactionHash,
         timestamp: payload.timestamp,
         compositeScore,
+        detectionSource: 'WS',
       },
     });
 
@@ -240,6 +241,7 @@ async function checkTraderForNewTrades(
   lastSync: Date | null,
   compositeScore: number | null,
   logSuffix = '',
+  source: string = 'POLL',
 ): Promise<number> {
   // Fetch recent trades (limit 100 should be enough for a 2-min window)
   const recentTrades = await getTrades({
@@ -286,6 +288,7 @@ async function checkTraderForNewTrades(
           transactionHash: trade.transactionHash,
           timestamp: trade.timestamp,
           compositeScore,
+          detectionSource: source,
         },
       });
       insertedCount++;
@@ -363,6 +366,7 @@ export async function detectLiveTradeForWallet(proxyWallet: string): Promise<num
     trader.lastTradeSync,
     trader.scores[0]?.compositeScore ?? null,
     ' (CHAIN)',
+    'CHAIN',
   );
 }
 
@@ -393,7 +397,7 @@ export async function detectLiveTrades(): Promise<number> {
     traders.map(t =>
       checkTraderForNewTrades(
         t.proxyWallet, t.userName, t.lastTradeSync,
-        t.scores[0]?.compositeScore ?? null, ' (LIVE)',
+        t.scores[0]?.compositeScore ?? null, ' (LIVE)', 'LIVE_POLL',
       ).catch((err: any) => {
         logger.warn(`Live poll: failed for ${t.proxyWallet.slice(0, 10)}: ${err.message}`);
         return 0;

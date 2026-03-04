@@ -5,6 +5,7 @@ import { executeMarketOrder as realExecute, isBalancePaused, CLOB_MIN_ORDER_USD 
 import { executeMarketOrder as paperExecute } from './paper-executor';
 import type { ExecuteOrderResult } from './trade-executor';
 import { addToPool } from './order-pool';
+import { resolveMarkets } from './market-resolver';
 
 const log = createJobLogger('copy-trade-worker');
 
@@ -27,6 +28,7 @@ interface DetectedTradeRow {
 
 export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   const startMs = Date.now();
+  const signalAgeMs = startMs - trade.timestamp * 1000;
 
   // ─── Filter checks ───
 
@@ -50,6 +52,13 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   // Skip live BUYs when wallet balance is insufficient — SELLs and paper allocations continue normally
   if (!isPaper && trade.side === 'BUY' && isBalancePaused()) {
     await createSkippedRecord(trade, 'live trading paused: insufficient wallet balance', allocation.id, isPaper);
+    return;
+  }
+
+  // ─── Market end-time gatekeep (BUY only) ───
+  const endTimeSkip = await checkMarketEndTime(trade.conditionId, trade.side);
+  if (endTimeSkip) {
+    await createSkippedRecord(trade, endTimeSkip, allocation.id, isPaper);
     return;
   }
 
@@ -303,6 +312,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       slippageBps,
       estimatedFee: result.estimatedFee,
       latencyMs,
+      signalAgeMs,
       allocationId: allocation.id,
     });
   } else if (result.status === 'SKIPPED') {
@@ -312,6 +322,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       reason: result.failReason,
       side: trade.side,
       title: trade.title?.slice(0, 50),
+      signalAgeMs,
     });
   } else {
     log.warn(`COPY TRADE FAILED [${mode}]`, {
@@ -321,6 +332,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       side: trade.side,
       title: trade.title?.slice(0, 50),
       latencyMs,
+      signalAgeMs,
     });
   }
 }
@@ -377,6 +389,75 @@ async function getNetPositionUsd(
     else netUsd -= usd;
   }
   return Math.max(netUsd, 0);
+}
+
+/**
+ * Returns the minimum time (ms) that must remain before market end
+ * for us to place a BUY order. Scales with proximity to close.
+ */
+function getMinTimeRemaining(timeRemainingMs: number): number {
+  if (timeRemainingMs <= 10 * 60_000) return 120_000;   // ≤10 min → 2 min buffer
+  if (timeRemainingMs <= 60 * 60_000) return 90_000;    // ≤1 hour → 90s buffer
+  if (timeRemainingMs <= 4 * 60 * 60_000) return 60_000; // ≤4 hours → 60s buffer
+  return 30_000;                                          // >4 hours → 30s buffer
+}
+
+/**
+ * Check if the market's end time has passed or is too close.
+ * Returns a skip reason string if the trade should not be executed, null otherwise.
+ * BUY-only — SELLs should always be allowed (exit existing positions).
+ * Fail-open: errors return null (allow trade).
+ */
+async function checkMarketEndTime(
+  conditionId: string,
+  side: string,
+): Promise<string | null> {
+  if (side !== 'BUY') return null;
+  if (!config.MARKET_END_GATEKEEP_ENABLED) return null;
+
+  try {
+    let market = await prisma.market.findUnique({
+      where: { conditionId },
+      select: { endDate: true, closed: true },
+    });
+
+    // If not cached, resolve from Gamma API
+    if (!market) {
+      await resolveMarkets([conditionId]);
+      market = await prisma.market.findUnique({
+        where: { conditionId },
+        select: { endDate: true, closed: true },
+      });
+    }
+
+    // No market data — fail-open
+    if (!market) return null;
+
+    if (market.closed) {
+      return 'market already closed';
+    }
+
+    // No endDate (regular prediction markets) — allow
+    if (!market.endDate) return null;
+
+    const now = Date.now();
+    const timeRemainingMs = market.endDate.getTime() - now;
+
+    if (timeRemainingMs <= 0) {
+      return `market ended ${Math.abs(Math.round(timeRemainingMs / 1000))}s ago`;
+    }
+
+    const minBuffer = getMinTimeRemaining(timeRemainingMs);
+    if (timeRemainingMs < minBuffer) {
+      return `market ends in ${Math.round(timeRemainingMs / 1000)}s, below ${Math.round(minBuffer / 1000)}s minimum`;
+    }
+
+    return null;
+  } catch (err: any) {
+    // Fail-open: don't block trades on API/DB errors
+    log.warn('Market end-time check failed (proceeding)', { conditionId, error: err.message });
+    return null;
+  }
 }
 
 async function createSkippedRecord(
