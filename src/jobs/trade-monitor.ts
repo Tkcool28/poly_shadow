@@ -3,7 +3,7 @@ import { isShuttingDown } from '../lib/shutdown';
 import { createJobLogger } from '../lib/logger';
 import { prisma } from '../lib/prisma';
 import { config } from '../config/env';
-import { detectNewTrades, handleRealtimeTrade, startCacheRefresh, stopCacheRefresh, getLiveAllocationWallets, createDetectedTradeFromChain } from '../services/trade-detector';
+import { detectNewTrades, detectLiveTrades, handleRealtimeTrade, startCacheRefresh, stopCacheRefresh, getLiveAllocationWallets, createDetectedTradeFromChain } from '../services/trade-detector';
 import { RtdsTradeStream } from '../services/ws-trade-stream';
 import { ChainTradeWatcher } from '../services/chain-trade-watcher';
 
@@ -17,6 +17,21 @@ let chainDetectedCount = 0;
 
 async function runPollingCycle(): Promise<number> {
   return await detectNewTrades();
+}
+
+async function startLivePoll(): Promise<void> {
+  log.info('Starting live-trader fast-poll gap filler', { intervalMs: config.LIVE_TRADERS_POLL_MS });
+  while (!isShuttingDown()) {
+    try {
+      const detected = await detectLiveTrades();
+      if (detected > 0) log.info(`Live poll gap filler: ${detected} new trades detected`);
+    } catch (err: any) {
+      log.error(`Live poll error: ${err.message}`, { stack: err.stack });
+    }
+    if (!isShuttingDown()) {
+      await new Promise(resolve => setTimeout(resolve, config.LIVE_TRADERS_POLL_MS));
+    }
+  }
 }
 
 async function main() {
@@ -65,6 +80,9 @@ async function main() {
     );
     chainWatcher.connect();
   }
+
+  // Live-allocation gap filler: 10s fast-poll (LIVE_POLL source, not used for copy signals)
+  void startLivePoll();
 
   // Bulk detection for all monitored traders
   if (config.WS_ENABLED) {

@@ -126,6 +126,8 @@ async function main() {
         detectedAt: { gte: staleCutoff },
         timestamp: { gte: Math.floor(staleCutoff.getTime() / 1000) },
         proxyWallet: { in: activeWallets },
+        // LIVE_POLL is a gap-filler for monitoring only — too high latency for copy signals
+        detectionSource: { not: 'LIVE_POLL' },
       };
       const pendingSells = await prisma.detectedTrade.findMany({
         where: { ...baseWhere, side: 'SELL' },

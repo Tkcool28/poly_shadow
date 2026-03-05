@@ -306,6 +306,41 @@ export async function handleRealtimeTrade(payload: RtdsTradePayload): Promise<bo
   }
 }
 
+// ─── Live-allocation fast-poll gap filler ───
+// Detects trades for live-allocation wallets at 10s intervals.
+// Marked as LIVE_POLL — NOT used as copy-trade signal, only for gap monitoring.
+
+export async function detectLiveTrades(): Promise<number> {
+  if (liveAllocationWallets.size === 0) return 0;
+
+  let total = 0;
+  for (const wallet of liveAllocationWallets) {
+    try {
+      const score = scoreCache.get(wallet) ?? null;
+      const name = userNameCache.get(wallet) ?? null;
+      const trader = await prisma.trader.findUnique({
+        where: { proxyWallet: wallet },
+        select: { lastTradeSync: true },
+      });
+      if (!trader) continue;
+
+      const detected = await checkTraderForNewTrades(
+        wallet,
+        name,
+        trader.lastTradeSync,
+        score,
+        ' (LIVE_POLL)',
+        'LIVE_POLL',
+      );
+      total += detected;
+    } catch (err: any) {
+      logger.warn(`Live poll failed for ${wallet.slice(0, 10)}: ${err.message}`);
+    }
+  }
+
+  return total;
+}
+
 // ─── Polling-based detection (existing) ───
 
 export async function detectNewTrades(): Promise<number> {

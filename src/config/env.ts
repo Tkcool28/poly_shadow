@@ -39,6 +39,8 @@ const envSchema = z.object({
   WS_FALLBACK_POLL_MS: z.coerce.number().default(300000), // 5 min
   LIVE_TRADERS_POLL_MS: z.coerce.number().default(10000), // 10s fast-poll backup for live-allocation traders
   POLYGON_WS_RPC_URL: z.string().default('wss://polygon-bor-rpc.publicnode.com'),
+  POLYGON_HTTP_RPC_URL: z.string().default('https://polygon-bor-rpc.publicnode.com'),
+  CHAIN_VERIFY_INTERVAL_MS: z.coerce.number().default(300000), // 5 min periodic eth_getLogs verification
   CHAIN_WATCHER_ENABLED: z
     .string()
     .default('false') // default off; enable explicitly after verifying WS works
