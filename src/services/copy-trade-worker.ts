@@ -144,25 +144,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     }
 
     // ─── Trade-proportional sizing ───
-    let effectiveCopyPercent = config.COPY_TRADE_PERCENT;
-
-    // ─── Sliding-window loss guard ───
-    // If recent settlements for this allocation are mostly losses, reduce position size.
-    // Prevents bleeding from consistently losing streaks (e.g., low-probability bets).
-    if (config.LOSS_GUARD_WINDOW > 0) {
-      const lossRate = await getRecentLossRate(allocation.id, isPaper, config.LOSS_GUARD_WINDOW);
-      if (lossRate !== null && lossRate >= config.LOSS_GUARD_THRESHOLD) {
-        effectiveCopyPercent *= config.LOSS_GUARD_SCALE;
-        log.debug('Loss guard active: reducing copy%', {
-          allocationId: allocation.id,
-          lossRate: lossRate.toFixed(2),
-          threshold: config.LOSS_GUARD_THRESHOLD,
-          effectiveCopyPercent: effectiveCopyPercent.toFixed(4),
-        });
-      }
-    }
-
-    copyAmountUsd = traderTradeUsd * effectiveCopyPercent;
+    copyAmountUsd = traderTradeUsd * config.COPY_TRADE_PERCENT;
     // Absolute dollar cap
     copyAmountUsd = Math.min(copyAmountUsd, config.MAX_POSITION_USD);
   }
@@ -524,34 +506,6 @@ async function checkMarketClosed(
     log.warn('Market closed check failed (proceeding)', { conditionId, error: err.message });
     return null;
   }
-}
-
-/**
- * Sliding-window loss rate: fraction of recent settlements that were losses.
- * Returns null if fewer than `window` settlements exist (insufficient data).
- */
-async function getRecentLossRate(
-  followAllocationId: string,
-  isPaper: boolean,
-  window: number,
-): Promise<number | null> {
-  const recent = await prisma.copyTrade.findMany({
-    where: {
-      followAllocationId,
-      isPaper,
-      status: 'SETTLED',
-      side: 'BUY',
-      settlementPnl: { not: null },
-    },
-    select: { settlementPnl: true },
-    orderBy: { createdAt: 'desc' },
-    take: window,
-  });
-
-  if (recent.length < window) return null; // Not enough data yet
-
-  const losses = recent.filter(r => (r.settlementPnl ?? 0) < 0).length;
-  return losses / recent.length;
 }
 
 async function createSkippedRecord(

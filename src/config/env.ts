@@ -72,10 +72,6 @@ const envSchema = z.object({
 
   // Anti-cycle: per-token cool-down after a SELL fill to prevent market-making spread loss
   TOKEN_SELL_COOLDOWN_MS: z.coerce.number().min(0).default(60000), // 60s — 0 = disabled
-  // Sliding-window loss guard: reduce copy% after consecutive settlement losses per allocation
-  LOSS_GUARD_WINDOW: z.coerce.number().min(0).default(10), // Number of recent settlements to consider (0 = disabled)
-  LOSS_GUARD_THRESHOLD: z.coerce.number().min(0).max(1).default(0.60), // Trigger if >= 60% of window are losses
-  LOSS_GUARD_SCALE: z.coerce.number().min(0).max(1).default(0.50), // Reduce copy% to this fraction when triggered
 
   // Order aggregation pool
   POOL_MIN_AMOUNT_USD: z.coerce.number().min(0.01).max(100).default(0.50), // min USD to pool paper trades
