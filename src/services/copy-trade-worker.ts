@@ -55,10 +55,10 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     return;
   }
 
-  // ─── Market end-time gatekeep (BUY only) ───
-  const endTimeSkip = await checkMarketEndTime(trade.conditionId, trade.side);
-  if (endTimeSkip) {
-    await createSkippedRecord(trade, endTimeSkip, allocation.id, isPaper);
+  // ─── Market closed gatekeep (BUY only) ───
+  const closedSkip = await checkMarketClosed(trade.conditionId, trade.side);
+  if (closedSkip) {
+    await createSkippedRecord(trade, closedSkip, allocation.id, isPaper);
     return;
   }
 
@@ -414,23 +414,17 @@ async function getNetPositionUsd(
 }
 
 /**
- * Returns the minimum time (ms) that must remain before market end
- * for us to place a BUY order. Scales with proximity to close.
- */
-function getMinTimeRemaining(timeRemainingMs: number): number {
-  if (timeRemainingMs <= 10 * 60_000) return 120_000;   // ≤10 min → 2 min buffer
-  if (timeRemainingMs <= 60 * 60_000) return 90_000;    // ≤1 hour → 90s buffer
-  if (timeRemainingMs <= 4 * 60 * 60_000) return 60_000; // ≤4 hours → 60s buffer
-  return 30_000;                                          // >4 hours → 30s buffer
-}
-
-/**
- * Check if the market's end time has passed or is too close.
+ * Check if the market is closed.
  * Returns a skip reason string if the trade should not be executed, null otherwise.
  * BUY-only — SELLs should always be allowed (exit existing positions).
  * Fail-open: errors return null (allow trade).
+ *
+ * Note: We rely on the `closed` field (refreshed by position-settlement every 5 min
+ * and resolveMarkets on first encounter) rather than `endDate`, because Polymarket
+ * sets endDate to game-start time for sports markets, not market-close time.
+ * The signal trader successfully executing a trade is itself evidence the market is open.
  */
-async function checkMarketEndTime(
+async function checkMarketClosed(
   conditionId: string,
   side: string,
 ): Promise<string | null> {
@@ -440,7 +434,7 @@ async function checkMarketEndTime(
   try {
     let market = await prisma.market.findUnique({
       where: { conditionId },
-      select: { endDate: true, closed: true },
+      select: { closed: true },
     });
 
     // If not cached, resolve from Gamma API
@@ -448,7 +442,7 @@ async function checkMarketEndTime(
       await resolveMarkets([conditionId]);
       market = await prisma.market.findUnique({
         where: { conditionId },
-        select: { endDate: true, closed: true },
+        select: { closed: true },
       });
     }
 
@@ -459,25 +453,9 @@ async function checkMarketEndTime(
       return 'market already closed';
     }
 
-    // No endDate (regular prediction markets) — allow
-    if (!market.endDate) return null;
-
-    const now = Date.now();
-    const timeRemainingMs = market.endDate.getTime() - now;
-
-    if (timeRemainingMs <= 0) {
-      return `market ended ${Math.abs(Math.round(timeRemainingMs / 1000))}s ago`;
-    }
-
-    const minBuffer = getMinTimeRemaining(timeRemainingMs);
-    if (timeRemainingMs < minBuffer) {
-      return `market ends in ${Math.round(timeRemainingMs / 1000)}s, below ${Math.round(minBuffer / 1000)}s minimum`;
-    }
-
     return null;
   } catch (err: any) {
-    // Fail-open: don't block trades on API/DB errors
-    log.warn('Market end-time check failed (proceeding)', { conditionId, error: err.message });
+    log.warn('Market closed check failed (proceeding)', { conditionId, error: err.message });
     return null;
   }
 }
