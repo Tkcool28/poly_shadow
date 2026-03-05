@@ -4,6 +4,7 @@ import { config } from '../config/env';
 import { getMarketsByConditionIds } from '../api/gamma-api';
 import { executeMarketOrder } from './trade-executor';
 import { executeMarketOrder as paperExecute } from './paper-executor';
+import { computeSellCostBasis } from '../lib/cost-basis';
 
 const log = createJobLogger('pre-resolution-seller');
 
@@ -212,11 +213,24 @@ export async function sweepPreResolutionSells(): Promise<void> {
           const fresh = await tx.followAllocation.findUniqueOrThrow({
             where: { id: pos.followAllocationId },
           });
+          // SELL: release cost basis (not proceeds) from deployedCapital
+          const costBasisFills = await tx.copyTrade.findMany({
+            where: {
+              tokenId: pos.tokenId,
+              followAllocationId: pos.followAllocationId,
+              isPaper: pos.isPaper,
+              status: 'FILLED',
+              id: { not: copyTrade.id }, // exclude current SELL (already updated to FILLED above)
+            },
+            select: { side: true, filledSize: true, filledPrice: true, requestedAmount: true },
+          });
+          const costBasis = computeSellCostBasis(costBasisFills, result.filledSize ?? netShares);
+
           await tx.followAllocation.update({
             where: { id: pos.followAllocationId },
             data: {
               currentCapital: { increment: usdValue },
-              deployedCapital: { decrement: Math.min(usdValue, fresh.deployedCapital) },
+              deployedCapital: { decrement: Math.min(costBasis.costBasisOfSoldShares, fresh.deployedCapital) },
             },
           });
         }

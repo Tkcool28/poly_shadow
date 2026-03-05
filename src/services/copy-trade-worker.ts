@@ -6,6 +6,7 @@ import { executeMarketOrder as paperExecute } from './paper-executor';
 import type { ExecuteOrderResult } from './trade-executor';
 import { addToPool } from './order-pool';
 import { resolveMarkets } from './market-resolver';
+import { computeSellCostBasis } from '../lib/cost-basis';
 
 const log = createJobLogger('copy-trade-worker');
 
@@ -332,11 +333,32 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
           },
         });
       } else {
+        // SELL: release cost basis (not proceeds) from deployedCapital
+        const costBasisFills = await tx.copyTrade.findMany({
+          where: {
+            tokenId: trade.asset,
+            followAllocationId: allocation.id,
+            isPaper,
+            status: 'FILLED',
+            id: { not: copyTrade.id }, // exclude current SELL (already updated to FILLED above)
+          },
+          select: { side: true, filledSize: true, filledPrice: true, requestedAmount: true },
+        });
+        const costBasis = computeSellCostBasis(costBasisFills, result.filledSize ?? sellShares!);
+
+        log.debug('SELL cost basis', {
+          tokenId: trade.asset.slice(0, 20),
+          soldShares: (result.filledSize ?? sellShares!).toFixed(4),
+          avgCost: costBasis.avgCostPerShare.toFixed(4),
+          costBasis: costBasis.costBasisOfSoldShares.toFixed(2),
+          proceeds: usdValue.toFixed(2),
+        });
+
         await tx.followAllocation.update({
           where: { id: allocation.id },
           data: {
             currentCapital: { increment: usdValue },
-            deployedCapital: { decrement: Math.min(usdValue, fresh.deployedCapital) },
+            deployedCapital: { decrement: Math.min(costBasis.costBasisOfSoldShares, fresh.deployedCapital) },
           },
         });
       }

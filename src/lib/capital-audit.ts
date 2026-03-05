@@ -3,6 +3,13 @@ import { createJobLogger } from './logger';
 
 const log = createJobLogger('capital-audit');
 
+/** Estimate share count, guarding against zero/null price → Infinity. */
+function estimateShares(filledSize: number | null, filledPrice: number | null, requestedAmount: number): number {
+  if (filledSize != null) return filledSize;
+  if (filledPrice && filledPrice > 0) return requestedAmount / filledPrice;
+  return requestedAmount;
+}
+
 export interface AllocationAudit {
   id: string;
   proxyWallet: string;
@@ -24,8 +31,8 @@ export interface AllocationAudit {
  *
  * Capital flow:
  *   BUY fill:    cc -= min(cost, cc);  dc += min(cost, cc)
- *   SELL fill:   cc += proceeds;       dc -= min(proceeds, dc)
- *   Settlement:  cc += settlementValue; dc -= min(costBasis, dc)
+ *   SELL fill:   cc += proceeds;       dc -= min(costBasis, dc)  [per-token avg cost]
+ *   Settlement:  cc += settlementValue; dc -= min(costBasis, dc)  [per-token avg cost]
  */
 export async function auditAllocation(allocationId: string): Promise<AllocationAudit> {
   const allocation = await prisma.followAllocation.findUniqueOrThrow({
@@ -41,6 +48,7 @@ export async function auditAllocation(allocationId: string): Promise<AllocationA
     },
     select: {
       id: true,
+      tokenId: true,
       side: true,
       status: true,
       requestedAmount: true,
@@ -56,23 +64,38 @@ export async function auditAllocation(allocationId: string): Promise<AllocationA
   let cc = allocation.initialCapital;
   let dc = 0;
 
+  // Per-token cost accumulators for average cost method
+  const tokenCost = new Map<string, { buyCost: number; buyShares: number }>();
+
   for (const trade of trades) {
-    const cost = (trade.filledSize != null && trade.filledPrice != null)
+    const usd = (trade.filledSize != null && trade.filledPrice != null)
       ? trade.filledSize * trade.filledPrice
       : trade.requestedAmount;
 
     if (trade.side === 'BUY') {
+      const shares = estimateShares(trade.filledSize, trade.filledPrice, trade.requestedAmount);
+      const prev = tokenCost.get(trade.tokenId) ?? { buyCost: 0, buyShares: 0 };
+      tokenCost.set(trade.tokenId, {
+        buyCost: prev.buyCost + usd,
+        buyShares: prev.buyShares + shares,
+      });
+
       // BUY: deduct from available capital (capped to prevent negative)
-      const deducted = Math.min(cost, Math.max(cc, 0));
+      const deducted = Math.min(usd, Math.max(cc, 0));
       cc -= deducted;
       dc += deducted;
     } else {
-      // SELL: return proceeds
-      cc += cost;
-      dc -= Math.min(cost, dc);
+      // SELL: use per-token avg cost for deployedCapital release
+      const soldShares = estimateShares(trade.filledSize, trade.filledPrice, trade.requestedAmount);
+      const tok = tokenCost.get(trade.tokenId);
+      const avgCost = (tok && tok.buyShares > 0) ? tok.buyCost / tok.buyShares : 0;
+      const costBasis = avgCost * soldShares;
+
+      cc += usd;                          // proceeds (unchanged)
+      dc -= Math.min(costBasis, dc);       // cost basis (FIX)
     }
 
-    // Settlement: credit settlement value, release deployed capital
+    // Settlement: credit settlement value, release deployed capital using per-token cost basis
     if (trade.status === 'SETTLED' && trade.side === 'BUY') {
       let settleValue = trade.settlementValue;
 
@@ -83,9 +106,13 @@ export async function auditAllocation(allocationId: string): Promise<AllocationA
       }
 
       if (settleValue != null && Number.isFinite(settleValue)) {
+        const shares = estimateShares(trade.filledSize, trade.filledPrice, trade.requestedAmount);
+        const tok = tokenCost.get(trade.tokenId);
+        const avgCost = (tok && tok.buyShares > 0) ? tok.buyCost / tok.buyShares : 0;
+        const costBasis = avgCost * shares;
+
         cc += settleValue;
-        // Release the cost basis from deployed (capped)
-        dc -= Math.min(cost, dc);
+        dc -= Math.min(costBasis, dc);
       } else {
         log.warn('Settlement value missing for SETTLED BUY trade', {
           tradeId: trade.id, allocationId,
@@ -104,22 +131,6 @@ export async function auditAllocation(allocationId: string): Promise<AllocationA
   const pooled = pooledSum._sum.requestedAmount ?? 0;
   dc += pooled;
 
-  // Compute deployed from aggregates (cross-check)
-  const [filledBuySum, filledSellSum] = await Promise.all([
-    prisma.copyTrade.aggregate({
-      where: { followAllocationId: allocationId, side: 'BUY', status: 'FILLED', isPaper: allocation.isPaper },
-      _sum: { requestedAmount: true },
-    }),
-    prisma.copyTrade.aggregate({
-      where: { followAllocationId: allocationId, side: 'SELL', status: 'FILLED', isPaper: allocation.isPaper },
-      _sum: { requestedAmount: true },
-    }),
-  ]);
-  const aggregateDC = Math.max(
-    (filledBuySum._sum.requestedAmount ?? 0) - (filledSellSum._sum.requestedAmount ?? 0) + pooled,
-    0,
-  );
-
   return {
     id: allocation.id,
     proxyWallet: allocation.proxyWallet,
@@ -128,9 +139,9 @@ export async function auditAllocation(allocationId: string): Promise<AllocationA
     actualCC: allocation.currentCapital,
     actualDC: allocation.deployedCapital,
     computedCC: cc,
-    computedDC: aggregateDC, // use aggregate for deployed (more reliable)
+    computedDC: dc,
     deltaCC: Math.abs(cc - allocation.currentCapital),
-    deltaDC: Math.abs(aggregateDC - allocation.deployedCapital),
+    deltaDC: Math.abs(dc - allocation.deployedCapital),
   };
 }
 

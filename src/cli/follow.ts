@@ -289,23 +289,50 @@ export async function updateFollow(identifier: string, newCapital: number): Prom
 }
 
 async function recalcDeployedCapital(allocationId: string, isPaper: boolean): Promise<number> {
-  const [buySum, sellSum, pooledBuySum] = await Promise.all([
-    prisma.copyTrade.aggregate({
-      where: { followAllocationId: allocationId, side: 'BUY', status: 'FILLED', isPaper },
-      _sum: { requestedAmount: true },
-    }),
-    prisma.copyTrade.aggregate({
-      where: { followAllocationId: allocationId, side: 'SELL', status: 'FILLED', isPaper },
-      _sum: { requestedAmount: true },
-    }),
-    prisma.copyTrade.aggregate({
-      where: { followAllocationId: allocationId, side: 'BUY', status: 'POOLED', isPaper },
-      _sum: { requestedAmount: true },
-    }),
-  ]);
+  const fills = await prisma.copyTrade.findMany({
+    where: {
+      followAllocationId: allocationId,
+      isPaper,
+      status: { in: ['FILLED', 'POOLED'] },
+    },
+    select: { tokenId: true, side: true, filledSize: true, filledPrice: true, requestedAmount: true, status: true },
+  });
 
-  const buys = buySum._sum.requestedAmount ?? 0;
-  const sells = sellSum._sum.requestedAmount ?? 0;
-  const pooledBuys = pooledBuySum._sum.requestedAmount ?? 0;
-  return Math.max(buys - sells + pooledBuys, 0);
+  // Group by tokenId for per-token avg cost method
+  const byToken = new Map<string, typeof fills>();
+  for (const fill of fills) {
+    const arr = byToken.get(fill.tokenId) ?? [];
+    arr.push(fill);
+    byToken.set(fill.tokenId, arr);
+  }
+
+  let totalDeployed = 0;
+  for (const [, tokenFills] of byToken) {
+    let pooledBuyUsd = 0;
+    let totalBuyShares = 0;
+    let totalBuyCost = 0;
+    let totalSellShares = 0;
+
+    for (const fill of tokenFills) {
+      if (fill.status === 'POOLED' && fill.side === 'BUY') {
+        pooledBuyUsd += fill.requestedAmount;
+        continue;
+      }
+      if (fill.side === 'BUY') {
+        const shares = fill.filledSize ?? (fill.filledPrice && fill.filledPrice > 0 ? fill.requestedAmount / fill.filledPrice : fill.requestedAmount);
+        totalBuyShares += shares;
+        totalBuyCost += (fill.filledSize != null && fill.filledPrice != null)
+          ? fill.filledSize * fill.filledPrice : fill.requestedAmount;
+      } else {
+        totalSellShares += fill.filledSize ?? 0;
+      }
+    }
+
+    const netShares = Math.max(totalBuyShares - totalSellShares, 0);
+    if (netShares > 0 && totalBuyShares > 0) {
+      totalDeployed += (totalBuyCost / totalBuyShares) * netShares;
+    }
+    totalDeployed += pooledBuyUsd;
+  }
+  return Math.max(totalDeployed, 0);
 }

@@ -4,6 +4,7 @@ import { config } from '../config/env';
 import { executeMarketOrder as realExecute, isBalancePaused, CLOB_MIN_ORDER_USD } from './trade-executor';
 import { executeMarketOrder as paperExecute } from './paper-executor';
 import type { ExecuteOrderResult } from './trade-executor';
+import { computeSellCostBasis } from '../lib/cost-basis';
 
 const log = createJobLogger('order-pool');
 
@@ -395,11 +396,25 @@ async function fireBucket(bucket: PoolBucket): Promise<void> {
           },
         });
       } else {
+        // SELL: release cost basis (not proceeds) from deployedCapital
+        const costBasisFills = await tx.copyTrade.findMany({
+          where: {
+            tokenId,
+            followAllocationId,
+            isPaper,
+            status: 'FILLED',
+            id: { notIn: entries.map(e => e.copyTradeId) }, // exclude current batch (already updated to FILLED above)
+          },
+          select: { side: true, filledSize: true, filledPrice: true, requestedAmount: true },
+        });
+        const soldShares = result.filledSize ?? executorAmount;
+        const costBasis = computeSellCostBasis(costBasisFills, soldShares);
+
         await tx.followAllocation.update({
           where: { id: followAllocationId },
           data: {
             currentCapital: { increment: actualUsd },
-            deployedCapital: { decrement: Math.min(actualUsd, fresh.deployedCapital) },
+            deployedCapital: { decrement: Math.min(costBasis.costBasisOfSoldShares, fresh.deployedCapital) },
           },
         });
       }

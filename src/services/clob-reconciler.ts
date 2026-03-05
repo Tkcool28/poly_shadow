@@ -1,6 +1,7 @@
 import { prisma } from '../lib/prisma';
 import { createJobLogger } from '../lib/logger';
 import { getClient } from './trade-executor';
+import { computeSellCostBasis } from '../lib/cost-basis';
 
 const log = createJobLogger('clob-reconciler');
 
@@ -81,11 +82,24 @@ export async function reconcileStalePending(): Promise<void> {
                 },
               });
             } else {
+              // SELL: release cost basis (not proceeds) from deployedCapital
+              const costBasisFills = await tx.copyTrade.findMany({
+                where: {
+                  tokenId: record.tokenId,
+                  followAllocationId: record.followAllocationId!,
+                  isPaper: record.isPaper,
+                  status: 'FILLED',
+                  id: { not: record.id }, // exclude current SELL (already updated to FILLED above)
+                },
+                select: { side: true, filledSize: true, filledPrice: true, requestedAmount: true },
+              });
+              const costBasis = computeSellCostBasis(costBasisFills, sizeMatched);
+
               await tx.followAllocation.update({
                 where: { id: record.followAllocationId! },
                 data: {
                   currentCapital: { increment: usdValue },
-                  deployedCapital: { decrement: Math.min(usdValue, fresh.deployedCapital) },
+                  deployedCapital: { decrement: Math.min(costBasis.costBasisOfSoldShares, fresh.deployedCapital) },
                 },
               });
             }
