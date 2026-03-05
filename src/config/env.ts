@@ -60,7 +60,7 @@ const envSchema = z.object({
     .default('false')
     .transform((v) => v === 'true'),
   MAX_POSITION_USD: z.coerce.number().min(1).max(10000).default(2),
-  MAX_PREDICTION_POSITION_USD: z.coerce.number().min(0).max(10000).default(2), // 0 = disabled; max net USD per prediction per allocation
+  MAX_PREDICTION_POSITION_USD: z.coerce.number().min(0).max(10000).default(4), // 0 = disabled; max net USD per prediction per allocation
   MAX_DAILY_LOSS_USD: z.coerce.number().min(1).max(100000).default(200),
   MAX_TRADE_PERCENT: z.coerce.number().min(0.01).max(1.0).default(0.50), // Max 50% of allocation per trade
   PORTFOLIO_VALUE_REFRESH_MS: z.coerce.number().default(300000), // 5 min
@@ -69,6 +69,13 @@ const envSchema = z.object({
   COPY_TRADE_PERCENT: z.coerce.number().min(0.01).max(1.0).default(0.10), // Copy 10% of trader's actual trade size
   MIN_COMPOSITE_SCORE: z.coerce.number().min(0).max(1).default(0), // Skip BUY trades below this score (0 = disabled)
   MIN_SIGNAL_TRADE_USD: z.coerce.number().min(0).default(0), // Skip BUY trades where trader's USD < this (0 = disabled)
+
+  // Anti-cycle: per-token cool-down after a SELL fill to prevent market-making spread loss
+  TOKEN_SELL_COOLDOWN_MS: z.coerce.number().min(0).default(60000), // 60s — 0 = disabled
+  // Sliding-window loss guard: reduce copy% after consecutive settlement losses per allocation
+  LOSS_GUARD_WINDOW: z.coerce.number().min(0).default(10), // Number of recent settlements to consider (0 = disabled)
+  LOSS_GUARD_THRESHOLD: z.coerce.number().min(0).max(1).default(0.60), // Trigger if >= 60% of window are losses
+  LOSS_GUARD_SCALE: z.coerce.number().min(0).max(1).default(0.50), // Reduce copy% to this fraction when triggered
 
   // Order aggregation pool
   POOL_MIN_AMOUNT_USD: z.coerce.number().min(0.01).max(100).default(0.50), // min USD to pool paper trades

@@ -9,6 +9,34 @@ import { resolveMarkets } from './market-resolver';
 
 const log = createJobLogger('copy-trade-worker');
 
+// ─── Per-token SELL cool-down: tracks last SELL fill time per (allocation, token) ───
+// Prevents rapid BUY re-entry after a SELL that creates market-making spread loss.
+const lastSellAt = new Map<string, number>();
+
+function sellCooldownKey(allocationId: string, tokenId: string): string {
+  return `${allocationId}:${tokenId}`;
+}
+
+function isInSellCooldown(allocationId: string, tokenId: string): boolean {
+  if (config.TOKEN_SELL_COOLDOWN_MS <= 0) return false;
+  const key = sellCooldownKey(allocationId, tokenId);
+  const ts = lastSellAt.get(key);
+  if (!ts) return false;
+  return Date.now() - ts < config.TOKEN_SELL_COOLDOWN_MS;
+}
+
+function recordSellFill(allocationId: string, tokenId: string): void {
+  const key = sellCooldownKey(allocationId, tokenId);
+  lastSellAt.set(key, Date.now());
+  // Prune old entries to prevent unbounded growth
+  if (lastSellAt.size > 1000) {
+    const cutoff = Date.now() - config.TOKEN_SELL_COOLDOWN_MS * 2;
+    for (const [k, v] of lastSellAt) {
+      if (v < cutoff) lastSellAt.delete(k);
+    }
+  }
+}
+
 interface DetectedTradeRow {
   id: string;
   proxyWallet: string;
@@ -62,6 +90,12 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     return;
   }
 
+  // ─── Per-token cool-down: prevent rapid re-BUY after SELL (market-making cycle guard) ───
+  if (trade.side === 'BUY' && isInSellCooldown(allocation.id, trade.asset)) {
+    await createSkippedRecord(trade, 'token sell cool-down active', allocation.id, isPaper);
+    return;
+  }
+
   // ─── Sizing ───
 
   let copyAmountUsd: number;
@@ -77,8 +111,17 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       await createSkippedRecord(trade, 'no shares held to sell', allocation.id, isPaper);
       return;
     }
-    // Full position close — when trader sells, we exit entirely
-    sellShares = heldShares;
+    // Full position close — when trader sells, we exit entirely.
+    // Floor to 2 decimal places: CLOB rounds SELL fills to 2dp, leaving dust
+    // (e.g., send 2.409635 → fills 2.40, leaving 0.009635 orphaned).
+    // By flooring upfront, the fill matches exactly what we send — zero dust created.
+    sellShares = Math.floor(heldShares * 100) / 100;
+    if (sellShares < 0.01) {
+      // Remaining shares are sub-penny dust — cannot be sold on CLOB.
+      // They'll resolve at settlement (binary payout: $1/share if won, $0 if lost).
+      await createSkippedRecord(trade, `dust position (${heldShares.toFixed(6)} shares): awaiting settlement`, allocation.id, isPaper);
+      return;
+    }
     copyAmountUsd = sellShares * trade.price;
   } else {
     // Guard: negative or zero capital means no buying power — skip silently
@@ -101,7 +144,25 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     }
 
     // ─── Trade-proportional sizing ───
-    copyAmountUsd = traderTradeUsd * config.COPY_TRADE_PERCENT;
+    let effectiveCopyPercent = config.COPY_TRADE_PERCENT;
+
+    // ─── Sliding-window loss guard ───
+    // If recent settlements for this allocation are mostly losses, reduce position size.
+    // Prevents bleeding from consistently losing streaks (e.g., low-probability bets).
+    if (config.LOSS_GUARD_WINDOW > 0) {
+      const lossRate = await getRecentLossRate(allocation.id, isPaper, config.LOSS_GUARD_WINDOW);
+      if (lossRate !== null && lossRate >= config.LOSS_GUARD_THRESHOLD) {
+        effectiveCopyPercent *= config.LOSS_GUARD_SCALE;
+        log.debug('Loss guard active: reducing copy%', {
+          allocationId: allocation.id,
+          lossRate: lossRate.toFixed(2),
+          threshold: config.LOSS_GUARD_THRESHOLD,
+          effectiveCopyPercent: effectiveCopyPercent.toFixed(4),
+        });
+      }
+    }
+
+    copyAmountUsd = traderTradeUsd * effectiveCopyPercent;
     // Absolute dollar cap
     copyAmountUsd = Math.min(copyAmountUsd, config.MAX_POSITION_USD);
   }
@@ -300,6 +361,11 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     }
   });
 
+  // Record SELL fill time for per-token cool-down (after txn commit to avoid false cool-down on rollback)
+  if (result.status === 'FILLED' && trade.side === 'SELL') {
+    recordSellFill(allocation.id, trade.asset);
+  }
+
   // ─── Log ───
 
   const mode = isPaper ? 'PAPER' : 'LIVE';
@@ -458,6 +524,34 @@ async function checkMarketClosed(
     log.warn('Market closed check failed (proceeding)', { conditionId, error: err.message });
     return null;
   }
+}
+
+/**
+ * Sliding-window loss rate: fraction of recent settlements that were losses.
+ * Returns null if fewer than `window` settlements exist (insufficient data).
+ */
+async function getRecentLossRate(
+  followAllocationId: string,
+  isPaper: boolean,
+  window: number,
+): Promise<number | null> {
+  const recent = await prisma.copyTrade.findMany({
+    where: {
+      followAllocationId,
+      isPaper,
+      status: 'SETTLED',
+      side: 'BUY',
+      settlementPnl: { not: null },
+    },
+    select: { settlementPnl: true },
+    orderBy: { createdAt: 'desc' },
+    take: window,
+  });
+
+  if (recent.length < window) return null; // Not enough data yet
+
+  const losses = recent.filter(r => (r.settlementPnl ?? 0) < 0).length;
+  return losses / recent.length;
 }
 
 async function createSkippedRecord(
