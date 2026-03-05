@@ -27,6 +27,7 @@ import {
 } from '../services/arb/arb-types';
 import { getCandleInfo, calculateFee } from '../services/arb/arb-engine';
 import { buildSlug } from '../services/arb/market-discovery';
+import { loadCalibrationModel, getEntryRate, type CalibrationModel } from './backtest-price-model';
 
 // ─── CLI Args ───
 
@@ -36,6 +37,8 @@ const { values } = parseArgs({
     duration: { type: 'string', default: '5m' },
     days: { type: 'string', default: '7' },
     'cache-dir': { type: 'string', default: 'src/scripts/backtest-cache' },
+    'entry-mode': { type: 'string', default: 'calibrated' }, // 'calibrated' | 'all'
+    seed: { type: 'string', default: '42' },
   },
 });
 
@@ -43,6 +46,32 @@ const assets = (values.asset ?? 'btc').split(',').map((a) => a.trim().toLowerCas
 const durations = (values.duration ?? '5m').split(',').map((d) => d.trim());
 const days = parseInt(values.days ?? '7', 10);
 const cacheDir = values['cache-dir'] ?? 'src/scripts/backtest-cache';
+const entryMode = values['entry-mode'] ?? 'calibrated';
+const seedValue = parseInt(values.seed ?? '42', 10);
+
+// ─── Seeded PRNG (mulberry32) for reproducible probabilistic entry ───
+
+function mulberry32(seed: number): () => number {
+  let s = seed;
+  return function () {
+    s |= 0;
+    s = (s + 0x6D2B79F5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Load calibration model if in calibrated mode
+let priceModel: CalibrationModel | null = null;
+if (entryMode === 'calibrated') {
+  try {
+    priceModel = loadCalibrationModel(cacheDir);
+  } catch (err: any) {
+    console.error(`Warning: ${err.message}`);
+    console.error('Falling back to --entry-mode all (no entry filtering)\n');
+  }
+}
 
 // Validate inputs
 for (const asset of assets) {
@@ -351,6 +380,7 @@ function printStats(stats: StrategyStats): void {
 interface StrategyAccumulator {
   pnls: number[];
   fees: number[];
+  candleIndices: number[]; // Original candle index (for every-Nth in calibrated mode)
 }
 
 // ─── Strategy entry price configs ───
@@ -367,7 +397,7 @@ async function main(): Promise<void> {
 
   console.log(`\nArb Backtest — ${days} days (${new Date(startMs).toISOString().slice(0, 10)} → ${new Date(endMs).toISOString().slice(0, 10)})`);
   console.log(`Assets: ${assets.join(', ')}  |  Durations: ${durations.join(', ')}`);
-  console.log(`Cache: ${cacheDir}\n`);
+  console.log(`Entry mode: ${priceModel ? 'CALIBRATED' : 'ALL (no filtering)'}  |  Seed: ${seedValue}  |  Cache: ${cacheDir}\n`);
 
   // Global ranking across all (asset, duration) combos
   const globalRanking: StrategyStats[] = [];
@@ -395,7 +425,7 @@ async function main(): Promise<void> {
       const getAcc = (key: string): StrategyAccumulator => {
         let acc = accumulators.get(key);
         if (!acc) {
-          acc = { pnls: [], fees: [] };
+          acc = { pnls: [], fees: [], candleIndices: [] };
           accumulators.set(key, acc);
         }
         return acc;
@@ -405,6 +435,9 @@ async function main(): Promise<void> {
       const hourlyCorrect = new Map<number, { correct: number; total: number; pnl: number }>();
 
       const posSize = 10; // $10 per trade for simulation
+      const rng = mulberry32(seedValue); // Reset RNG per asset/duration combo
+      let candleIndex = 0; // Sequential candle counter (for every-Nth tracking)
+      const entryRateTracking = new Map<string, { entered: number; total: number }>();
 
       for (let i = 0; i < resolvedCandleStarts.length; i++) {
         const candleStartMs = resolvedCandleStarts[i];
@@ -440,6 +473,7 @@ async function main(): Promise<void> {
         const settlement = parseSettlement(market);
         if (!settlement) continue;
         marketsResolved++;
+        candleIndex++; // Count resolved candles for every-Nth tracking
 
         // 5. Calculate P&L for all strategies and push to accumulators
         const isCorrect = predicted === settlement;
@@ -481,12 +515,30 @@ async function main(): Promise<void> {
 
         // Contrarian strategies at multiple price points
         for (const cp of CONTRARIAN_PRICES) {
+          const tierKey = cp.toFixed(2);
+
+          // Calibrated entry gate: check if this candle would have been enterable
+          let tracker = entryRateTracking.get(tierKey);
+          if (!tracker) {
+            tracker = { entered: 0, total: 0 };
+            entryRateTracking.set(tierKey, tracker);
+          }
+          tracker.total++;
+          if (priceModel) {
+            const rate = getEntryRate(priceModel, marketConfig.type, moveMagnitude, cp);
+            if (rate === 0 || rng() > rate) {
+              continue; // Skip — market price wouldn't have been low enough
+            }
+          }
+          tracker.entered++;
+
           const cResult = calculateContrarianPnlWithFee(predicted, settlement, posSize, cp);
           const label = `$${cp.toFixed(2)}`;
 
           const cAcc = getAcc(`${prefix} Contrarian @${label}`);
           cAcc.pnls.push(cResult.pnl);
           cAcc.fees.push(cResult.fee);
+          cAcc.candleIndices.push(candleIndex);
 
           // Contrarian + move threshold variants
           for (const thresh of MOVE_THRESHOLDS) {
@@ -495,6 +547,7 @@ async function main(): Promise<void> {
               const acc = getAcc(key);
               acc.pnls.push(cResult.pnl);
               acc.fees.push(cResult.fee);
+              acc.candleIndices.push(candleIndex);
             }
           }
 
@@ -505,13 +558,25 @@ async function main(): Promise<void> {
               const acc = getAcc(key);
               acc.pnls.push(cResult.pnl);
               acc.fees.push(cResult.fee);
+              acc.candleIndices.push(candleIndex);
             }
           }
         }
       }
 
       console.log(''); // Clear progress line
-      console.log(`  Markets found: ${marketsFound}/${resolvedCandleStarts.length}  |  Resolved: ${marketsResolved}  |  Flat: ${directionFlat}`);
+      console.log(`  Markets found: ${marketsFound}/${resolvedCandleStarts.length}  |  Resolved: ${marketsResolved}  |  Flat: ${directionFlat}  |  Entry mode: ${priceModel ? 'CALIBRATED' : 'ALL'}`);
+
+      // Entry rate summary (only meaningful in calibrated mode)
+      if (priceModel && entryRateTracking.size > 0) {
+        const rateStr = [...entryRateTracking.entries()]
+          .sort(([a], [b]) => parseFloat(a) - parseFloat(b))
+          .map(([tier, { entered, total }]) =>
+            `@$${tier}=${(total > 0 ? (entered / total) * 100 : 0).toFixed(1)}% (${entered}/${total})`,
+          )
+          .join('  ');
+        console.log(`  Entry rates: ${rateStr}`);
+      }
       const unresolvedCount = marketsFound - marketsResolved;
       if (unresolvedCount > 0 && marketsFound > 0) {
         console.log(`  Unresolved markets: ${unresolvedCount} (${((unresolvedCount / marketsFound) * 100).toFixed(1)}%) — capital lockup not modeled`);
@@ -552,6 +617,7 @@ async function main(): Promise<void> {
         if (!baseAcc || baseAcc.pnls.length < 20) continue;
         const basePnls = baseAcc.pnls;
         const baseFees = baseAcc.fees;
+        const baseCandleIndices = baseAcc.candleIndices;
 
         // 1. Streak cooldown: after N consecutive losses, skip the next M candles
         for (const [cooldownAfter, skipCount] of [[3, 2], [5, 3], [5, 5], [3, 5]] as const) {
@@ -579,7 +645,7 @@ async function main(): Promise<void> {
           }
 
           const key = `${baseKey} cool${cooldownAfter}L→skip${skipCount}`;
-          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees, candleIndices: [] });
         }
 
         // 2. Drawdown pause: stop entering when cumulative DD exceeds threshold,
@@ -609,21 +675,22 @@ async function main(): Promise<void> {
           }
 
           const key = `${baseKey} ddPause$${maxDdUsd}`;
-          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees, candleIndices: [] });
         }
 
         // 3. Every-Nth trade: only enter every Nth candle (reduces exposure & streak length)
+        // Uses candleIndices to count by original candle position, not entered-trade index
         for (const nth of [2, 3]) {
           const filtPnls: number[] = [];
           const filtFees: number[] = [];
           for (let j = 0; j < basePnls.length; j++) {
-            if (j % nth === 0) {
+            if (baseCandleIndices[j] % nth === 0) {
               filtPnls.push(basePnls[j]);
               filtFees.push(baseFees[j]);
             }
           }
           const key = `${baseKey} every${nth}th`;
-          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees, candleIndices: [] });
         }
 
         // 4. Martingale inverse: halve position after each loss, reset after win
@@ -642,7 +709,7 @@ async function main(): Promise<void> {
             }
           }
           const key = `${baseKey} antiMart`;
-          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees, candleIndices: [] });
         }
 
         // 5. Combination: every3th + antiMart (skip + sizing)
@@ -651,7 +718,7 @@ async function main(): Promise<void> {
           const filtFees: number[] = [];
           let scale = 1.0;
           for (let j = 0; j < basePnls.length; j++) {
-            if (j % nth !== 0) continue; // every-Nth filter
+            if (baseCandleIndices[j] % nth !== 0) continue; // every-Nth filter
             filtPnls.push(basePnls[j] * scale);
             filtFees.push(baseFees[j] * scale);
             if (basePnls[j] < 0) {
@@ -661,7 +728,7 @@ async function main(): Promise<void> {
             }
           }
           const key = `${baseKey} every${nth}th+antiMart`;
-          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees, candleIndices: [] });
         }
 
         // 6. Combination: cooldown + antiMart (streak skip + sizing)
@@ -691,7 +758,7 @@ async function main(): Promise<void> {
             }
           }
           const key = `${baseKey} cool${cooldownAfter}L→skip${skipCount}+antiMart`;
-          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees, candleIndices: [] });
         }
 
         // 7. Reverse kelly: double after win, halve after loss (ride hot streaks)
@@ -709,7 +776,7 @@ async function main(): Promise<void> {
             }
           }
           const key = `${baseKey} kelly`;
-          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees, candleIndices: [] });
         }
 
         // 8. Every-Nth + cooldown (skip by count + skip by streak) — expanded combos
@@ -722,7 +789,7 @@ async function main(): Promise<void> {
           let consecLosses = 0;
           let cooldownRemaining = 0;
           for (let j = 0; j < basePnls.length; j++) {
-            if (j % nth !== 0) continue;
+            if (baseCandleIndices[j] % nth !== 0) continue;
             if (cooldownRemaining > 0) {
               cooldownRemaining--;
               continue;
@@ -740,7 +807,7 @@ async function main(): Promise<void> {
             }
           }
           const key = `${baseKey} every${nth}th+cool${cooldownAfter}L→skip${skipCount}`;
-          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees, candleIndices: [] });
         }
 
         // 9. Extended cooldown + antiMart combos (cool5L variants, cool2L, cool4L)
@@ -770,7 +837,7 @@ async function main(): Promise<void> {
             }
           }
           const key = `${baseKey} cool${cooldownAfter}L→skip${skipCount}+antiMart`;
-          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees, candleIndices: [] });
         }
 
         // 10. ddPause + antiMart combos
@@ -801,7 +868,7 @@ async function main(): Promise<void> {
             }
           }
           const key = `${baseKey} ddPause$${maxDdUsd}+antiMart`;
-          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees, candleIndices: [] });
         }
 
         // 11. Every-Nth (extended: 4th, 5th) + antiMart
@@ -810,7 +877,7 @@ async function main(): Promise<void> {
           const filtFees: number[] = [];
           let scale = 1.0;
           for (let j = 0; j < basePnls.length; j++) {
-            if (j % nth !== 0) continue;
+            if (baseCandleIndices[j] % nth !== 0) continue;
             filtPnls.push(basePnls[j] * scale);
             filtFees.push(baseFees[j] * scale);
             if (basePnls[j] < 0) {
@@ -820,7 +887,7 @@ async function main(): Promise<void> {
             }
           }
           const key = `${baseKey} every${nth}th+antiMart`;
-          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees, candleIndices: [] });
         }
 
         // 12. Triple combo: every-Nth + cooldown + antiMart
@@ -834,7 +901,7 @@ async function main(): Promise<void> {
           let cooldownRemaining = 0;
           let scale = 1.0;
           for (let j = 0; j < basePnls.length; j++) {
-            if (j % nth !== 0) continue;
+            if (baseCandleIndices[j] % nth !== 0) continue;
             if (cooldownRemaining > 0) {
               cooldownRemaining--;
               continue;
@@ -854,7 +921,7 @@ async function main(): Promise<void> {
             }
           }
           const key = `${baseKey} every${nth}th+cool${cooldownAfter}L→skip${skipCount}+antiMart`;
-          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees, candleIndices: [] });
         }
 
         // 13. Kelly + cooldown combos
@@ -884,7 +951,7 @@ async function main(): Promise<void> {
             }
           }
           const key = `${baseKey} kelly+cool${cooldownAfter}L→skip${skipCount}`;
-          accumulators.set(key, { pnls: filtPnls, fees: filtFees });
+          accumulators.set(key, { pnls: filtPnls, fees: filtFees, candleIndices: [] });
         }
       }
 

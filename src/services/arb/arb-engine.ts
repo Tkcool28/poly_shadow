@@ -174,6 +174,7 @@ export class ArbEngine {
       permanentSkipReason: null,
       lastConfidence: null,
       lastSkipDetail: null,
+      lastOppositePrice: null,
     };
 
     if (!marketInfo) {
@@ -313,6 +314,7 @@ export class ArbEngine {
       const oppositePrice = modelDirection === 'UP'
         ? candle.marketInfo.downPrice
         : candle.marketInfo.upPrice;
+      candle.lastOppositePrice = oppositePrice ?? null;
 
       if (!oppositePrice || !Number.isFinite(oppositePrice)
           || oppositePrice > this.strategyParams.maxEntryPrice) {
@@ -413,6 +415,7 @@ export class ArbEngine {
               modelDirection,
               contrarian: this.isContrarian,
             }),
+            oppositePrice: candle.lastOppositePrice ?? undefined,
             status: ArbCycleStatus.ENTERED,
             isPaper: this.isPaper,
             strategy: this.strategy,
@@ -544,6 +547,7 @@ export class ArbEngine {
           btcEntryPrice: this.priceFeed.lastPrice,
           confidenceScore: confidenceScore ?? undefined,
           confidenceSignals: confidenceSignals ?? undefined,
+          oppositePrice: this.currentCandle.lastOppositePrice ?? undefined,
           status: ArbCycleStatus.SKIPPED,
           failReason: reason,
           isPaper: this.isPaper,

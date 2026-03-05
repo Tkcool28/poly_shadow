@@ -469,6 +469,9 @@ model ArbCycle {
   confidenceScore    Float?    // 0.0-1.0 composite score at entry
   confidenceSignals  String?   // JSON: individual signal values for analysis
 
+  // Market pricing
+  oppositePrice       Float?  // Polymarket losing-side token price at evaluation time
+
   // Settlement
   settlementPrice     Float?  // 1.0 (win) or 0.0 (loss)
   pnl                 Float?  // Net P&L for this cycle
