@@ -79,6 +79,19 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
 
   const isPaper = allocation.isPaper;
 
+  // Resolve per-allocation sizing overrides (null = global default)
+  const copyPercent = allocation.copyTradePercent ?? config.COPY_TRADE_PERCENT;
+  const maxPerTrade = allocation.maxPositionUsd ?? config.MAX_POSITION_USD;
+  const maxPerPrediction = allocation.maxPredictionPositionUsd ?? config.MAX_PREDICTION_POSITION_USD;
+
+  // Sanity guard: reject obviously invalid overrides (DB typo protection)
+  if (copyPercent > 1.0 || copyPercent <= 0 || maxPerTrade <= 0 || maxPerPrediction < 0) {
+    log.error('Invalid per-allocation sizing override, skipping trade', {
+      allocationId: allocation.id, copyPercent, maxPerTrade, maxPerPrediction,
+    });
+    return;
+  }
+
   // Skip live BUYs when wallet balance is insufficient — SELLs and paper allocations continue normally
   if (!isPaper && trade.side === 'BUY' && isBalancePaused()) {
     await createSkippedRecord(trade, 'live trading paused: insufficient wallet balance', allocation.id, isPaper);
@@ -154,9 +167,9 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     }
 
     // ─── Trade-proportional sizing ───
-    copyAmountUsd = traderTradeUsd * config.COPY_TRADE_PERCENT;
+    copyAmountUsd = traderTradeUsd * copyPercent;
     // Absolute dollar cap
-    copyAmountUsd = Math.min(copyAmountUsd, config.MAX_POSITION_USD);
+    copyAmountUsd = Math.min(copyAmountUsd, maxPerTrade);
   }
 
   // ─── Per-prediction position cap (BUY only) ───
@@ -164,9 +177,9 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   // On partial room: trim to the gap rather than skip entirely.
   // Net position = BUY fills minus SELL fills, so re-entries after exits are allowed.
   let positionUsd = 0;
-  if (trade.side === 'BUY' && config.MAX_PREDICTION_POSITION_USD > 0) {
+  if (trade.side === 'BUY' && maxPerPrediction > 0) {
     positionUsd = await getNetPositionUsd(trade.asset, allocation.id, isPaper);
-    const remaining = config.MAX_PREDICTION_POSITION_USD - positionUsd;
+    const remaining = maxPerPrediction - positionUsd;
     if (remaining <= 0) {
       await createSkippedRecord(trade, 'prediction position limit reached', allocation.id, isPaper);
       return;
@@ -405,6 +418,9 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       latencyMs,
       signalAgeMs,
       allocationId: allocation.id,
+      copyPercent,
+      maxPerTrade,
+      maxPerPrediction,
     });
   } else if (result.status === 'SKIPPED') {
     log.info(`COPY TRADE SKIPPED [${mode}]`, {

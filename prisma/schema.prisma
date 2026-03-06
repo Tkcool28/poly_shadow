@@ -310,6 +310,11 @@ model FollowAllocation {
   traderPortfolioValue Float?
   portfolioValueAt     DateTime?
 
+  // Per-allocation sizing overrides (null = use global env defaults)
+  copyTradePercent          Float?  // Override COPY_TRADE_PERCENT (e.g. 0.10 = 10%)
+  maxPositionUsd            Float?  // Override MAX_POSITION_USD (per-trade cap)
+  maxPredictionPositionUsd  Float?  // Override MAX_PREDICTION_POSITION_USD (per-tokenId cap)
+
   // State
   isActive             Boolean   @default(true)
   isPaper              Boolean   @default(false) // true = paper trading, no real orders
