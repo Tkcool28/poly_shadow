@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { computeConsistency } from './consistency';
 
 function makePositions(pnls: number[]): Array<{ realizedPnl: number; timestamp: number }> {
-  return pnls.map((pnl, i) => ({ realizedPnl: pnl, timestamp: 1000 + i }));
+  // Space each position 1 day apart so daily binning treats them as separate days
+  return pnls.map((pnl, i) => ({ realizedPnl: pnl, timestamp: 1000 + i * 86400 }));
 }
 
 describe('computeMaxDrawdown', () => {
@@ -28,10 +29,10 @@ describe('computeMaxDrawdown', () => {
     expect(result.maxDrawdown).toBeCloseTo(0.8, 5);
   });
 
-  it('returns 0 for all losses (peak never > 0)', () => {
-    // cumPnl: -10, -30, -35 → peak never goes above 0
+  it('returns 1.0 for all losses (equity never went positive)', () => {
+    // cumPnl: -10, -30, -35 → peak never goes above 0 → 100% drawdown
     const result = computeConsistency(makePositions([-10, -20, -5]));
-    expect(result.maxDrawdown).toBe(0);
+    expect(result.maxDrawdown).toBe(1.0);
   });
 
   it('caps drawdown at 1.0 when cumPnl goes negative past peak', () => {
@@ -48,7 +49,14 @@ describe('computeMaxDrawdown', () => {
 
   it('handles single losing position', () => {
     const result = computeConsistency(makePositions([-50]));
-    expect(result.maxDrawdown).toBe(0);
+    expect(result.maxDrawdown).toBe(1.0);
+  });
+
+  it('captures underwater drawdown for loss-then-recovery', () => {
+    // cumPnl: -20, 30 → eventualPeak=30, underwater depth=20
+    // underwater DD = 20/30 ≈ 0.6667
+    const result = computeConsistency(makePositions([-20, 50]));
+    expect(result.maxDrawdown).toBeCloseTo(0.6667, 3);
   });
 
   it('detects drawdown mid-sequence even if equity recovers', () => {
@@ -56,6 +64,30 @@ describe('computeMaxDrawdown', () => {
     // Earlier: peak=100, drop to 60 = 40/100 = 0.4 → this is the max
     const result = computeConsistency(makePositions([100, -40, 60, -40]));
     expect(result.maxDrawdown).toBeCloseTo(0.4, 5);
+  });
+
+  it('captures underwater drawdown relative to eventual peak', () => {
+    // cumPnl: -50, -150, 200 → eventualPeak=200
+    // Deepest underwater: 150 at day 2
+    // underwater DD = 150/200 = 0.75
+    const result = computeConsistency(makePositions([-50, -100, 350]));
+    expect(result.maxDrawdown).toBeCloseTo(0.75, 3);
+  });
+
+  it('caps underwater drawdown at 1.0 when depth exceeds eventual peak', () => {
+    // cumPnl: -500, 10 → eventualPeak=10
+    // underwater DD = 500/10 = 50, capped at 1.0
+    const result = computeConsistency(makePositions([-500, 510]));
+    expect(result.maxDrawdown).toBe(1.0);
+  });
+
+  it('takes max of standard DD and underwater DD', () => {
+    // cumPnl: -10, 90, 50 → eventualPeak=90
+    // Underwater DD: 10/90 ≈ 0.111
+    // Standard DD: (90-50)/90 ≈ 0.444
+    // Max: 0.444 (standard DD wins)
+    const result = computeConsistency(makePositions([-10, 100, -40]));
+    expect(result.maxDrawdown).toBeCloseTo(0.4444, 3);
   });
 });
 

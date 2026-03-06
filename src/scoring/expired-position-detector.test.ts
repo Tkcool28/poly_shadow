@@ -233,10 +233,10 @@ describe('integration: synthetic positions in scoring', () => {
   });
 
   it('synthetic losses increase max drawdown', () => {
-    // 5 wins (+100 each) then 3 synthetic losses (-150 each)
+    // 5 wins (+100 each) then 3 synthetic losses (-150 each), 1 day apart
     const positions = [
-      ...Array.from({ length: 5 }, (_, i) => ({ realizedPnl: 100, timestamp: 1000 + i })),
-      ...Array.from({ length: 3 }, (_, i) => ({ realizedPnl: -150, timestamp: 1005 + i })),
+      ...Array.from({ length: 5 }, (_, i) => ({ realizedPnl: 100, timestamp: 1000 + i * 86400 })),
+      ...Array.from({ length: 3 }, (_, i) => ({ realizedPnl: -150, timestamp: 1000 + (5 + i) * 86400 })),
     ];
 
     const result = computeConsistency(positions);

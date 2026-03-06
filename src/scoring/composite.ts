@@ -47,6 +47,28 @@ function countLessOrEqual(sorted: number[], val: number): number {
   return lo;
 }
 
+/**
+ * Detect when an inverted metric's zero value comes from insufficient data
+ * rather than a genuinely measured "best" value.
+ *
+ * Note: totalTrades counts raw Trade records. maxDrawdown/returnStdDev are
+ * computed from closedPositions (different source), but DB analysis shows
+ * only 1 trader has >2 trades with 0 closed positions, so this proxy is
+ * acceptable.
+ */
+function isInsufficientData(key: string, trader: ScoreInput): boolean {
+  switch (key) {
+    case 'returnStdDev':
+    case 'maxDrawdown':
+      return trader.totalTrades < 2;
+    case 'concentrationScore':
+    case 'avgRelativePositionSize':
+      return trader.totalTrades === 0;
+    default:
+      return false;
+  }
+}
+
 export function computeCompositeScores(traders: ScoreInput[]): CompositeResult[] {
   if (traders.length === 0) return [];
 
@@ -66,13 +88,21 @@ export function computeCompositeScores(traders: ScoreInput[]): CompositeResult[]
 
     for (const trader of traders) {
       const val = trader[key];
-      // Percentile = fraction of values <= this value (binary search)
-      const rank = countLessOrEqual(sorted, val);
-      let percentile = rank / sorted.length;
+      let percentile: number;
 
-      // Invert for metrics where lower = better
-      if (invertedSet.has(key)) {
-        percentile = 1 - percentile;
+      // Guard: inverted metrics with zero value from insufficient data get
+      // neutral 0.5 percentile instead of false "best" after inversion
+      if (invertedSet.has(key) && val === 0 && isInsufficientData(key, trader)) {
+        percentile = 0.5;
+      } else {
+        // Percentile = fraction of values <= this value (binary search)
+        const rank = countLessOrEqual(sorted, val);
+        percentile = rank / sorted.length;
+
+        // Invert for metrics where lower = better
+        if (invertedSet.has(key)) {
+          percentile = 1 - percentile;
+        }
       }
 
       if (!percentiles.has(trader.proxyWallet)) {

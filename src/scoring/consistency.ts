@@ -77,19 +77,40 @@ function computeMaxDrawdown(sortedPositions: ClosedPositionInput[]): number {
   // ISO date strings sort lexicographically → chronological order
   const sortedDays = [...dailyPnl.entries()].sort((a, b) => a[0].localeCompare(b[0]));
 
+  // Pass 1: find the eventual positive peak of cumulative PnL
   let cumPnl = new Decimal(0);
-  let peak = new Decimal(0);
+  let eventualPeak = new Decimal(0);
+  for (const [, pnl] of sortedDays) {
+    cumPnl = cumPnl.plus(pnl);
+    if (cumPnl.gt(eventualPeak)) eventualPeak = cumPnl;
+  }
+
+  // All-losses case: equity never went positive but ended negative → 100% drawdown
+  if (eventualPeak.lte(0) && cumPnl.lt(0)) {
+    return 1.0;
+  }
+
+  // Pass 2: compute max drawdown including underwater periods
+  cumPnl = new Decimal(0);
+  let runningPeak = new Decimal(0);
   let maxDrawdown = new Decimal(0);
 
   for (const [, pnl] of sortedDays) {
     cumPnl = cumPnl.plus(pnl);
-    if (cumPnl.gt(peak)) peak = cumPnl;
-    if (peak.gt(0)) {
-      const drawdown = peak.minus(cumPnl).div(peak);
+    if (cumPnl.gt(runningPeak)) runningPeak = cumPnl;
+
+    if (runningPeak.gt(0)) {
+      // Standard drawdown from positive running peak
+      const drawdown = runningPeak.minus(cumPnl).div(runningPeak);
+      if (drawdown.gt(maxDrawdown)) maxDrawdown = drawdown;
+    } else if (cumPnl.lt(0) && eventualPeak.gt(0)) {
+      // Underwater period: equity below starting $0 but trader eventually recovers.
+      // Express depth relative to eventual peak to capture the risk.
+      const drawdown = cumPnl.abs().div(eventualPeak);
       if (drawdown.gt(maxDrawdown)) maxDrawdown = drawdown;
     }
   }
 
-  // Cap at 1.0 (100%) — safety net for edge cases where cumPnl goes negative past peak
+  // Cap at 1.0 (100%)
   return Math.min(maxDrawdown.toNumber(), 1.0);
 }

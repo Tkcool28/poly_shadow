@@ -244,7 +244,7 @@ async function upsertScores(
     for (const cs of categoryScores) {
       await tx.categoryScore.create({ data: { proxyWallet, ...cs } });
     }
-  });
+  }, { timeout: 30000 });
 }
 
 async function updateMonitoredTraders() {
