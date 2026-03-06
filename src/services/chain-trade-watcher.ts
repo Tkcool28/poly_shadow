@@ -298,6 +298,17 @@ export class ChainTradeWatcher {
             : 0;
         }
 
+        // Guard: zero-size fills (FOK unmatched orders emit OrderFilled with 0 amounts)
+        if (size <= 0 || price <= 0) {
+          log.debug('Skipping zero-size/price OrderFilled (likely FOK non-fill)', {
+            wallet: matchedWallet.slice(0, 10),
+            size: size.toFixed(6),
+            price: price.toFixed(6),
+            txHash: logEntry.transactionHash?.slice(0, 18),
+          });
+          return;
+        }
+
         log.debug('OrderFilled decoded', {
           wallet: matchedWallet.slice(0, 10),
           side,

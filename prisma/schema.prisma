@@ -55,6 +55,7 @@ model Trader {
 
   @@index([backfillStatus])
   @@index([backfillStatus, screenedAt])
+  @@index([backfillStatus, backfillCompleted])
   @@index([isMonitored])
   @@index([leaderboardPnl(sort: Desc)])
 }

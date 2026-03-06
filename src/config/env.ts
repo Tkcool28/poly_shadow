@@ -5,6 +5,8 @@ const envSchema = z.object({
   DATABASE_URL: z.string().min(1, 'DATABASE_URL must not be empty'),
   LEADERBOARD_SCAN_INTERVAL_MS: z.coerce.number().default(43200000),
   BACKFILL_POLL_INTERVAL_MS: z.coerce.number().default(60000),
+  BACKFILL_REFRESH_AFTER_MS: z.coerce.number().default(604800000),  // 7 days
+  BACKFILL_REFRESH_BATCH_SIZE: z.coerce.number().default(3),         // stale traders per idle cycle
   SCORE_RECALC_INTERVAL_MS: z.coerce.number().default(21600000),
   TRADE_MONITOR_INTERVAL_MS: z.coerce.number().default(120000),
   PROXY_ENABLED: z
@@ -60,7 +62,7 @@ const envSchema = z.object({
     .default('false')
     .transform((v) => v === 'true'),
   MAX_POSITION_USD: z.coerce.number().min(1).max(10000).default(2),
-  MAX_PREDICTION_POSITION_USD: z.coerce.number().min(0).max(10000).default(4), // 0 = disabled; max net USD per prediction per allocation
+  MAX_PREDICTION_POSITION_USD: z.coerce.number().min(0).max(10000).default(5), // 0 = disabled; max net USD per prediction per allocation
   MAX_DAILY_LOSS_USD: z.coerce.number().min(1).max(100000).default(200),
   MAX_TRADE_PERCENT: z.coerce.number().min(0.01).max(1.0).default(0.50), // Max 50% of allocation per trade
   PORTFOLIO_VALUE_REFRESH_MS: z.coerce.number().default(300000), // 5 min

@@ -150,18 +150,13 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     copyAmountUsd = Math.min(copyAmountUsd, config.MAX_POSITION_USD);
   }
 
-  // Live: bump to CLOB $1 minimum before backstop checks — ensures the backstop sees the true
-  // intended order size, preventing it from capping below the exchange minimum.
-  if (trade.side === 'BUY' && !isPaper && copyAmountUsd < CLOB_MIN_ORDER_USD) {
-    copyAmountUsd = CLOB_MIN_ORDER_USD;
-  }
-
   // ─── Per-prediction position cap (BUY only) ───
   // Prevents stacking beyond MAX_PREDICTION_POSITION_USD in a single tokenId.
   // On partial room: trim to the gap rather than skip entirely.
   // Net position = BUY fills minus SELL fills, so re-entries after exits are allowed.
+  let positionUsd = 0;
   if (trade.side === 'BUY' && config.MAX_PREDICTION_POSITION_USD > 0) {
-    const positionUsd = await getNetPositionUsd(trade.asset, allocation.id, isPaper);
+    positionUsd = await getNetPositionUsd(trade.asset, allocation.id, isPaper);
     const remaining = config.MAX_PREDICTION_POSITION_USD - positionUsd;
     if (remaining <= 0) {
       await createSkippedRecord(trade, 'prediction position limit reached', allocation.id, isPaper);
@@ -175,16 +170,27 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
         remaining: remaining.toFixed(2),
         allocationId: allocation.id,
       });
-      // After trimming: live order may now fall below CLOB $1 minimum — not executable
-      if (!isPaper && copyAmountUsd < CLOB_MIN_ORDER_USD) {
-        await createSkippedRecord(
-          trade,
-          `position gap $${remaining.toFixed(2)} below CLOB minimum $${CLOB_MIN_ORDER_USD}`,
-          allocation.id,
-          isPaper,
-        );
-        return;
-      }
+    }
+  }
+
+  // ─── CLOB $1 minimum (live BUY only) ───
+  // Smart bump: only bump to CLOB minimum on FIRST entry (no existing position).
+  // On subsequent entries, natural size < $1 means the cumulative signal is small;
+  // the initial bump already covered the market entry overhead — skip instead of
+  // over-deploying (e.g. $0.60 bumped to $1 + $0.30 bumped to $1 = $2 for $0.90 intent).
+  if (trade.side === 'BUY' && !isPaper && copyAmountUsd < CLOB_MIN_ORDER_USD) {
+    if (positionUsd < 0.01) {
+      // First entry: bump to CLOB minimum (market entry cost)
+      copyAmountUsd = CLOB_MIN_ORDER_USD;
+    } else {
+      // Subsequent entry: natural size too small for CLOB, skip
+      await createSkippedRecord(
+        trade,
+        `sub-CLOB-minimum $${copyAmountUsd.toFixed(2)} add-on (existing position: $${positionUsd.toFixed(2)})`,
+        allocation.id,
+        isPaper,
+      );
+      return;
     }
   }
 

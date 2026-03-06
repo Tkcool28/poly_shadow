@@ -7,21 +7,30 @@ import {
 } from '../api/data-api';
 import { resolveMarkets } from './market-resolver';
 import { logger } from '../lib/logger';
+import { config } from '../config/env';
 import {
   MAX_BACKFILL_RETRIES,
   BACKFILL_LOCK_TIMEOUT_MS,
 } from '../config/constants';
 
+export interface ClaimedTrader {
+  proxyWallet: string;
+  isRefresh: boolean;
+}
+
 /**
- * Atomically claim a trader for backfill using lock-based concurrency.
- * Returns traders that are PENDING/FAILED and not locked by another process.
- * Also recovers IN_PROGRESS traders with expired locks (e.g. from OOM crashes).
+ * Atomically claim traders for backfill using lock-based concurrency.
+ * Priority 1: PENDING/FAILED traders and IN_PROGRESS with expired locks (crash recovery).
+ * Priority 2: Stale COMPLETED traders for data refresh (only when no new work exists).
  */
-export async function claimTradersForBackfill(batchSize: number): Promise<string[]> {
+export async function claimTradersForBackfill(
+  batchSize: number,
+  refreshBatchSize = 0,
+): Promise<ClaimedTrader[]> {
   const now = new Date();
   const lockExpiry = new Date(now.getTime() - BACKFILL_LOCK_TIMEOUT_MS);
 
-  // Find unlocked traders that need backfill, including IN_PROGRESS with stale locks
+  // Priority 1: PENDING/FAILED/stale-IN_PROGRESS (existing query, unchanged)
   const traders = await prisma.trader.findMany({
     where: {
       OR: [
@@ -47,14 +56,38 @@ export async function claimTradersForBackfill(batchSize: number): Promise<string
     orderBy: { createdAt: 'asc' },
   });
 
-  const wallets: string[] = [];
+  // Priority 2: Stale COMPLETED traders (refresh) — only when no new work exists
+  const refreshWallets = new Set<string>();
+  if (traders.length === 0 && refreshBatchSize > 0) {
+    const refreshCutoff = new Date(now.getTime() - config.BACKFILL_REFRESH_AFTER_MS);
+    const staleTraders = await prisma.trader.findMany({
+      where: {
+        backfillStatus: 'COMPLETED',
+        backfillCompleted: { lt: refreshCutoff },
+        OR: [
+          { backfillLockedAt: null },
+          { backfillLockedAt: { lt: lockExpiry } },
+        ],
+      },
+      select: { proxyWallet: true },
+      take: refreshBatchSize,
+      orderBy: { backfillCompleted: 'asc' },  // oldest first = round-robin
+    });
+    traders.push(...staleTraders);
+    for (const t of staleTraders) refreshWallets.add(t.proxyWallet);
+  }
 
   // Atomically lock each trader (only if lock is still unclaimed or expired)
+  const claimed: ClaimedTrader[] = [];
+
   for (const trader of traders) {
+    const isRefresh = refreshWallets.has(trader.proxyWallet);
+
     const result = await prisma.trader.updateMany({
       where: {
         proxyWallet: trader.proxyWallet,
-        backfillRetries: { lt: MAX_BACKFILL_RETRIES },
+        // Skip retries check for refresh candidates (may have retries from initial backfill)
+        ...(isRefresh ? {} : { backfillRetries: { lt: MAX_BACKFILL_RETRIES } }),
         OR: [
           { backfillLockedAt: null },
           { backfillLockedAt: { lt: lockExpiry } },
@@ -64,15 +97,17 @@ export async function claimTradersForBackfill(batchSize: number): Promise<string
         backfillLockedAt: now,
         backfillStatus: 'IN_PROGRESS',
         backfillStarted: now,
+        // Reset retries for refresh so failure handling works cleanly
+        ...(isRefresh ? { backfillRetries: 0 } : {}),
       },
     });
 
     if (result.count > 0) {
-      wallets.push(trader.proxyWallet);
+      claimed.push({ proxyWallet: trader.proxyWallet, isRefresh });
     }
   }
 
-  return wallets;
+  return claimed;
 }
 
 // Chunk sizes for batched DB writes
@@ -82,7 +117,10 @@ const UPSERT_BATCH_CHUNK = 200;
 /**
  * Backfill full trading history for a single wallet.
  */
-export async function backfillTrader(proxyWallet: string): Promise<void> {
+export async function backfillTrader(
+  proxyWallet: string,
+  options?: { isRefresh?: boolean },
+): Promise<void> {
   const log = logger.child({ job: 'backfiller', wallet: proxyWallet.slice(0, 10) });
 
   try {
@@ -410,6 +448,23 @@ export async function backfillTrader(proxyWallet: string): Promise<void> {
     });
   } catch (err: any) {
     log.error(`Backfill failed: ${err.message}`);
+
+    // Refresh failure: revert to COMPLETED, keep existing data, clear lock.
+    // Bump backfillCompleted to now so this trader moves to the back of the
+    // refresh queue — prevents infinite retry on persistently failing traders.
+    if (options?.isRefresh) {
+      await prisma.trader.update({
+        where: { proxyWallet },
+        data: {
+          backfillStatus: 'COMPLETED',
+          backfillLockedAt: null,
+          backfillCompleted: new Date(),
+          backfillError: `Refresh failed: ${err.message?.slice(0, 480)}`,
+        },
+      });
+      log.warn('Refresh failed, reverted to COMPLETED (cooldown until next refresh window)');
+      return;
+    }
 
     const status = err.response?.status;
     const isClientError = status && status !== 429 && status >= 400 && status < 500;

@@ -10,23 +10,28 @@ const log = createJobLogger(JOB_NAME);
 const BATCH_SIZE = 10;
 const TRADER_CONCURRENCY = 3;
 
-async function runCycle(): Promise<number> {
-  const wallets = await claimTradersForBackfill(BATCH_SIZE);
+async function runCycle(): Promise<{ total: number; refreshCount: number }> {
+  const claimed = await claimTradersForBackfill(
+    BATCH_SIZE,
+    config.BACKFILL_REFRESH_BATCH_SIZE,
+  );
 
-  if (wallets.length === 0) {
-    log.debug('No traders pending backfill');
-    return 0;
+  if (claimed.length === 0) {
+    log.debug('No traders pending backfill or refresh');
+    return { total: 0, refreshCount: 0 };
   }
 
-  log.info(`Processing ${wallets.length} traders (concurrency: ${TRADER_CONCURRENCY})`);
+  const refreshCount = claimed.filter(c => c.isRefresh).length;
+  const newCount = claimed.length - refreshCount;
+  log.info(`Processing ${claimed.length} traders (${newCount} new, ${refreshCount} refresh, concurrency: ${TRADER_CONCURRENCY})`);
 
   // Process traders with bounded concurrency
   let failed = 0;
-  for (let i = 0; i < wallets.length; i += TRADER_CONCURRENCY) {
+  for (let i = 0; i < claimed.length; i += TRADER_CONCURRENCY) {
     if (isShuttingDown()) break;
-    const chunk = wallets.slice(i, i + TRADER_CONCURRENCY);
+    const chunk = claimed.slice(i, i + TRADER_CONCURRENCY);
     const results = await Promise.allSettled(
-      chunk.map((wallet) => backfillTrader(wallet))
+      chunk.map((c) => backfillTrader(c.proxyWallet, { isRefresh: c.isRefresh }))
     );
     for (const r of results) {
       if (r.status === 'rejected') {
@@ -37,10 +42,10 @@ async function runCycle(): Promise<number> {
   }
 
   if (failed > 0) {
-    log.warn(`${failed}/${wallets.length} traders failed in this cycle`);
+    log.warn(`${failed}/${claimed.length} traders failed in this cycle`);
   }
 
-  return wallets.length;
+  return { total: claimed.length, refreshCount };
 }
 
 async function main() {
@@ -50,11 +55,13 @@ async function main() {
     pollInterval: config.BACKFILL_POLL_INTERVAL_MS,
     batchSize: BATCH_SIZE,
     concurrency: TRADER_CONCURRENCY,
+    refreshAfterMs: config.BACKFILL_REFRESH_AFTER_MS,
+    refreshBatchSize: config.BACKFILL_REFRESH_BATCH_SIZE,
   });
 
   while (!isShuttingDown()) {
     const start = Date.now();
-    let processedCount = 0;
+    let processedCount = { total: 0, refreshCount: 0 };
     let result = 'success';
     let errorMessage: string | undefined;
 
@@ -76,25 +83,25 @@ async function main() {
           lastRunAt: new Date(),
           lastRunDuration: duration,
           lastRunResult: result,
-          processedCount,
+          processedCount: processedCount.total,
           errorMessage: errorMessage ?? null,
         },
         update: {
           lastRunAt: new Date(),
           lastRunDuration: duration,
           lastRunResult: result,
-          processedCount,
+          processedCount: processedCount.total,
           errorMessage: errorMessage ?? null,
         },
       });
     } catch {}
 
     if (!isShuttingDown()) {
-      if (processedCount > 0) {
-        // More work likely available, short delay then continue
+      if (processedCount.total > 0 && processedCount.total > processedCount.refreshCount) {
+        // New backfills processed — more likely available, short delay
         await new Promise((resolve) => setTimeout(resolve, 2000));
       } else {
-        // No work found, use full poll interval
+        // Refresh-only or no work — use full poll interval to avoid API churn
         await new Promise((resolve) => setTimeout(resolve, config.BACKFILL_POLL_INTERVAL_MS));
       }
     }
