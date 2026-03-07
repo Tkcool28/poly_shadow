@@ -176,10 +176,6 @@ async function main() {
 
   // Start bot detector
   botDetector = new ScalpBotDetector();
-  // Register our own wallets to avoid self-detection in live mode
-  if (config.FUNDER_ADDRESS) botDetector.addOwnWallet(config.FUNDER_ADDRESS);
-  if (config.SCALP_FUNDER_ADDRESS) botDetector.addOwnWallet(config.SCALP_FUNDER_ADDRESS);
-  if (config.ARB_FUNDER_ADDRESS) botDetector.addOwnWallet(config.ARB_FUNDER_ADDRESS);
   botDetector.updateTokens(getAllEsportsTokenIds());
   botDetector.on('botSignal', (signal) => {
     engine.onBotSignal(signal).catch((err: any) =>

@@ -172,6 +172,11 @@ export async function discoverMarkets(): Promise<number> {
 
   // Mark stale markets inactive
   const staleCount = await markStaleMarkets();
+  if (staleCount > 0) {
+    // Rebuild caches from DB to remove stale token IDs
+    await loadMarketsIntoCache();
+    log.info('Rebuilt caches after stale deactivation', { staleCount });
+  }
 
   const elapsed = Date.now() - startTime;
   log.info('Market discovery complete', {

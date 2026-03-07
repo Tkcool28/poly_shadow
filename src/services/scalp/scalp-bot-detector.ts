@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import { createJobLogger } from '../../lib/logger';
-import { RtdsTradeStream, type RtdsTradePayload } from '../ws-trade-stream';
+import { ClobMarketStream, type ClobTradeEvent } from '../clob-market-stream';
 import { getMarketByTokenId } from './scalp-market-discovery';
 import type { BotSignal } from './scalp-types';
 
@@ -20,30 +20,40 @@ interface TradeCluster {
 }
 
 export class ScalpBotDetector extends EventEmitter {
-  private stream: RtdsTradeStream;
+  private stream: ClobMarketStream;
   private esportsTokens: Set<string> = new Set();
   private clusters: Map<string, TradeCluster> = new Map();
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
-  private ownWallets: Set<string> = new Set(); // our proxy wallets to ignore
+  private ownTxHashes: Set<string> = new Set(); // our tx hashes to ignore
+  private tradesReceived = 0;
+  private tradesMatchedEsports = 0;
+  private lastStatsLogAt = 0;
 
   constructor() {
     super();
-    this.stream = new RtdsTradeStream(this.onTrade.bind(this));
+    this.stream = new ClobMarketStream(this.onTrade.bind(this));
   }
 
   /**
    * Update the set of esports token IDs to monitor.
+   * Also updates the CLOB WebSocket subscription.
    */
   updateTokens(tokenIds: Set<string>): void {
     this.esportsTokens = tokenIds;
+    this.stream.setTokenIds([...tokenIds]);
     log.info('Bot detector tokens updated', { count: tokenIds.size });
   }
 
   /**
-   * Add our own proxy wallet addresses so we can ignore our own trades.
+   * Register a transaction hash as our own so we can ignore it.
    */
-  addOwnWallet(wallet: string): void {
-    this.ownWallets.add(wallet.toLowerCase());
+  addOwnTxHash(txHash: string): void {
+    this.ownTxHashes.add(txHash.toLowerCase());
+    // Prevent unbounded growth: cap at 1000 entries
+    if (this.ownTxHashes.size > 1000) {
+      const toDelete = [...this.ownTxHashes].slice(0, 500);
+      for (const h of toDelete) this.ownTxHashes.delete(h);
+    }
   }
 
   start(): void {
@@ -67,36 +77,41 @@ export class ScalpBotDetector extends EventEmitter {
     return this.stream.state === 'connected';
   }
 
-  private onTrade(payload: RtdsTradePayload): void {
-    // Only care about esports tokens
-    if (!this.esportsTokens.has(payload.asset)) return;
+  private onTrade(event: ClobTradeEvent): void {
+    this.tradesReceived++;
 
-    // Ignore our own trades
-    if (this.ownWallets.has(payload.proxyWallet.toLowerCase())) return;
+    // CLOB market stream delivers all events for subscribed tokens;
+    // double-check against our esports set for safety
+    if (!this.esportsTokens.has(event.asset_id)) return;
+
+    this.tradesMatchedEsports++;
+
+    // Ignore our own trades by tx hash
+    if (event.transaction_hash && this.ownTxHashes.has(event.transaction_hash.toLowerCase())) return;
 
     // Only track BUYs
-    if (payload.side !== 'BUY') return;
+    if (event.side !== 'BUY') return;
 
-    const size = parseFloat(payload.size);
-    const price = parseFloat(payload.price);
+    const size = parseFloat(event.size);
+    const price = parseFloat(event.price);
     if (!size || !price || isNaN(size) || isNaN(price) || size <= 0 || price <= 0) return;
 
     const usdValue = size * price;
     const now = Date.now();
 
     // Get or create cluster for this tokenId
-    let cluster = this.clusters.get(payload.asset);
+    let cluster = this.clusters.get(event.asset_id);
     if (!cluster || now - cluster.firstTradeAt > CLUSTER_WINDOW_MS) {
       // Start new cluster
       cluster = {
-        tokenId: payload.asset,
+        tokenId: event.asset_id,
         buys: [],
         firstTradeAt: now,
         totalBuyUsd: 0,
         minPrice: price,
         maxPrice: price,
       };
-      this.clusters.set(payload.asset, cluster);
+      this.clusters.set(event.asset_id, cluster);
     }
 
     cluster.buys.push({ price, size, timestamp: now });
@@ -105,7 +120,7 @@ export class ScalpBotDetector extends EventEmitter {
     cluster.maxPrice = Math.max(cluster.maxPrice, price);
 
     // Check signal conditions
-    const market = getMarketByTokenId(payload.asset);
+    const market = getMarketByTokenId(event.asset_id);
     const liquidity = market?.liquidity ?? 10_000;
     const threshold = Math.max(DEFAULT_MIN_CLUSTER_USD, liquidity * 0.0005);
 
@@ -122,7 +137,7 @@ export class ScalpBotDetector extends EventEmitter {
         cluster.totalBuyUsd >= threshold * 10 ? 'HIGH' : 'MEDIUM';
 
       const signal: BotSignal = {
-        tokenId: payload.asset,
+        tokenId: event.asset_id,
         side: 'BUY',
         avgPrice,
         totalUsd: cluster.totalBuyUsd,
@@ -132,7 +147,7 @@ export class ScalpBotDetector extends EventEmitter {
       };
 
       log.info('Bot signal detected', {
-        tokenId: payload.asset.slice(0, 20) + '...',
+        tokenId: event.asset_id.slice(0, 20) + '...',
         totalUsd: signal.totalUsd.toFixed(2),
         tradeCount: signal.tradeCount,
         avgPrice: signal.avgPrice.toFixed(4),
@@ -142,7 +157,7 @@ export class ScalpBotDetector extends EventEmitter {
       this.emit('botSignal', signal);
 
       // Reset cluster after emitting signal (prevent duplicate signals)
-      this.clusters.delete(payload.asset);
+      this.clusters.delete(event.asset_id);
     }
   }
 
@@ -152,6 +167,20 @@ export class ScalpBotDetector extends EventEmitter {
       if (now - cluster.firstTradeAt > CLUSTER_WINDOW_MS * 2) {
         this.clusters.delete(tokenId);
       }
+    }
+
+    // Periodic trade stats (every ~60s)
+    if (now - this.lastStatsLogAt >= 60_000) {
+      log.info('Bot detector stats', {
+        tradesReceived: this.tradesReceived,
+        tradesMatchedEsports: this.tradesMatchedEsports,
+        activeClusters: this.clusters.size,
+        watchedTokens: this.esportsTokens.size,
+        streamState: this.stream.state,
+        streamMessages: this.stream.messagesReceived,
+        streamTrades: this.stream.tradesReceived,
+      });
+      this.lastStatsLogAt = now;
     }
   }
 }
