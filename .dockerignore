@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+logs/
+*.log
+.git/
+.github/
+.claude/
+prisma/generated/
+src/scripts/backtest-cache/

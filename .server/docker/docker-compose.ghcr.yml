@@ -1,0 +1,204 @@
+# =============================================================================
+# Polymarket Copy Trade — Production Docker Compose (GHCR Images)
+# =============================================================================
+# Usage:
+#   IMAGE_TAG=latest docker compose -f docker-compose.ghcr.yml up -d
+#
+# Optional profiles:
+#   IMAGE_TAG=latest docker compose -f docker-compose.ghcr.yml --profile arb --profile scalp up -d
+#
+# Secrets (in ./secrets/ directory):
+#   - env.txt         (all env vars, one per line: KEY=value)
+#   - pg_password.txt (PostgreSQL password, single line)
+
+x-worker-base: &worker-base
+  image: ghcr.io/${GITHUB_REPOSITORY_OWNER:-mantotan}/polymarket-copy-trade:${IMAGE_TAG:-latest}
+  restart: unless-stopped
+  env_file:
+    - ./secrets/env.txt
+  environment:
+    NODE_ENV: production
+  volumes:
+    - polymarket_logs:/app/logs
+  networks:
+    - polymarket-network
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+
+services:
+  # ===========================================================================
+  # Infrastructure
+  # ===========================================================================
+
+  polymarket_postgres:
+    image: postgres:16-alpine
+    container_name: polymarket_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: polymarket
+      POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
+      POSTGRES_DB: polymarket_copytrade
+    volumes:
+      - polymarket_pgdata:/var/lib/postgresql/data
+      - ./secrets/pg_password.txt:/run/secrets/pg_password:ro
+    ports:
+      - "127.0.0.1:5438:5432"
+    networks:
+      - polymarket-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polymarket -d polymarket_copytrade"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # ===========================================================================
+  # Database Migrations (one-shot)
+  # ===========================================================================
+
+  migrate:
+    <<: *worker-base
+    container_name: polymarket_migrate
+    restart: "no"
+    entrypoint: ["sh", "-c"]
+    command: ["npx prisma migrate deploy && echo 'Migrations complete'"]
+    depends_on:
+      polymarket_postgres:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Daemon Workers
+  # ===========================================================================
+
+  copy-trader:
+    <<: *worker-base
+    container_name: polymarket_copy_trader
+    command: ["src/jobs/copy-trader.ts"]
+    stop_grace_period: 45s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  trade-monitor:
+    <<: *worker-base
+    container_name: polymarket_trade_monitor
+    command: ["src/jobs/trade-monitor.ts"]
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  history-backfiller:
+    <<: *worker-base
+    container_name: polymarket_history_backfiller
+    command: ["src/jobs/history-backfiller.ts"]
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: --max-old-space-size=8192
+    stop_grace_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 9G
+
+  # ===========================================================================
+  # Scheduled Workers (sleep-loop replicating PM2 cron_restart)
+  # Note: $$ in YAML = literal $ in shell (docker compose escaping).
+  # ===========================================================================
+
+  leaderboard-scanner:
+    <<: *worker-base
+    container_name: polymarket_leaderboard_scanner
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        while true; do
+          node --import tsx src/jobs/leaderboard-scanner.ts
+          EXIT_CODE=$$?
+          if [ $$EXIT_CODE -ne 0 ]; then
+            echo "leaderboard-scanner failed (exit $$EXIT_CODE), retrying in 5m..."
+            sleep 300
+          else
+            echo "leaderboard-scanner complete, sleeping 12h..."
+            sleep 43200
+          fi
+        done
+    stop_grace_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  score-calculator:
+    <<: *worker-base
+    container_name: polymarket_score_calculator
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        while true; do
+          node --import tsx src/jobs/score-calculator.ts
+          EXIT_CODE=$$?
+          if [ $$EXIT_CODE -ne 0 ]; then
+            echo "score-calculator failed (exit $$EXIT_CODE), retrying in 5m..."
+            sleep 300
+          else
+            echo "score-calculator complete, sleeping 6h..."
+            sleep 21600
+          fi
+        done
+    stop_grace_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ===========================================================================
+  # Optional Workers (activate via --profile arb / --profile scalp)
+  # ===========================================================================
+
+  arb-worker:
+    <<: *worker-base
+    container_name: polymarket_arb_worker
+    command: ["src/jobs/arb-worker.ts"]
+    stop_grace_period: 45s
+    profiles:
+      - arb
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  scalp-worker:
+    <<: *worker-base
+    container_name: polymarket_scalp_worker
+    command: ["src/jobs/scalp-worker.ts"]
+    stop_grace_period: 45s
+    profiles:
+      - scalp
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+# =============================================================================
+# Volumes
+# =============================================================================
+volumes:
+  polymarket_pgdata:
+    driver: local
+  polymarket_logs:
+    driver: local
+
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  polymarket-network:
+    driver: bridge
