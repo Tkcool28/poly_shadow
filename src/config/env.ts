@@ -190,6 +190,55 @@ const envSchema = z.object({
   ARB_CLOB_API_PASSPHRASE: z.string().optional(),
   ARB_FUNDER_ADDRESS: z.string().optional(),
   ARB_SIGNATURE_TYPE: z.coerce.number().default(2),
+
+  // ─── Scalp Worker (in-play esports/tennis trading) ───
+  SCALP_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+  SCALP_IS_PAPER: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+  SCALP_INITIAL_CAPITAL_USD: z.coerce.number().min(5).default(100),
+  SCALP_POSITION_SIZE_USD: z.coerce.number().min(5).max(50000).default(5),
+  SCALP_MAX_DAILY_LOSS_USD: z.coerce.number().min(1).default(30),
+  SCALP_MIN_EDGE_CENTS: z.coerce.number().min(1).default(5),
+  SCALP_STOP_LOSS_CENTS: z.coerce.number().min(1).default(15),
+
+  // Scalp exit
+  SCALP_CONVERGENCE_SELL_TIMEOUT_MS: z.coerce.number().default(120000),       // 2 min
+  SCALP_CONVERGENCE_SELL_DISCOUNT_CENTS: z.coerce.number().default(3),
+  SCALP_SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(30000),       // 30s
+  SCALP_ORDER_POLL_INTERVAL_MS: z.coerce.number().default(5000),              // 5s
+  SCALP_STOP_LOSS_COOLDOWN_MS: z.coerce.number().default(60000),              // 60s
+  SCALP_SETTLEMENT_TIMEOUT_MS: z.coerce.number().default(86400000),           // 24hr fail-safe
+
+  // Scalp market discovery
+  SCALP_MARKET_DISCOVERY_INTERVAL_MS: z.coerce.number().default(300000),      // 5 min
+  SCALP_GAMES: z.string().default('cs2,dota2'),
+
+  // Scalp data feeds
+  SCALP_STEAM_API_KEY: z.string().default(''),
+  SCALP_DOTA2_POLL_INTERVAL_MS: z.coerce.number().default(5000),
+  SCALP_CS2_ENABLED: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+  SCALP_HLTV_RECONNECT_MAX_MS: z.coerce.number().default(30000),
+
+  // Scalp paper trading (separate from copy-trade paper config)
+  SCALP_PAPER_FEE_RATE: z.coerce.number().default(0.0175),      // Sports market fee rate
+  SCALP_PAPER_FEE_EXPONENT: z.coerce.number().default(1),        // Linear fee scaling
+  SCALP_PAPER_SLIPPAGE_FRACTION: z.coerce.number().default(0.05),
+
+  // Scalp CLOB credentials (falls back to ARB_* if not set)
+  SCALP_PRIVATE_KEY: z.string().optional(),
+  SCALP_CLOB_API_KEY: z.string().optional(),
+  SCALP_CLOB_API_SECRET: z.string().optional(),
+  SCALP_CLOB_API_PASSPHRASE: z.string().optional(),
+  SCALP_FUNDER_ADDRESS: z.string().optional(),
+  SCALP_SIGNATURE_TYPE: z.coerce.number().default(2),
 });
 
 const parsed = envSchema.safeParse(process.env);

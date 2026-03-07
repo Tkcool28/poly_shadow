@@ -71,5 +71,17 @@ module.exports = {
         NODE_ENV: 'production',
       },
     },
+    {
+      name: 'scalp-worker',
+      script: './node_modules/.bin/tsx',
+      args: 'src/jobs/scalp-worker.ts',
+      autorestart: true,
+      watch: false,
+      max_restarts: 50,
+      exp_backoff_restart_delay: 1000,
+      env: {
+        NODE_ENV: 'production',
+      },
+    },
   ],
 };

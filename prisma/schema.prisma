@@ -516,3 +516,103 @@ model SystemHealth {
 
   updatedAt DateTime @updatedAt
 }
+
+// ─── Scalp Worker (in-play esports/tennis trading) ───
+
+enum ScalpCycleStatus {
+  ENTERED
+  SOLD
+  SETTLED_WON
+  SETTLED_LOST
+  SKIPPED
+  FAILED
+  CANCELLED
+}
+
+model ScalpCycle {
+  id               String   @id @default(cuid())
+  game             String   // "cs2" | "dota2" | "lol" | "val" | "atp" | "wta"
+  matchId          String   // external match ID from game API or bot-signal
+  slug             String   // Polymarket market slug
+  conditionId      String?
+  marketQuestion   String?
+  outcomeLabel     String?  // "MOUZ", "Astralis", etc.
+  tokenId          String?
+  eventType        String   // "map_win" | "series_end" | "bot_signal"
+  eventSequence    Int      @default(0) // map number (1, 2, 3) or 0 for series_end
+  eventDetail      String?  // JSON: series score, map score, etc.
+  signalSource     String?  // "bot" | "game_api" | "both"
+  signalConfidence String?  // "LOW" | "MEDIUM" | "HIGH"
+
+  // Entry
+  entryPrice       Float?
+  entryShares      Float?
+  entryAmountUsd   Float?
+  entryOrderId     String?
+  entryOrderType   String?  // "FAK" | "GTC"
+  entryLatencyMs   Int?     // event-detected → order-placed
+
+  // Exit
+  exitPrice        Float?
+  exitShares       Float?
+  exitOrderId      String?
+  exitMethod       String?  // "convergence_sell" | "settlement" | "stop_loss"
+
+  // P&L
+  pnl              Float?
+  estimatedEdge    Float?   // expected edge at entry time
+
+  status           ScalpCycleStatus @default(ENTERED)
+  failReason       String?
+  isPaper          Boolean  @default(true)
+  enteredAt        DateTime?
+  exitedAt         DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([matchId, game, tokenId, eventType, eventSequence, isPaper])
+  @@index([status])
+  @@index([isPaper, status])
+}
+
+model ScalpCapital {
+  id              String   @id @default(cuid())
+  initialCapital  Float
+  currentCapital  Float
+  deployedCapital Float    @default(0)
+  isPaper         Boolean  @default(true)
+  totalPnl        Float    @default(0)
+  totalCycles     Int      @default(0)
+  totalWins       Int      @default(0)
+  dailyLossUsd    Float    @default(0)
+  dailyLossResetAt DateTime @default(now())
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([isPaper])
+}
+
+model ScalpMarketWatch {
+  id              String    @id @default(cuid())
+  game            String    // "cs2" | "dota2" | "lol" | "val" | "atp" | "wta"
+  slug            String    @unique
+  conditionId     String
+  question        String
+  outcomes        String    // JSON: ["MOUZ", "Astralis"]
+  clobTokenIds    String    // JSON: ["token1", "token2"]
+  negRisk         Boolean   @default(false)
+  tickSize        Float     @default(0.01)
+  orderMinSize    Float     @default(5)
+  liquidity       Float?
+  eventSlug       String?
+  endDate         DateTime?
+  isActive        Boolean   @default(true)
+  marketType      String    @default("series") // "series" | "map" | "handicap" | "total"
+  homeTeam        String?   // normalized: trimmed, lowercase
+  awayTeam        String?   // normalized: trimmed, lowercase
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([game, isActive, marketType])
+  @@index([homeTeam, awayTeam])
+}

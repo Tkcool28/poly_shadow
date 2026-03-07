@@ -148,6 +148,10 @@ export const GammaMarketSchema = z.object({
   icon: z.string().nullable().optional(),
   eventSlug: z.string().nullable().optional(),
   negRisk: z.boolean().optional(),
+  // Scalp worker fields (flow through .passthrough() but now typed)
+  clobTokenIds: z.string().nullable().optional(),       // JSON: '["token1","token2"]'
+  orderMinSize: z.coerce.number().nullable().optional(), // $5 for sports markets
+  minimumTickSize: z.coerce.number().nullable().optional(), // 0.01 for series, 0.001 for maps
 }).passthrough();
 
 export type GammaMarketData = z.infer<typeof GammaMarketSchema>;

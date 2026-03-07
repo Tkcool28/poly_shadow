@@ -41,6 +41,26 @@ export async function getMarketBySlug(slug: string): Promise<GammaMarketData | n
 }
 
 /**
+ * Paginate all active (non-closed) markets from the Gamma API.
+ * Uses the existing Bottleneck-wrapped `gammaApi` client for rate limiting.
+ */
+export async function getActiveMarkets(params: {
+  limit?: number;
+  offset?: number;
+  active?: boolean;
+  closed?: boolean;
+}): Promise<GammaMarketData[]> {
+  const raw = await gammaApi.get<unknown[]>('/markets', {
+    limit: params.limit ?? 100,
+    offset: params.offset ?? 0,
+    active: params.active ?? true,
+    closed: params.closed ?? false,
+  });
+  if (!Array.isArray(raw)) return [];
+  return safeParseArray(GammaMarketSchema, raw, 'gamma-active-markets');
+}
+
+/**
  * Fetch markets by condition IDs. The Gamma API only supports single
  * condition_ids lookups, so we query one at a time. All lookups are
  * submitted concurrently — Bottleneck's maxConcurrent (5) and reservoir
