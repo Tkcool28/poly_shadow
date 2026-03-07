@@ -143,7 +143,7 @@ services:
     command:
       - |
         while true; do
-          node --import tsx src/jobs/score-calculator.ts
+          node --max-old-space-size=1024 --import tsx src/jobs/score-calculator.ts
           EXIT_CODE=$$?
           if [ $$EXIT_CODE -ne 0 ]; then
             echo "score-calculator failed (exit $$EXIT_CODE), retrying in 5m..."
@@ -157,7 +157,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 1280M
 
   # ===========================================================================
   # Optional Workers (activate via --profile arb / --profile scalp)
