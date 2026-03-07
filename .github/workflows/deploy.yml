@@ -1,0 +1,45 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (latest or sha-xxxxx)"
+        required: false
+        default: "latest"
+        type: string
+      profiles:
+        description: "Comma-separated Docker Compose profiles (e.g. arb,scalp)"
+        required: false
+        default: ""
+        type: string
+      skip_migrations:
+        description: "Skip database migrations (emergency only)"
+        required: false
+        default: false
+        type: boolean
+      skip_backup:
+        description: "Skip database backup (emergency only)"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: deploy-production-v1
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_OWNER: ${{ github.repository_owner }}
+
+jobs:
+  deploy:
+    name: Deploy to production
+    runs-on: [self-hosted, polymarket-copytrade]
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Test
+        run: echo "Deploy inputs - tag=${{ inputs.image_tag }} profiles=${{ inputs.profiles }}"
