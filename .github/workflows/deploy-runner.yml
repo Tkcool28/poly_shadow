@@ -1,4 +1,4 @@
-name: Deploy to Production (Self-Hosted Runner)
+name: Deploy to Production
 
 # Manual deployment workflow using self-hosted runner.
 # Dedicated infrastructure (all containers managed by this stack):
