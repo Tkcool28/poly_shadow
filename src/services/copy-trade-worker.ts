@@ -147,8 +147,11 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     }
     copyAmountUsd = sellShares * trade.price;
   } else {
-    // Guard: negative or zero capital means no buying power — skip silently
-    if (allocation.currentCapital <= 0) return;
+    // Guard: negative or zero capital means no buying power
+    if (allocation.currentCapital <= 0) {
+      await createSkippedRecord(trade, 'insufficient allocated capital (zero balance)', allocation.id, isPaper);
+      return;
+    }
 
     traderTradeUsd = trade.size * trade.price;
 

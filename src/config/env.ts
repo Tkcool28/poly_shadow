@@ -73,9 +73,12 @@ const envSchema = z.object({
   MIN_SIGNAL_TRADE_USD: z.coerce.number().min(0).default(0), // Skip BUY trades where trader's USD < this (0 = disabled)
 
   // Hedge guard: block low-probability BUY trades unless opposite outcome has sufficient position
-  HEDGE_PRICE_THRESHOLD: z.coerce.number().min(0).max(0.20).default(0.05),  // ≤5¢ = potential hedge
+  HEDGE_PRICE_THRESHOLD: z.coerce.number().min(0).max(0.20).default(0.099),  // ≤9.9¢ = potential hedge
   HEDGE_MIN_OPPOSITE_USD: z.coerce.number().min(0).max(1000).default(5),     // need ≥$5 on opposite side
   HEDGE_MAX_RATIO: z.coerce.number().min(0).max(1.0).default(0.20),         // max 20% of opposite (5:1)
+
+  // Fallback poll interval for copy-trader when pg LISTEN is active
+  COPY_TRADE_FALLBACK_POLL_MS: z.coerce.number().min(1000).default(7000), // 7s safety net
 
   // Anti-cycle: per-token cool-down after a SELL fill to prevent market-making spread loss
   TOKEN_SELL_COOLDOWN_MS: z.coerce.number().min(0).default(60000), // 60s — 0 = disabled
