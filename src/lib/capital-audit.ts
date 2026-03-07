@@ -29,10 +29,13 @@ export interface AllocationAudit {
 /**
  * Audit a single allocation by replaying trade history to compute expected capital.
  *
- * Capital flow:
- *   BUY fill:    cc -= min(cost, cc);  dc += min(cost, cc)
- *   SELL fill:   cc += proceeds;       dc -= min(costBasis, dc)  [per-token avg cost]
- *   Settlement:  cc += settlementValue; dc -= min(costBasis, dc)  [per-token avg cost]
+ * Capital flow (event-based replay):
+ *   BUY event  (at createdAt):  cc -= min(cost, cc);  dc += min(cost, cc)
+ *   SELL event (at createdAt):  cc += proceeds;        dc -= min(costBasis, dc)
+ *   SETTLEMENT (at settledAt):  cc += settlementValue;  dc -= min(costBasis, dc)
+ *
+ * SETTLED BUYs are split into two events so that cc accurately drops between
+ * BUY execution and settlement — matching the real system's capital pressure.
  */
 export async function auditAllocation(allocationId: string): Promise<AllocationAudit> {
   const allocation = await prisma.followAllocation.findUniqueOrThrow({
@@ -57,9 +60,34 @@ export async function auditAllocation(allocationId: string): Promise<AllocationA
       settlementValue: true,
       settlementPnl: true,
       failReason: true,
+      createdAt: true,
+      settledAt: true,
     },
     orderBy: { createdAt: 'asc' },
   });
+
+  // Build event list: SETTLED BUYs produce two events (BUY deduction + settlement credit)
+  // so that cc accurately drops between execution and settlement.
+  type AuditEvent = { type: 'BUY' | 'SELL' | 'SETTLEMENT'; timestamp: Date; trade: typeof trades[number] };
+  const events: AuditEvent[] = [];
+
+  for (const trade of trades) {
+    events.push({
+      type: trade.side as 'BUY' | 'SELL',
+      timestamp: trade.createdAt,
+      trade,
+    });
+
+    if (trade.status === 'SETTLED' && trade.side === 'BUY') {
+      events.push({
+        type: 'SETTLEMENT',
+        timestamp: trade.settledAt ?? trade.createdAt, // fallback for legacy trades without settledAt
+        trade,
+      });
+    }
+  }
+
+  events.sort((a, b) => a.timestamp.getTime() - b.timestamp.getTime());
 
   let cc = allocation.initialCapital;
   let dc = 0;
@@ -67,12 +95,13 @@ export async function auditAllocation(allocationId: string): Promise<AllocationA
   // Per-token cost accumulators for average cost method
   const tokenCost = new Map<string, { buyCost: number; buyShares: number }>();
 
-  for (const trade of trades) {
+  for (const event of events) {
+    const { trade } = event;
     const usd = (trade.filledSize != null && trade.filledPrice != null)
       ? trade.filledSize * trade.filledPrice
       : trade.requestedAmount;
 
-    if (trade.side === 'BUY') {
+    if (event.type === 'BUY') {
       const shares = estimateShares(trade.filledSize, trade.filledPrice, trade.requestedAmount);
       const prev = tokenCost.get(trade.tokenId) ?? { buyCost: 0, buyShares: 0 };
       tokenCost.set(trade.tokenId, {
@@ -84,19 +113,17 @@ export async function auditAllocation(allocationId: string): Promise<AllocationA
       const deducted = Math.min(usd, Math.max(cc, 0));
       cc -= deducted;
       dc += deducted;
-    } else {
+    } else if (event.type === 'SELL') {
       // SELL: use per-token avg cost for deployedCapital release
       const soldShares = estimateShares(trade.filledSize, trade.filledPrice, trade.requestedAmount);
       const tok = tokenCost.get(trade.tokenId);
       const avgCost = (tok && tok.buyShares > 0) ? tok.buyCost / tok.buyShares : 0;
       const costBasis = avgCost * soldShares;
 
-      cc += usd;                          // proceeds (unchanged)
-      dc -= Math.min(costBasis, dc);       // cost basis (FIX)
-    }
-
-    // Settlement: credit settlement value, release deployed capital using per-token cost basis
-    if (trade.status === 'SETTLED' && trade.side === 'BUY') {
+      cc += usd;
+      dc -= Math.min(costBasis, dc);
+    } else {
+      // SETTLEMENT: credit settlement value, release deployed capital
       let settleValue = trade.settlementValue;
 
       // Fallback: parse from failReason if new fields not populated

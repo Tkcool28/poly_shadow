@@ -96,9 +96,10 @@ async function main() {
   let drainScheduled = false;
   let drainRunning = false;
 
-  function scheduleDrain() {
+  function scheduleDrain(source?: string) {
     if (drainScheduled || drainRunning) return;
     drainScheduled = true;
+    log.debug(`Drain scheduled (${source ?? 'unknown'})`);
     setImmediate(runDrain);
   }
 
@@ -185,14 +186,14 @@ async function main() {
   }
 
   // Connect pg LISTEN for instant wake on DetectedTrade INSERT
-  const listener = new PgListener('detected_trade_inserted', () => scheduleDrain());
+  const listener = new PgListener('detected_trade_inserted', () => scheduleDrain('pg-notify'));
   await listener.connect();
 
   // Fallback poll: safety net if LISTEN connection drops
-  const fallbackTimer = setInterval(scheduleDrain, config.COPY_TRADE_FALLBACK_POLL_MS);
+  const fallbackTimer = setInterval(() => scheduleDrain('fallback-poll'), config.COPY_TRADE_FALLBACK_POLL_MS);
 
   // Initial drain on startup (recover unprocessed trades from downtime)
-  scheduleDrain();
+  scheduleDrain('startup');
 
   // ─── Independent housekeeping timers ───
   // These run on their own schedules, never blocking trade processing.
