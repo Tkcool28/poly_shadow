@@ -40,6 +40,321 @@ jobs:
     permissions:
       contents: read
       packages: read
+
     steps:
-      - name: Test
-        run: echo "Deploy inputs - tag=${{ inputs.image_tag }} profiles=${{ inputs.profiles }}"
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up environment
+        run: |
+          echo "Setting up deployment environment..."
+          DEPLOY_DIR="$HOME/polymarket-copytrade"
+          echo "DEPLOY_DIR=$DEPLOY_DIR" >> $GITHUB_ENV
+          DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"
+          if [ -S "${DOCKER_HOST#unix://}" ]; then
+            echo "DOCKER_HOST=$DOCKER_HOST" >> $GITHUB_ENV
+            echo "Using rootless Docker socket"
+          else
+            echo "Rootless Docker socket not found, using default"
+          fi
+          echo "DEPLOY_DIR=$DEPLOY_DIR"
+
+      - name: Verify Docker access
+        run: |
+          echo "Checking Docker..."
+          docker --version
+          docker compose version
+          docker ps
+          echo "Docker accessible"
+
+      - name: Login to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          echo "GHCR login successful"
+
+      - name: Validate image exists
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/polymarket-copy-trade:${{ inputs.image_tag }}"
+          echo "Validating image: $IMAGE"
+          if ! docker manifest inspect "$IMAGE" >/dev/null 2>&1; then
+            echo "Image not found: $IMAGE"
+            exit 1
+          fi
+          echo "Image validated: $IMAGE"
+
+      - name: Sync deployment files
+        run: |
+          echo "=== Syncing deployment files ==="
+          mkdir -p ${{ env.DEPLOY_DIR }}
+          cp -v .server/docker/docker-compose.ghcr.yml ${{ env.DEPLOY_DIR }}/docker-compose.ghcr.yml
+          mkdir -p ${{ env.DEPLOY_DIR }}/prisma
+          rm -rf ${{ env.DEPLOY_DIR }}/prisma/migrations
+          cp -rv prisma/schema.prisma ${{ env.DEPLOY_DIR }}/prisma/
+          cp -rv prisma/migrations ${{ env.DEPLOY_DIR }}/prisma/
+          cp -v prisma.config.ts ${{ env.DEPLOY_DIR }}/
+          cp -v package.json ${{ env.DEPLOY_DIR }}/
+          mkdir -p ${{ env.DEPLOY_DIR }}/.server/scripts
+          cp -v .server/scripts/health-check.sh ${{ env.DEPLOY_DIR }}/.server/scripts/
+          chmod +x ${{ env.DEPLOY_DIR }}/.server/scripts/health-check.sh
+          echo "File sync complete"
+
+      - name: Update systemd service files
+        run: |
+          echo "=== Updating systemd service files ==="
+          SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+          mkdir -p "$SYSTEMD_USER_DIR"
+          SERVICE_UPDATED=0
+          if ! cmp -s .server/systemd/polymarket-copytrade.service "$SYSTEMD_USER_DIR/polymarket-copytrade.service" 2>/dev/null; then
+            echo "Updating polymarket-copytrade.service..."
+            cp -v .server/systemd/polymarket-copytrade.service "$SYSTEMD_USER_DIR/"
+            SERVICE_UPDATED=1
+          else
+            echo "polymarket-copytrade.service unchanged"
+          fi
+          if [ $SERVICE_UPDATED -eq 1 ]; then
+            echo "Reloading systemd daemon..."
+            export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+            systemctl --user daemon-reload
+            echo "Systemd service updated and reloaded"
+          else
+            echo "No systemd service changes detected"
+          fi
+
+      - name: Setup secrets
+        run: |
+          echo "=== Setting up secrets ==="
+          SECRETS_DIR="${{ env.DEPLOY_DIR }}/secrets"
+          mkdir -p "$SECRETS_DIR"
+          echo -n '${{ secrets.ENV_FILE }}' > "$SECRETS_DIR/env.txt"
+          echo -n '${{ secrets.PG_PASSWORD }}' > "$SECRETS_DIR/pg_password.txt"
+          chmod 600 "$SECRETS_DIR"/*.txt
+          echo "Verifying secrets..."
+          for secret in env.txt pg_password.txt; do
+            if [ ! -s "$SECRETS_DIR/$secret" ]; then
+              echo "Required secret missing or empty: $secret"
+              exit 1
+            fi
+            SIZE=$(wc -c < "$SECRETS_DIR/$secret")
+            echo "$secret ($SIZE bytes)"
+          done
+          echo "Secrets setup complete"
+
+      - name: Pull latest image
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/polymarket-copy-trade:${{ inputs.image_tag }}"
+          echo "Pulling image: $IMAGE"
+          docker pull "$IMAGE"
+          echo "Image pulled successfully"
+
+      - name: Build profile flags
+        id: profiles
+        run: |
+          PROFILES="${{ inputs.profiles }}"
+          FLAGS=""
+          if [ -n "$PROFILES" ]; then
+            for p in $(echo "$PROFILES" | tr ',' ' '); do
+              FLAGS="$FLAGS --profile $p"
+            done
+          fi
+          echo "flags=$FLAGS" >> $GITHUB_OUTPUT
+          echo "Profile flags: $FLAGS"
+
+      - name: Start PostgreSQL
+        working-directory: ${{ env.DEPLOY_DIR }}
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          GITHUB_REPOSITORY_OWNER: ${{ env.IMAGE_OWNER }}
+        run: |
+          echo "=== Starting PostgreSQL ==="
+          docker compose -f docker-compose.ghcr.yml up -d polymarket_postgres
+          echo "Waiting for PostgreSQL to be healthy..."
+          MAX_ATTEMPTS=30
+          ATTEMPT=0
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            if docker compose -f docker-compose.ghcr.yml ps polymarket_postgres | grep -q "healthy"; then
+              echo "PostgreSQL is healthy"
+              break
+            fi
+            ATTEMPT=$((ATTEMPT + 1))
+            if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
+              echo "PostgreSQL failed to become healthy"
+              docker compose -f docker-compose.ghcr.yml logs polymarket_postgres
+              exit 1
+            fi
+            echo "Waiting... ($ATTEMPT/$MAX_ATTEMPTS)"
+            sleep 2
+          done
+
+      - name: Backup database
+        if: ${{ !inputs.skip_backup && !inputs.skip_migrations }}
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          echo "=== Backing up database ==="
+          BACKUP_DIR="${{ env.DEPLOY_DIR }}/backups"
+          mkdir -p "$BACKUP_DIR"
+          BACKUP_FILE="$BACKUP_DIR/pre-deploy-$(date +%Y%m%d-%H%M%S).sql"
+          docker exec polymarket_postgres pg_dump -U polymarket polymarket_copytrade > "$BACKUP_FILE" 2>/dev/null || true
+          if [ -s "$BACKUP_FILE" ]; then
+            gzip "$BACKUP_FILE"
+            echo "Database backed up to ${BACKUP_FILE}.gz"
+            ls -t "$BACKUP_DIR"/*.gz 2>/dev/null | tail -n +6 | xargs -r rm
+          else
+            echo "Backup file is empty (new database?)"
+            rm -f "$BACKUP_FILE"
+          fi
+
+      - name: Run database migrations
+        if: ${{ !inputs.skip_migrations }}
+        working-directory: ${{ env.DEPLOY_DIR }}
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          GITHUB_REPOSITORY_OWNER: ${{ env.IMAGE_OWNER }}
+        run: |
+          echo "=== Running Database Migrations ==="
+          docker compose -f docker-compose.ghcr.yml up migrate
+          MIGRATE_EXIT_CODE=$(docker inspect polymarket_migrate --format='{{.State.ExitCode}}' 2>/dev/null || echo "1")
+          if [ "$MIGRATE_EXIT_CODE" != "0" ]; then
+            echo "Migrations failed with exit code $MIGRATE_EXIT_CODE"
+            docker compose -f docker-compose.ghcr.yml logs migrate
+            exit 1
+          fi
+          echo "Migrations completed successfully"
+
+      - name: Skip migrations notice
+        if: ${{ inputs.skip_migrations }}
+        run: echo "WARNING - Skipping database migrations as requested"
+
+      - name: Backup current deployment
+        id: backup
+        working-directory: ${{ env.DEPLOY_DIR }}
+        run: |
+          CURRENT_TAG=$(docker inspect polymarket_copy_trader --format='{{.Config.Image}}' 2>/dev/null | cut -d':' -f2 || echo "none")
+          echo "previous_tag=$CURRENT_TAG" >> $GITHUB_OUTPUT
+          echo "Current image tag: $CURRENT_TAG"
+
+      - name: Stop existing worker containers
+        working-directory: ${{ env.DEPLOY_DIR }}
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          GITHUB_REPOSITORY_OWNER: ${{ env.IMAGE_OWNER }}
+        run: |
+          echo "Stopping existing workers..."
+          WORKERS="copy-trader trade-monitor history-backfiller leaderboard-scanner score-calculator"
+          for worker in $WORKERS; do
+            docker compose -f docker-compose.ghcr.yml stop --timeout 45 "$worker" 2>/dev/null || true
+            docker compose -f docker-compose.ghcr.yml rm -f "$worker" 2>/dev/null || true
+          done
+          for worker in arb-worker scalp-worker; do
+            docker compose -f docker-compose.ghcr.yml ${{ steps.profiles.outputs.flags }} stop --timeout 45 "$worker" 2>/dev/null || true
+            docker compose -f docker-compose.ghcr.yml ${{ steps.profiles.outputs.flags }} rm -f "$worker" 2>/dev/null || true
+          done
+          echo "Existing workers stopped"
+
+      - name: Start new worker containers
+        working-directory: ${{ env.DEPLOY_DIR }}
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          GITHUB_REPOSITORY_OWNER: ${{ env.IMAGE_OWNER }}
+        run: |
+          echo "Starting new workers..."
+          docker compose -f docker-compose.ghcr.yml ${{ steps.profiles.outputs.flags }} up -d \
+            copy-trader trade-monitor history-backfiller leaderboard-scanner score-calculator
+          PROFILES="${{ inputs.profiles }}"
+          if echo "$PROFILES" | grep -q "arb"; then
+            docker compose -f docker-compose.ghcr.yml --profile arb up -d arb-worker
+          fi
+          if echo "$PROFILES" | grep -q "scalp"; then
+            docker compose -f docker-compose.ghcr.yml --profile scalp up -d scalp-worker
+          fi
+          echo "Workers started"
+
+      - name: Verify deployment
+        working-directory: ${{ env.DEPLOY_DIR }}
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          GITHUB_REPOSITORY_OWNER: ${{ env.IMAGE_OWNER }}
+        run: |
+          echo "Waiting for containers to stabilize..."
+          sleep 30
+          echo "=== Deployment Verification ==="
+          if ! docker compose -f docker-compose.ghcr.yml ps polymarket_postgres | grep -q "Up"; then
+            echo "ERROR - PostgreSQL is not running"
+            exit 1
+          fi
+          echo "OK - PostgreSQL running"
+          CORE_WORKERS="copy-trader trade-monitor history-backfiller"
+          for worker in $CORE_WORKERS; do
+            if ! docker compose -f docker-compose.ghcr.yml ps "$worker" | grep -q "Up"; then
+              echo "ERROR - $worker is not running"
+              docker compose -f docker-compose.ghcr.yml logs --tail=30 "$worker"
+              exit 1
+            fi
+            echo "OK - $worker running"
+          done
+          for worker in leaderboard-scanner score-calculator; do
+            if ! docker compose -f docker-compose.ghcr.yml ps "$worker" | grep -q "Up"; then
+              echo "WARNING - $worker is not running"
+              docker compose -f docker-compose.ghcr.yml logs --tail=10 "$worker"
+            else
+              echo "OK - $worker running"
+            fi
+          done
+          echo ""
+          docker compose -f docker-compose.ghcr.yml ps
+          echo ""
+          echo "Deployment verification complete"
+
+      - name: Deployment summary
+        if: success()
+        run: |
+          echo "# Deployment Successful" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image Tag:** \`${{ inputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Profiles:** \`${{ inputs.profiles || 'none' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployed at:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup old images
+        if: success()
+        run: |
+          echo "Cleaning up old Docker images..."
+          docker image prune -f
+          docker images "ghcr.io/${{ env.IMAGE_OWNER }}/polymarket-copy-trade" --format "table {{.Repository}}:{{.Tag}}" | \
+            grep -v -E "(${{ inputs.image_tag }})" | \
+            tail -n +4 | xargs -r docker rmi || true
+          echo "Cleanup complete"
+
+      - name: Rollback on failure
+        if: failure()
+        working-directory: ${{ env.DEPLOY_DIR }}
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          GITHUB_REPOSITORY_OWNER: ${{ env.IMAGE_OWNER }}
+        run: |
+          echo "Deployment failed! Rolling back..."
+          PREVIOUS_TAG="${{ steps.backup.outputs.previous_tag }}"
+          if [ "$PREVIOUS_TAG" != "none" ] && [ -n "$PREVIOUS_TAG" ]; then
+            echo "Rolling back to tag: $PREVIOUS_TAG"
+            WORKERS="copy-trader trade-monitor history-backfiller leaderboard-scanner score-calculator"
+            for worker in $WORKERS; do
+              docker compose -f docker-compose.ghcr.yml stop --timeout 45 "$worker" 2>/dev/null || true
+              docker compose -f docker-compose.ghcr.yml rm -f "$worker" 2>/dev/null || true
+            done
+            IMAGE_TAG=$PREVIOUS_TAG docker compose -f docker-compose.ghcr.yml up -d \
+              copy-trader trade-monitor history-backfiller leaderboard-scanner score-calculator
+            echo "Rollback complete"
+          else
+            echo "No previous version found. Manual intervention required."
+          fi
+          echo ""
+          echo "=== Container Logs ==="
+          for container in polymarket_postgres polymarket_copy_trader polymarket_trade_monitor polymarket_history_backfiller; do
+            echo "--- $container ---"
+            docker logs --tail=100 "$container" 2>/dev/null || echo "(no logs)"
+            echo ""
+          done
+
+      - name: Logout from GHCR
+        if: always()
+        run: docker logout ghcr.io || true
