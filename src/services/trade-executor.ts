@@ -388,28 +388,29 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
       };
     }
 
-    // Verify fill exists in CLOB (catches phantom fills from CLOB edge cases)
-    // Brief delay allows CLOB state to propagate before querying
-    if (orderId) {
-      try {
-        await new Promise(resolve => setTimeout(resolve, 200));
-        const order = await client.getOrder(orderId);
-        if (!order) {
-          log.error('PHANTOM FILL DETECTED: getOrder returned null', {
-            orderId, side, filledPrice, filledSize, makingAmount, takingAmount, negRisk,
+    // Background phantom verification (non-blocking — saves ~300ms on critical path).
+    // Safety: hourly auditPhantomPositions() catches any phantom that slips through.
+    // This matches existing fail-open behavior where getOrder() errors already let
+    // fills through unverified.
+    if (orderId && filledSize && filledPrice) {
+      const capturedOrderId = orderId;
+      const capturedCtx = { side, filledPrice, filledSize, makingAmount, takingAmount, negRisk };
+      const verifyInBackground = async () => {
+        try {
+          if (!client) return;
+          const order = await client.getOrder(capturedOrderId);
+          if (!order) {
+            log.error('PHANTOM FILL DETECTED (background)', {
+              orderId: capturedOrderId, ...capturedCtx,
+            });
+          }
+        } catch (err: any) {
+          log.warn('Background phantom verification failed', {
+            orderId: capturedOrderId, error: err.message,
           });
-          return {
-            orderId, status: 'FAILED', filledPrice: null, filledSize: null,
-            failReason: `phantom fill: CLOB getOrder() returned null for ${orderId}`,
-            transactionHashes: txHashes,
-          };
         }
-      } catch (verifyErr: any) {
-        // Non-blocking: rate limit or network error — let fill through, audit catches later
-        log.warn('Post-fill verification failed (non-blocking)', {
-          orderId, error: verifyErr.message,
-        });
-      }
+      };
+      setTimeout(() => { verifyInBackground().catch(() => {}); }, 500);
     }
 
     resetBalancePause(); // clear any prior balance failure count on successful fill
