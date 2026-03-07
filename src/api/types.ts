@@ -156,6 +156,17 @@ export const GammaMarketSchema = z.object({
 
 export type GammaMarketData = z.infer<typeof GammaMarketSchema>;
 
+export const GammaEventSchema = z.object({
+  id: z.union([z.string(), z.number()]).transform(String),
+  slug: z.string(),
+  title: z.string().optional(),
+  active: z.boolean().optional().default(true),
+  closed: z.boolean().optional().default(false),
+  markets: z.array(GammaMarketSchema).optional().default([]),
+}).passthrough();
+
+export type GammaEventData = z.infer<typeof GammaEventSchema>;
+
 // ─── Profile ───
 
 export const ProfileSchema = z.object({

@@ -63,16 +63,11 @@ export const GAME_SLUG_PREFIXES: Record<ScalpGame, string> = {
   wta: 'wta-',
 };
 
-// Slug suffixes that indicate derivative markets (skip these)
-export const DERIVATIVE_SLUG_PATTERNS = [
-  '-map-handicap-',
-  '-total-games-',
-  '-set-handicap-',
-  '-total-maps-',
-  '-total-rounds-',
-];
+// Slug pattern for series winner: {game}-{team1}-{team2}-{YYYY-MM-DD} with no further suffix
+// This is an allowlist approach — anything not matching series or map is derivative
+export const SERIES_SLUG_PATTERN = /^[a-z0-9]+-[a-z0-9]+-[a-z0-9]+-\d{4}-\d{2}-\d{2}$/;
 
-// Slug suffixes for individual map markets
+// Slug suffixes for individual map markets: exactly -game1, -game2, -game3
 export const MAP_SLUG_PATTERN = /-game\d+$/;
 
 /**

@@ -1,12 +1,12 @@
 import { createJobLogger } from '../../lib/logger';
 import { prisma } from '../../lib/prisma';
 import { config } from '../../config/env';
-import { getActiveMarkets } from '../../api/gamma-api';
+import { getActiveEvents } from '../../api/gamma-api';
 import type { GammaMarketData } from '../../api/types';
 import type { ScalpMarketWatchModel as ScalpMarketWatch } from '../../../prisma/generated/prisma/client/models/ScalpMarketWatch';
 import {
   GAME_SLUG_PREFIXES,
-  DERIVATIVE_SLUG_PATTERNS,
+  SERIES_SLUG_PATTERN,
   MAP_SLUG_PATTERN,
   type ScalpGame,
 } from './scalp-types';
@@ -21,6 +21,9 @@ const tokenIdIndex = new Map<string, ScalpMarketWatch>(); // tokenId → market
 const enabledGames: Set<ScalpGame> = new Set(
   config.SCALP_GAMES.split(',').map((g) => g.trim().toLowerCase() as ScalpGame),
 );
+
+// Gamma API event tag_slugs that contain esports/tennis markets
+const DISCOVERY_TAG_SLUGS = ['esports', 'tennis'] as const;
 
 /**
  * Normalize a team name for matching: trim, lowercase, strip non-alphanumeric.
@@ -49,15 +52,15 @@ function detectGame(slug: string): ScalpGame | null {
 }
 
 /**
- * Classify market type from slug.
- * - "series": no suffix (e.g., cs2-mouz-ast10-2026-03-07)
- * - "map": has -game1, -game2 suffix
- * - "derivative": handicap, total, etc.
+ * Classify market type from slug using allowlist patterns.
+ * - "series": exactly {game}-{team1}-{team2}-{YYYY-MM-DD} (no suffix)
+ * - "map": ends with -game1, -game2, -game3
+ * - "derivative": everything else (handicaps, totals, kills, odd-even, first-blood, etc.)
  */
 function classifyMarketType(slug: string): 'series' | 'map' | 'derivative' {
-  if (DERIVATIVE_SLUG_PATTERNS.some((p) => slug.includes(p))) return 'derivative';
+  if (SERIES_SLUG_PATTERN.test(slug)) return 'series';
   if (MAP_SLUG_PATTERN.test(slug)) return 'map';
-  return 'series';
+  return 'derivative';
 }
 
 /**
@@ -73,90 +76,98 @@ function parseOutcomes(outcomesJson: string): string[] {
 }
 
 /**
- * Full discovery: paginate all active markets, filter by game slug, upsert into DB.
+ * Full discovery: fetch events by tag_slug, extract nested markets, filter by game slug, upsert into DB.
+ *
+ * Esports/tennis markets are NOT reachable via /markets pagination (30K+ markets, esports buried).
+ * Instead, use /events?tag_slug=esports which returns events with nested markets.
  */
 export async function discoverMarkets(): Promise<number> {
   const startTime = Date.now();
-  let offset = 0;
-  const limit = 100;
   let totalFound = 0;
   let totalUpserted = 0;
 
   log.info('Starting market discovery...', { enabledGames: [...enabledGames] });
 
-  while (true) {
-    const markets = await getActiveMarkets({ limit, offset, active: true, closed: false });
-    if (markets.length === 0) break;
+  for (const tagSlug of DISCOVERY_TAG_SLUGS) {
+    let offset = 0;
+    const limit = 100;
 
-    for (const market of markets) {
-      const game = detectGame(market.slug);
-      if (!game || !enabledGames.has(game)) continue;
+    while (true) {
+      const events = await getActiveEvents({ tag_slug: tagSlug, limit, offset, active: true, closed: false });
+      if (events.length === 0) break;
 
-      const marketType = classifyMarketType(market.slug);
-      // Phase 1: only track series markets
-      if (marketType === 'derivative') continue;
+      for (const event of events) {
+        const markets = event.markets ?? [];
+        for (const market of markets) {
+          const game = detectGame(market.slug);
+          if (!game || !enabledGames.has(game)) continue;
 
-      const outcomes = parseOutcomes(market.outcomes);
-      if (outcomes.length < 2) continue;
+          const marketType = classifyMarketType(market.slug);
+          // Phase 1: skip derivative markets (handicaps, totals)
+          if (marketType === 'derivative') continue;
 
-      const clobTokenIds = market.clobTokenIds ?? '';
-      if (!clobTokenIds) continue;
+          const outcomes = parseOutcomes(market.outcomes);
+          if (outcomes.length < 2) continue;
 
-      const homeTeam = normalizeTeamName(outcomes[0]);
-      const awayTeam = normalizeTeamName(outcomes[1]);
+          const clobTokenIds = market.clobTokenIds ?? '';
+          if (!clobTokenIds) continue;
 
-      try {
-        const record = await prisma.scalpMarketWatch.upsert({
-          where: { slug: market.slug },
-          create: {
-            game,
-            slug: market.slug,
-            conditionId: market.conditionId,
-            question: market.question,
-            outcomes: market.outcomes,
-            clobTokenIds,
-            negRisk: market.negRisk ?? false,
-            tickSize: market.minimumTickSize ?? 0.01,
-            orderMinSize: market.orderMinSize ?? 5,
-            liquidity: market.liquidity ?? null,
-            eventSlug: market.eventSlug ?? null,
-            endDate: market.endDate ? new Date(market.endDate) : null,
-            isActive: true,
-            marketType,
-            homeTeam,
-            awayTeam,
-          },
-          update: {
-            conditionId: market.conditionId,
-            question: market.question,
-            outcomes: market.outcomes,
-            clobTokenIds,
-            negRisk: market.negRisk ?? false,
-            tickSize: market.minimumTickSize ?? 0.01,
-            orderMinSize: market.orderMinSize ?? 5,
-            liquidity: market.liquidity ?? null,
-            eventSlug: market.eventSlug ?? null,
-            endDate: market.endDate ? new Date(market.endDate) : null,
-            isActive: true,
-            marketType,
-            homeTeam,
-            awayTeam,
-          },
-        });
+          const homeTeam = normalizeTeamName(outcomes[0]);
+          const awayTeam = normalizeTeamName(outcomes[1]);
 
-        // Update in-memory caches
-        addToCache(record);
-        totalUpserted++;
-      } catch (err: any) {
-        log.warn(`Failed to upsert market ${market.slug}: ${err.message}`);
+          try {
+            const record = await prisma.scalpMarketWatch.upsert({
+              where: { slug: market.slug },
+              create: {
+                game,
+                slug: market.slug,
+                conditionId: market.conditionId,
+                question: market.question,
+                outcomes: market.outcomes,
+                clobTokenIds,
+                negRisk: market.negRisk ?? false,
+                tickSize: market.minimumTickSize ?? 0.01,
+                orderMinSize: market.orderMinSize ?? 5,
+                liquidity: market.liquidity ?? null,
+                eventSlug: event.slug,
+                endDate: market.endDate ? new Date(market.endDate) : null,
+                isActive: true,
+                marketType,
+                homeTeam,
+                awayTeam,
+              },
+              update: {
+                conditionId: market.conditionId,
+                question: market.question,
+                outcomes: market.outcomes,
+                clobTokenIds,
+                negRisk: market.negRisk ?? false,
+                tickSize: market.minimumTickSize ?? 0.01,
+                orderMinSize: market.orderMinSize ?? 5,
+                liquidity: market.liquidity ?? null,
+                eventSlug: event.slug,
+                endDate: market.endDate ? new Date(market.endDate) : null,
+                isActive: true,
+                marketType,
+                homeTeam,
+                awayTeam,
+              },
+            });
+
+            addToCache(record);
+            totalUpserted++;
+          } catch (err: any) {
+            log.warn(`Failed to upsert market ${market.slug}: ${err.message}`);
+          }
+
+          totalFound++;
+        }
       }
 
-      totalFound++;
+      offset += limit;
+      // Safety: events are <500 per tag, 2000 is generous
+      if (offset > 2000) break;
     }
-
-    offset += limit;
-    // Safety: don't paginate forever
-    if (offset > 5000) break;
   }
 
   // Mark stale markets inactive

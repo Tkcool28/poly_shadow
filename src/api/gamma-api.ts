@@ -1,7 +1,7 @@
 import { z } from 'zod/v4';
 import { gammaApi } from '../lib/api-client';
 import { logger } from '../lib/logger';
-import { GammaMarketSchema, type GammaMarketData } from './types';
+import { GammaMarketSchema, GammaEventSchema, type GammaMarketData, type GammaEventData } from './types';
 
 function safeParseArray<T>(schema: z.ZodType<T>, data: unknown[], label: string): T[] {
   const results: T[] = [];
@@ -58,6 +58,29 @@ export async function getActiveMarkets(params: {
   });
   if (!Array.isArray(raw)) return [];
   return safeParseArray(GammaMarketSchema, raw, 'gamma-active-markets');
+}
+
+/**
+ * Fetch active events by tag_slug from the Gamma events endpoint.
+ * Events contain nested markets — this is the correct way to discover
+ * esports/sports markets (they are unreachable via /markets pagination).
+ */
+export async function getActiveEvents(params: {
+  tag_slug: string;
+  limit?: number;
+  offset?: number;
+  active?: boolean;
+  closed?: boolean;
+}): Promise<GammaEventData[]> {
+  const raw = await gammaApi.get<unknown[]>('/events', {
+    tag_slug: params.tag_slug,
+    limit: params.limit ?? 100,
+    offset: params.offset ?? 0,
+    active: params.active ?? true,
+    closed: params.closed ?? false,
+  });
+  if (!Array.isArray(raw)) return [];
+  return safeParseArray(GammaEventSchema, raw, `gamma-events-${params.tag_slug}`);
 }
 
 /**
