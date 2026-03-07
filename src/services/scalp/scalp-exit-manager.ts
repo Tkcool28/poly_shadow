@@ -1,7 +1,7 @@
 import { createJobLogger } from '../../lib/logger';
 import { prisma } from '../../lib/prisma';
 import { config } from '../../config/env';
-import { scalpGetOrderBook } from './scalp-executor';
+import { scalpGetOrderBook, paperCalculateFee } from './scalp-executor';
 import { ScalpCycleStatus } from '../../../prisma/generated/prisma/client/enums';
 
 const log = createJobLogger('scalp-exit');
@@ -19,12 +19,15 @@ interface ExitState {
 
 export class ScalpExitManager {
   private activeExits = new Map<string, ExitState>();
+  private tickOffset = 0;
 
   /**
    * Track a new position for exit management.
    */
   addPosition(cycleId: string, tokenId: string, entryPrice: number, entryShares: number, estimatedEdge: number, entryAmountUsd: number): void {
-    const targetSellPrice = entryPrice + (estimatedEdge / 100) - (config.SCALP_CONVERGENCE_SELL_DISCOUNT_CENTS / 100);
+    const rawTarget = entryPrice + (estimatedEdge / 100) - (config.SCALP_CONVERGENCE_SELL_DISCOUNT_CENTS / 100);
+    // Floor at entryPrice + 1¢ to prevent selling at/below entry (guaranteed loss after fees)
+    const targetSellPrice = Math.min(Math.max(rawTarget, entryPrice + 0.01), 0.99);
 
     this.activeExits.set(cycleId, {
       cycleId,
@@ -32,7 +35,7 @@ export class ScalpExitManager {
       entryPrice,
       entryShares,
       entryAmountUsd,
-      targetSellPrice: Math.min(targetSellPrice, 0.99),
+      targetSellPrice,
       startedAt: Date.now(),
     });
 
@@ -40,18 +43,40 @@ export class ScalpExitManager {
       cycleId: cycleId.slice(0, 12),
       tokenId: tokenId.slice(0, 20) + '...',
       entryPrice,
-      targetSellPrice: Math.min(targetSellPrice, 0.99).toFixed(4),
+      targetSellPrice: targetSellPrice.toFixed(4),
     });
   }
 
   /**
    * Called every SCALP_ORDER_POLL_INTERVAL_MS (5s).
    * Checks real orderbook bids for convergence sell and stop-loss.
+   * Uses round-robin to fairly distribute API reads across positions.
    */
   async tick(): Promise<void> {
-    for (const [cycleId, exit] of this.activeExits) {
+    const entries = [...this.activeExits.entries()];
+    if (entries.length === 0) return;
+
+    // Rotate starting position each tick for fairness
+    const startIdx = this.tickOffset % entries.length;
+    this.tickOffset++;
+
+    let uniqueReads = 0;
+    const readTokens = new Set<string>();
+
+    for (let i = 0; i < entries.length; i++) {
+      const idx = (startIdx + i) % entries.length;
+      const [cycleId, exit] = entries[idx];
+
+      // Count only NEW orderbook reads (not cached duplicates)
+      const isNewRead = !readTokens.has(exit.tokenId);
+      if (isNewRead && uniqueReads >= 5) continue; // Defer to next tick
+
       try {
         await this.checkExit(cycleId, exit);
+        if (isNewRead) {
+          readTokens.add(exit.tokenId);
+          uniqueReads++;
+        }
       } catch (err: any) {
         log.warn(`Exit check failed for ${cycleId.slice(0, 12)}: ${err.message}`);
       }
@@ -100,10 +125,10 @@ export class ScalpExitManager {
   ): Promise<void> {
     // Paper mode: simulate sell at bid price with slippage + fees
     const slippage = bidPrice * (config.SCALP_PAPER_SLIPPAGE_FRACTION / 2);
-    const sellPrice = bidPrice - slippage;
+    const sellPrice = Math.max(bidPrice - slippage, 0.01); // Floor at 1¢
     const grossUsd = exit.entryShares * sellPrice;
-    const fee = exit.entryShares * config.SCALP_PAPER_FEE_RATE *
-      Math.pow(sellPrice * (1 - sellPrice), config.SCALP_PAPER_FEE_EXPONENT) * sellPrice;
+    const feeShares = paperCalculateFee(exit.entryShares, sellPrice);
+    const fee = feeShares * sellPrice;
     const netUsd = grossUsd - fee;
     const pnl = netUsd - exit.entryAmountUsd;
 

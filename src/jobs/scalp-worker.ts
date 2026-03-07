@@ -98,7 +98,7 @@ async function recoverOrphans(engine: ScalpEngine): Promise<void> {
           cycle.tokenId,
           cycle.entryPrice,
           cycle.entryShares,
-          cycle.estimatedEdge ?? 0,
+          Math.max(cycle.estimatedEdge ?? 0, config.SCALP_MIN_EDGE_CENTS),
           cycle.entryAmountUsd ?? 0,
         );
         log.info(`Orphan ${cycle.slug}: re-added to exit manager`, { cycleId: cycle.id.slice(0, 12) });
@@ -176,6 +176,10 @@ async function main() {
 
   // Start bot detector
   botDetector = new ScalpBotDetector();
+  // Register our own wallets to avoid self-detection in live mode
+  if (config.FUNDER_ADDRESS) botDetector.addOwnWallet(config.FUNDER_ADDRESS);
+  if (config.SCALP_FUNDER_ADDRESS) botDetector.addOwnWallet(config.SCALP_FUNDER_ADDRESS);
+  if (config.ARB_FUNDER_ADDRESS) botDetector.addOwnWallet(config.ARB_FUNDER_ADDRESS);
   botDetector.updateTokens(getAllEsportsTokenIds());
   botDetector.on('botSignal', (signal) => {
     engine.onBotSignal(signal).catch((err: any) =>

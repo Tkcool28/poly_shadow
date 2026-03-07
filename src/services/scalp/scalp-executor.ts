@@ -19,7 +19,7 @@ const METADATA_CACHE_MAX = 500;
 
 // Order book cache (3s TTL)
 const orderBookCache = new Map<string, { data: OrderBookSummary; fetchedAt: number }>();
-const ORDER_BOOK_CACHE_TTL_MS = 3000;
+const ORDER_BOOK_CACHE_TTL_MS = 6000; // Covers 5s tick interval — most exit reads hit cache
 
 export interface ScalpOrderParams {
   tokenId: string;
@@ -173,7 +173,7 @@ function paperExecuteOrder(params: ScalpOrderParams): ExecuteOrderResult {
   };
 }
 
-function paperCalculateFee(shares: number, price: number): number {
+export function paperCalculateFee(shares: number, price: number): number {
   if (config.SCALP_PAPER_FEE_RATE <= 0) return 0;
   return shares * config.SCALP_PAPER_FEE_RATE * Math.pow(price * (1 - price), config.SCALP_PAPER_FEE_EXPONENT);
 }

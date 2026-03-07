@@ -70,6 +70,10 @@ export class ScalpEngine {
 
     // Estimate fair value
     const currentPrice = await getCurrentPrice(tokenInfo.tokenId);
+    if (currentPrice === null) {
+      log.warn('Cannot get current price, skipping game event', { slug: market.slug });
+      return;
+    }
     const fairValue = estimateSeriesFairValue(
       event.seriesScore,
       event.seriesFormat,
@@ -187,23 +191,33 @@ export class ScalpEngine {
       return;
     }
 
+    // Guard: invalid currentAsk would cause division-by-zero in liquidity check
+    if (signal.currentAsk <= 0 || signal.currentAsk >= 1) {
+      log.warn('Invalid currentAsk, skipping', { slug: signal.slug, currentAsk: signal.currentAsk });
+      await recordCycle(signal, 'SKIPPED', `invalid price: ${signal.currentAsk}`);
+      return;
+    }
+
     // Paper mode: check real orderbook liquidity
     if (config.SCALP_IS_PAPER) {
       const book = await scalpGetOrderBook(signal.tokenId);
-      if (book) {
-        const availableShares = (book.asks ?? [])
-          .filter((a) => parseFloat(a.price) <= signal.currentAsk + 0.02)
-          .reduce((sum, a) => sum + parseFloat(a.size), 0);
-        const requiredShares = config.SCALP_POSITION_SIZE_USD / signal.currentAsk;
-        if (availableShares < requiredShares) {
-          log.info('Insufficient orderbook liquidity', {
-            slug: signal.slug,
-            available: availableShares.toFixed(0),
-            required: requiredShares.toFixed(0),
-          });
-          await recordCycle(signal, 'SKIPPED', 'insufficient liquidity');
-          return;
-        }
+      if (!book) {
+        log.warn('Orderbook unavailable, skipping', { slug: signal.slug, tokenId: signal.tokenId.slice(0, 20) });
+        await recordCycle(signal, 'SKIPPED', 'orderbook unavailable');
+        return;
+      }
+      const availableShares = (book.asks ?? [])
+        .filter((a) => parseFloat(a.price) <= signal.currentAsk + 0.02)
+        .reduce((sum, a) => sum + parseFloat(a.size), 0);
+      const requiredShares = config.SCALP_POSITION_SIZE_USD / signal.currentAsk;
+      if (availableShares < requiredShares) {
+        log.info('Insufficient orderbook liquidity', {
+          slug: signal.slug,
+          available: availableShares.toFixed(0),
+          required: requiredShares.toFixed(0),
+        });
+        await recordCycle(signal, 'SKIPPED', 'insufficient liquidity');
+        return;
       }
     }
 
@@ -297,9 +311,9 @@ export class ScalpEngine {
 
 // ─── Helpers ───
 
-async function getCurrentPrice(tokenId: string): Promise<number> {
+async function getCurrentPrice(tokenId: string): Promise<number | null> {
   const book = await scalpGetOrderBook(tokenId);
-  if (!book?.asks?.length) return 0.5; // fallback
+  if (!book?.asks?.length) return null;
   return parseFloat(book.asks[0].price);
 }
 
@@ -313,10 +327,30 @@ function resolveWinnerToken(
 
     const normalizedWinner = winnerName.trim().toLowerCase().replace(/[^a-z0-9]/g, '');
 
+    // First pass: exact match only
     for (let i = 0; i < outcomes.length; i++) {
       const normalizedOutcome = outcomes[i].trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-      if (normalizedOutcome === normalizedWinner || normalizedOutcome.includes(normalizedWinner) || normalizedWinner.includes(normalizedOutcome)) {
+      if (normalizedOutcome === normalizedWinner) {
         return { tokenId: tokenIds[i], outcomeLabel: outcomes[i].trim() };
+      }
+    }
+
+    // Second pass: fuzzy match for longer names only (>3 chars both sides)
+    for (let i = 0; i < outcomes.length; i++) {
+      const normalizedOutcome = outcomes[i].trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (normalizedWinner.length > 3 && normalizedOutcome.length > 3) {
+        if (normalizedOutcome.includes(normalizedWinner) || normalizedWinner.includes(normalizedOutcome)) {
+          const overlap = Math.min(normalizedWinner.length, normalizedOutcome.length) /
+                          Math.max(normalizedWinner.length, normalizedOutcome.length);
+          if (overlap > 0.7) {
+            log.warn('Fuzzy team match used', {
+              winner: winnerName,
+              matched: outcomes[i].trim(),
+              overlap: overlap.toFixed(2),
+            });
+            return { tokenId: tokenIds[i], outcomeLabel: outcomes[i].trim() };
+          }
+        }
       }
     }
   } catch {}

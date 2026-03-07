@@ -51,12 +51,9 @@ export class CS2Feed extends EventEmitter implements GameFeed {
       return;
     }
 
-    log.info('CS2 feed starting (polling mode — Socket.IO pending)');
-
-    // Phase 1: Use polling fallback until socket.io-client is added
-    // TODO: Replace with Socket.IO connection to HLTV Scorebot
-    this.healthy = true;
-    log.info('CS2 feed ready (waiting for live matches)');
+    // HLTV Scorebot Socket.IO not yet implemented — rely on bot detector for CS2 signals
+    log.warn('CS2 feed: HLTV Scorebot not yet implemented, relying on bot detector for CS2 signals');
+    this.healthy = false;
   }
 
   stop(): void {

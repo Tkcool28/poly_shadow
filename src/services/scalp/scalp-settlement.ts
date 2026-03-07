@@ -102,7 +102,7 @@ export async function sweepScalpSettlements(): Promise<void> {
           where: { isPaper: config.SCALP_IS_PAPER },
           data: {
             currentCapital: { increment: entryAmountUsd + pnl },
-            deployedCapital: { decrement: Math.min(entryAmountUsd, 999999) },
+            deployedCapital: { decrement: entryAmountUsd },
             totalPnl: { increment: pnl },
             totalCycles: { increment: 1 },
             totalWins: won ? { increment: 1 } : undefined,

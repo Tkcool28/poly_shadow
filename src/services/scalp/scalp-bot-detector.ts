@@ -79,7 +79,7 @@ export class ScalpBotDetector extends EventEmitter {
 
     const size = parseFloat(payload.size);
     const price = parseFloat(payload.price);
-    if (size <= 0 || price <= 0) return;
+    if (!size || !price || isNaN(size) || isNaN(price) || size <= 0 || price <= 0) return;
 
     const usdValue = size * price;
     const now = Date.now();
@@ -117,13 +117,17 @@ export class ScalpBotDetector extends EventEmitter {
       const avgPrice = cluster.buys.reduce((s, b) => s + b.price * b.size, 0) /
                         cluster.buys.reduce((s, b) => s + b.size, 0);
 
+      // Dynamic confidence based on cluster magnitude vs threshold
+      const confidence: BotSignal['confidence'] =
+        cluster.totalBuyUsd >= threshold * 10 ? 'HIGH' : 'MEDIUM';
+
       const signal: BotSignal = {
         tokenId: payload.asset,
         side: 'BUY',
         avgPrice,
         totalUsd: cluster.totalBuyUsd,
         tradeCount: cluster.buys.length,
-        confidence: 'MEDIUM',
+        confidence,
         timestamp: new Date(),
       };
 
