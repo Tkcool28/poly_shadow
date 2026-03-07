@@ -1,5 +1,10 @@
 name: Deploy to Production
 
+# Manual deployment workflow using self-hosted runner.
+# Dedicated infrastructure (all containers managed by this stack):
+#   - PostgreSQL: polymarket_postgres (host port 5438)
+#   - Network: polymarket-network (isolated)
+
 on:
   workflow_dispatch:
     inputs:
