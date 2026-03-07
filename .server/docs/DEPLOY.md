@@ -16,7 +16,7 @@
               ↓
     ┌─────────────────────┐
     │ Manual Trigger      │
-    │ deploy-runner.yml   │
+    │ deploy.yml   │
     │ image_tag: latest   │
     │ profiles: arb,scalp │
     └─────────────────────┘
