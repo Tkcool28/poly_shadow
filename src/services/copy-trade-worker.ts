@@ -195,6 +195,43 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     }
   }
 
+  // ─── Hedge guard: block low-probability BUY legs without sufficient opposite position ───
+  // When a trader buys both sides (e.g., $249 Down @83¢ + $9 Up @3¢), we often fail to fill
+  // the main bet (liquidity drained) but fill the cheap hedge — copying the intentional loss.
+  // This guard ensures we only copy hedge legs when we've already built the main position.
+  let hedgeMaxUsd = Infinity; // set by hedge guard; caps CLOB bump below
+  if (trade.side === 'BUY' && trade.price <= config.HEDGE_PRICE_THRESHOLD && config.HEDGE_PRICE_THRESHOLD > 0) {
+    const oppositeUsd = await getOppositePositionUsd(trade.conditionId, trade.asset, allocation.id, isPaper);
+    if (oppositeUsd < config.HEDGE_MIN_OPPOSITE_USD) {
+      log.info('Hedge guard: blocked low-probability trade without sufficient opposite position', {
+        trader: trade.proxyWallet.slice(0, 10),
+        price: trade.price,
+        threshold: config.HEDGE_PRICE_THRESHOLD,
+        oppositeUsd: oppositeUsd.toFixed(2),
+        minRequired: config.HEDGE_MIN_OPPOSITE_USD,
+        outcome: trade.outcome,
+        title: trade.title?.slice(0, 50),
+      });
+      await createSkippedRecord(
+        trade,
+        `hedge guard: trade @${trade.price.toFixed(2)} is ≤${config.HEDGE_PRICE_THRESHOLD} threshold, ` +
+        `opposite position $${oppositeUsd.toFixed(2)} < $${config.HEDGE_MIN_OPPOSITE_USD} minimum`,
+        allocation.id,
+        isPaper,
+      );
+      return;
+    }
+    hedgeMaxUsd = oppositeUsd * config.HEDGE_MAX_RATIO;
+    if (copyAmountUsd > hedgeMaxUsd) {
+      copyAmountUsd = hedgeMaxUsd;
+      log.info('Hedge guard: trimmed copy amount to max hedge ratio', {
+        trader: trade.proxyWallet.slice(0, 10),
+        tokenId: trade.asset, oppositeUsd: oppositeUsd.toFixed(2),
+        maxHedgeUsd: hedgeMaxUsd.toFixed(2), hedgeMaxRatio: config.HEDGE_MAX_RATIO,
+      });
+    }
+  }
+
   // ─── CLOB $1 minimum (live BUY only) ───
   // Smart bump: only bump to CLOB minimum on FIRST entry (no existing position).
   // On subsequent entries, natural size < $1 means the cumulative signal is small;
@@ -202,8 +239,17 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   // over-deploying (e.g. $0.60 bumped to $1 + $0.30 bumped to $1 = $2 for $0.90 intent).
   if (trade.side === 'BUY' && !isPaper && copyAmountUsd < CLOB_MIN_ORDER_USD) {
     if (positionUsd < 0.01) {
-      // First entry: bump to CLOB minimum (market entry cost)
-      copyAmountUsd = CLOB_MIN_ORDER_USD;
+      // First entry: bump to CLOB minimum, but respect hedge guard cap
+      copyAmountUsd = Math.min(CLOB_MIN_ORDER_USD, hedgeMaxUsd);
+      if (copyAmountUsd < CLOB_MIN_ORDER_USD) {
+        await createSkippedRecord(
+          trade,
+          `hedge guard cap $${hedgeMaxUsd.toFixed(2)} below CLOB minimum $${CLOB_MIN_ORDER_USD}`,
+          allocation.id,
+          isPaper,
+        );
+        return;
+      }
     } else {
       // Subsequent entry: natural size too small for CLOB, skip
       await createSkippedRecord(
@@ -333,6 +379,10 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
         estimatedFee: result.estimatedFee ?? null,
         latencyMs,
         filledAt: result.status === 'FILLED' ? new Date() : null,
+        // FAK partial fills: update requestedAmount to actual USD so daily spend tracking is accurate
+        requestedAmount: (result.status === 'FILLED' && result.filledSize && result.filledPrice)
+          ? result.filledSize * result.filledPrice
+          : undefined,
       },
     });
 
@@ -512,6 +562,28 @@ async function getNetPositionUsd(
     });
   }
   return Math.max(netUsd, 0);
+}
+
+/**
+ * Hedge guard helper: find our net position USD on the OPPOSITE outcome
+ * of the same binary market (conditionId).
+ * Uses DetectedTrade records to discover the other tokenId, then queries our fills.
+ */
+async function getOppositePositionUsd(
+  conditionId: string,
+  currentAsset: string,
+  followAllocationId: string,
+  isPaper: boolean,
+): Promise<number> {
+  const oppositeToken = await prisma.detectedTrade.findFirst({
+    where: {
+      conditionId,
+      asset: { not: currentAsset },
+    },
+    select: { asset: true },
+  });
+  if (!oppositeToken) return 0;
+  return getNetPositionUsd(oppositeToken.asset, followAllocationId, isPaper);
 }
 
 // ─── Cached API position check for dust tiebreaker ───

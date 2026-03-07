@@ -210,7 +210,7 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
     }
   }
 
-  log.info('Placing FOK market order', {
+  log.info('Placing FAK market order', {
     tokenId: tokenId.slice(0, 20) + '...',
     side,
     amount,
@@ -229,12 +229,13 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
         price: slippagePrice,
       },
       { tickSize, negRisk },
-      OrderType.FOK,
+      OrderType.FAK,
     );
 
     if (response?.success === false || response?.errorMsg) {
       const errorMsg: string = response.errorMsg || 'Unknown order error';
 
+      // Defensive: FAK orders won't trigger this, but kept as a safety net
       if (errorMsg.includes('FOK_ORDER_NOT_FILLED')) {
         return {
           orderId: null,
@@ -332,9 +333,9 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
       filledPrice = detectedPrice;
     }
 
-    // Guard: FOK order submitted but not matched (no fill amounts) — treat as SKIPPED
+    // Guard: FAK order submitted but not matched (no fill amounts) — treat as SKIPPED
     if (!filledSize || !filledPrice) {
-      log.info('FOK order unmatched (no fill amounts)', {
+      log.info('FAK order unmatched (no fill amounts)', {
         orderId,
         side,
         makingAmount: response?.makingAmount,
@@ -345,7 +346,7 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
         status: 'SKIPPED',
         filledPrice: null,
         filledSize: null,
-        failReason: 'no matching orders (FOK unmatched)',
+        failReason: 'no matching orders (FAK unmatched)',
         transactionHashes: txHashes,
       };
     }
