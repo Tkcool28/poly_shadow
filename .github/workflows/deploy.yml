@@ -127,12 +127,15 @@ jobs:
           fi
 
       - name: Setup secrets
+        env:
+          _ENV_FILE: ${{ secrets.ENV_FILE }}
+          _PG_PASSWORD: ${{ secrets.PG_PASSWORD }}
         run: |
           echo "=== Setting up secrets ==="
           SECRETS_DIR="${{ env.DEPLOY_DIR }}/secrets"
           mkdir -p "$SECRETS_DIR"
-          echo -n '${{ secrets.ENV_FILE }}' > "$SECRETS_DIR/env.txt"
-          echo -n '${{ secrets.PG_PASSWORD }}' > "$SECRETS_DIR/pg_password.txt"
+          printenv _ENV_FILE > "$SECRETS_DIR/env.txt"
+          printenv _PG_PASSWORD > "$SECRETS_DIR/pg_password.txt"
           chmod 600 "$SECRETS_DIR"/*.txt
           echo "Verifying secrets..."
           for secret in env.txt pg_password.txt; do
