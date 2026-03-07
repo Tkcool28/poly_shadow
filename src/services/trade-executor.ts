@@ -364,6 +364,46 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
       };
     }
 
+    // Sanity: implied USD should be within 3x of requested amount
+    // (filledPrice and filledSize are guaranteed non-null here — FAK guard above returns otherwise)
+    const impliedUsd = filledPrice * filledSize;
+    const requestedUsd = side === 'BUY' ? amount : amount * detectedPrice;
+    if (requestedUsd > 0 && impliedUsd / requestedUsd > 3.0) {
+      log.error('SUSPECT FILL: impliedUsd diverges from requestedUsd', {
+        orderId, side, filledPrice, filledSize, impliedUsd, requestedUsd,
+        negRisk, makingAmount, takingAmount,
+      });
+      return {
+        orderId, status: 'FAILED', filledPrice: null, filledSize: null,
+        failReason: `suspect fill: implied $${impliedUsd.toFixed(2)} vs requested $${requestedUsd.toFixed(2)}`,
+        transactionHashes: txHashes,
+      };
+    }
+
+    // Verify fill exists in CLOB (catches phantom fills from CLOB edge cases)
+    // Brief delay allows CLOB state to propagate before querying
+    if (orderId) {
+      try {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        const order = await client.getOrder(orderId);
+        if (!order) {
+          log.error('PHANTOM FILL DETECTED: getOrder returned null', {
+            orderId, side, filledPrice, filledSize, makingAmount, takingAmount, negRisk,
+          });
+          return {
+            orderId, status: 'FAILED', filledPrice: null, filledSize: null,
+            failReason: `phantom fill: CLOB getOrder() returned null for ${orderId}`,
+            transactionHashes: txHashes,
+          };
+        }
+      } catch (verifyErr: any) {
+        // Non-blocking: rate limit or network error — let fill through, audit catches later
+        log.warn('Post-fill verification failed (non-blocking)', {
+          orderId, error: verifyErr.message,
+        });
+      }
+    }
+
     resetBalancePause(); // clear any prior balance failure count on successful fill
 
     log.info('Order filled', {

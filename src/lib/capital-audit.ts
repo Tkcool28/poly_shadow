@@ -1,5 +1,6 @@
 import { prisma } from './prisma';
 import { createJobLogger } from './logger';
+import { getAllPositions } from '../api/data-api';
 
 const log = createJobLogger('capital-audit');
 
@@ -206,6 +207,123 @@ export async function auditAllAllocations(options?: {
     });
   } else {
     log.info(`Capital audit: ${results.length} allocations checked, all within $${threshold} tolerance`);
+  }
+
+  return results;
+}
+
+export interface PhantomPositionAudit {
+  tokenId: string;
+  followAllocationId: string;
+  dbShares: number;
+  dbCostBasis: number;
+  apiShares: number;
+  isPhantom: boolean;
+  heldByOtherStrategy: boolean;
+}
+
+/**
+ * Detect phantom positions: DB says FILLED BUYs exist, but API shows 0 shares.
+ * Only checks FILLED trades (not SETTLED) — SETTLED phantoms need getOrder() verification.
+ */
+export async function auditPhantomPositions(funderAddress: string): Promise<PhantomPositionAudit[]> {
+  // 1. Get all FILLED BUY positions from DB (live only)
+  const filledBuys = await prisma.copyTrade.findMany({
+    where: {
+      status: 'FILLED',
+      side: 'BUY',
+      isPaper: false,
+      followAllocation: { isActive: true },
+    },
+    select: {
+      tokenId: true,
+      followAllocationId: true,
+      filledSize: true,
+      filledPrice: true,
+    },
+  });
+
+  // Group by (tokenId, followAllocationId)
+  const positionMap = new Map<string, { tokenId: string; allocId: string; shares: number; cost: number }>();
+  for (const t of filledBuys) {
+    if (!t.followAllocationId) continue;
+    const key = `${t.tokenId}|${t.followAllocationId}`;
+    const existing = positionMap.get(key) ?? { tokenId: t.tokenId, allocId: t.followAllocationId, shares: 0, cost: 0 };
+    existing.shares += t.filledSize ?? 0;
+    existing.cost += (t.filledSize ?? 0) * (t.filledPrice ?? 0);
+    positionMap.set(key, existing);
+  }
+
+  // Also subtract FILLED SELLs
+  const filledSells = await prisma.copyTrade.findMany({
+    where: {
+      status: 'FILLED',
+      side: 'SELL',
+      isPaper: false,
+      followAllocation: { isActive: true },
+    },
+    select: { tokenId: true, followAllocationId: true, filledSize: true },
+  });
+  for (const t of filledSells) {
+    if (!t.followAllocationId) continue;
+    const key = `${t.tokenId}|${t.followAllocationId}`;
+    const existing = positionMap.get(key);
+    if (existing) existing.shares -= t.filledSize ?? 0;
+  }
+
+  // 2. Fetch API positions
+  const apiPositions = await getAllPositions(funderAddress);
+  const apiMap = new Map<string, number>();
+  for (const pos of apiPositions) {
+    apiMap.set(pos.asset, pos.size);
+  }
+
+  // 3. Query scalp/arb active positions
+  const otherStrategyTokens = new Set<string>();
+  const scalpCycles = await prisma.scalpCycle.findMany({
+    where: { status: 'ENTERED' },
+    select: { tokenId: true },
+  });
+  for (const sc of scalpCycles) {
+    if (sc.tokenId) otherStrategyTokens.add(sc.tokenId);
+  }
+  const arbCycles = await prisma.arbCycle.findMany({
+    where: { status: 'ENTERED' },
+    select: { tokenId: true },
+  });
+  for (const ac of arbCycles) {
+    if (ac.tokenId) otherStrategyTokens.add(ac.tokenId);
+  }
+
+  // 4. Compare
+  const results: PhantomPositionAudit[] = [];
+  for (const [, pos] of positionMap) {
+    if (pos.shares <= 0.001) continue; // no meaningful position
+
+    const apiShares = apiMap.get(pos.tokenId) ?? 0;
+    const heldByOther = otherStrategyTokens.has(pos.tokenId);
+
+    if (apiShares <= 0.001 && !heldByOther) {
+      results.push({
+        tokenId: pos.tokenId,
+        followAllocationId: pos.allocId,
+        dbShares: pos.shares,
+        dbCostBasis: pos.cost,
+        apiShares,
+        isPhantom: true,
+        heldByOtherStrategy: false,
+      });
+    } else if (apiShares <= 0.001 && heldByOther) {
+      results.push({
+        tokenId: pos.tokenId,
+        followAllocationId: pos.allocId,
+        dbShares: pos.shares,
+        dbCostBasis: pos.cost,
+        apiShares,
+        isPhantom: false,
+        heldByOtherStrategy: true,
+      });
+    }
   }
 
   return results;

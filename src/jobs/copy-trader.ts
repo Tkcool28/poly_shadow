@@ -10,7 +10,7 @@ import { rehydratePool, sweepPool } from '../services/order-pool';
 import { sweepPositionSettlements } from '../services/position-settlement';
 import { reconcileStalePending } from '../services/clob-reconciler';
 import { sweepPreResolutionSells } from '../services/pre-resolution-seller';
-import { auditAllAllocations } from '../lib/capital-audit';
+import { auditAllAllocations, auditPhantomPositions } from '../lib/capital-audit';
 import { PgListener } from '../lib/pg-listen';
 
 const JOB_NAME = 'copy-trader';
@@ -243,6 +243,21 @@ async function main() {
     if (shuttingDown || isShuttingDown()) return;
     try {
       await auditAllAllocations({ isPaper: false, threshold: 1.0 });
+      // Phantom position check — detection only, no auto-fix
+      if (config.FUNDER_ADDRESS) {
+        const phantomResults = await auditPhantomPositions(config.FUNDER_ADDRESS);
+        const confirmedPhantoms = phantomResults.filter(p => p.isPhantom);
+        if (confirmedPhantoms.length > 0) {
+          log.error(`Phantom positions detected: ${confirmedPhantoms.length} tokens with no on-chain position`, {
+            phantoms: confirmedPhantoms.map(p => ({
+              token: p.tokenId.slice(0, 16),
+              allocation: p.followAllocationId,
+              dbShares: p.dbShares.toFixed(4),
+              dbCost: p.dbCostBasis.toFixed(2),
+            })),
+          });
+        }
+      }
     } catch (err: any) {
       log.warn(`Capital audit failed: ${err.message}`);
     }
