@@ -19,7 +19,7 @@ function sellCooldownKey(allocationId: string, tokenId: string): string {
   return `${allocationId}:${tokenId}`;
 }
 
-function isInSellCooldown(allocationId: string, tokenId: string): boolean {
+export function isInSellCooldown(allocationId: string, tokenId: string): boolean {
   if (config.TOKEN_SELL_COOLDOWN_MS <= 0) return false;
   const key = sellCooldownKey(allocationId, tokenId);
   const ts = lastSellAt.get(key);
@@ -27,7 +27,7 @@ function isInSellCooldown(allocationId: string, tokenId: string): boolean {
   return Date.now() - ts < config.TOKEN_SELL_COOLDOWN_MS;
 }
 
-function recordSellFill(allocationId: string, tokenId: string): void {
+export function recordSellFill(allocationId: string, tokenId: string): void {
   const key = sellCooldownKey(allocationId, tokenId);
   lastSellAt.set(key, Date.now());
   // Prune old entries to prevent unbounded growth
@@ -39,7 +39,7 @@ function recordSellFill(allocationId: string, tokenId: string): void {
   }
 }
 
-interface DetectedTradeRow {
+export interface DetectedTradeRow {
   id: string;
   proxyWallet: string;
   userName: string | null;
@@ -175,15 +175,22 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     copyAmountUsd = Math.min(copyAmountUsd, maxPerTrade);
   }
 
-  // ─── Per-prediction position cap (BUY only) ───
+  // ─── Position lookup (BUY only) ───
+  // ALWAYS look up position for BUY (needed by CLOB min check + pool routing),
+  // not just when maxPerPrediction > 0 (was a bug: positionUsd stayed 0, causing
+  // every sub-$1 trade to be bumped to $1 instead of routing to pool).
+  let positionUsd = 0;
+  if (trade.side === 'BUY') {
+    positionUsd = await getNetPositionUsd(trade.asset, allocation.id, isPaper);
+  }
+
+  // ─── Per-prediction position cap (BUY only, when enabled) ───
   // Prevents stacking beyond MAX_PREDICTION_POSITION_USD in a single tokenId.
   // On partial room: trim to the gap rather than skip entirely.
   // Net position = BUY fills minus SELL fills, so re-entries after exits are allowed.
-  let positionUsd = 0;
   if (trade.side === 'BUY' && maxPerPrediction > 0) {
-    positionUsd = await getNetPositionUsd(trade.asset, allocation.id, isPaper);
     const remaining = maxPerPrediction - positionUsd;
-    if (remaining <= 0) {
+    if (remaining < 0.01) {
       await createSkippedRecord(trade, 'prediction position limit reached', allocation.id, isPaper);
       return;
     }
@@ -254,13 +261,12 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
         return;
       }
     } else {
-      // Subsequent entry: natural size too small for CLOB, skip
-      await createSkippedRecord(
-        trade,
-        `sub-CLOB-minimum $${copyAmountUsd.toFixed(2)} add-on (existing position: $${positionUsd.toFixed(2)})`,
-        allocation.id,
-        isPaper,
-      );
+      // Subsequent entry: natural size too small for CLOB — pool it (skip dust)
+      if (copyAmountUsd < 0.01) {
+        await createSkippedRecord(trade, `dust amount $${copyAmountUsd.toFixed(6)} below pool minimum`, allocation.id, isPaper);
+        return;
+      }
+      await addToPool(trade, copyAmountUsd, { id: allocation.id, isPaper });
       return;
     }
   }
@@ -275,7 +281,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     // Global daily backstop (across all allocations, scoped by paper/live)
     const globalSpend = await prisma.copyTrade.aggregate({
       where: {
-        status: { in: ['FILLED', 'POOLED'] },
+        status: { in: ['FILLED', 'POOLED', 'PENDING'] },
         side: 'BUY',
         createdAt: { gte: todayStart },
         isPaper,
@@ -294,8 +300,9 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   // Guard: skip if amount is effectively zero (can happen after position-cap trim on tiny signal trades)
   if (copyAmountUsd <= 0) return;
 
-  // Paper: pool if below paper pool threshold
-  if (trade.side === 'BUY' && isPaper && copyAmountUsd < config.POOL_MIN_AMOUNT_USD) {
+  // Pool if below threshold (paper uses POOL_MIN_AMOUNT_USD, live uses LIVE_POOL_MIN_AMOUNT_USD)
+  const poolThreshold = isPaper ? config.POOL_MIN_AMOUNT_USD : config.LIVE_POOL_MIN_AMOUNT_USD;
+  if (trade.side === 'BUY' && copyAmountUsd < poolThreshold) {
     await addToPool(trade, copyAmountUsd, { id: allocation.id, isPaper });
     return;
   }
@@ -503,8 +510,8 @@ async function getHeldShares(
   isPaper: boolean,
 ): Promise<number> {
   const fills = await prisma.copyTrade.findMany({
-    where: { tokenId, followAllocationId, isPaper, status: 'FILLED' },
-    select: { side: true, filledSize: true, filledPrice: true, requestedAmount: true },
+    where: { tokenId, followAllocationId, isPaper, status: { in: ['FILLED', 'PENDING'] } },
+    select: { side: true, filledSize: true, filledPrice: true, requestedAmount: true, requestedPrice: true },
   });
 
   let netShares = 0;
@@ -513,17 +520,16 @@ async function getHeldShares(
       if (fill.filledSize != null) {
         netShares += fill.filledSize;
       } else {
-        const price = fill.filledPrice ?? 1;
+        // PENDING records have NULL filledSize — use requestedAmount/requestedPrice
+        const price = fill.filledPrice ?? fill.requestedPrice ?? 1;
         netShares += fill.requestedAmount / price;
-        log.warn('getHeldShares: BUY fill missing filledSize, using fallback', { tokenId, fillPrice: price });
       }
     } else {
       if (fill.filledSize != null) {
         netShares -= fill.filledSize;
       } else {
-        const price = fill.filledPrice ?? 1;
+        const price = fill.filledPrice ?? fill.requestedPrice ?? 1;
         netShares -= fill.requestedAmount / price;
-        log.warn('getHeldShares: SELL fill missing filledSize, using fallback', { tokenId, fillPrice: price });
       }
     }
   }
@@ -541,7 +547,7 @@ async function getNetPositionUsd(
   isPaper: boolean,
 ): Promise<number> {
   const fills = await prisma.copyTrade.findMany({
-    where: { tokenId, followAllocationId, isPaper, status: 'FILLED' },
+    where: { tokenId, followAllocationId, isPaper, status: { in: ['FILLED', 'PENDING'] } },
     select: { side: true, filledSize: true, filledPrice: true, requestedAmount: true },
   });
 
@@ -551,10 +557,8 @@ async function getNetPositionUsd(
     if (fill.filledSize != null && fill.filledPrice != null) {
       usd = fill.filledSize * fill.filledPrice;
     } else {
+      // PENDING records have NULL filledSize/filledPrice — use requestedAmount
       usd = fill.requestedAmount;
-      log.warn('getNetPositionUsd: fill missing filledSize/filledPrice, using requestedAmount fallback', {
-        tokenId, side: fill.side, requestedAmount: fill.requestedAmount,
-      });
     }
     if (fill.side === 'BUY') netUsd += usd;
     else netUsd -= usd;
@@ -602,7 +606,7 @@ const POSITION_CACHE_TTL_MS = 60_000;
  * Fail-open on all error paths (returns true → existing dust behavior preserved).
  * Only called for live allocations in the dust band (< 0.01 shares).
  */
-async function checkApiPositionExists(tokenId: string): Promise<boolean> {
+export async function checkApiPositionExists(tokenId: string): Promise<boolean> {
   if (!config.FUNDER_ADDRESS) return true;
   try {
     const now = Date.now();
@@ -676,7 +680,7 @@ async function checkMarketClosed(
   }
 }
 
-async function createSkippedRecord(
+export async function createSkippedRecord(
   trade: DetectedTradeRow,
   reason: string,
   followAllocationId: string | null,

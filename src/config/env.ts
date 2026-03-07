@@ -83,8 +83,19 @@ const envSchema = z.object({
   // Anti-cycle: per-token cool-down after a SELL fill to prevent market-making spread loss
   TOKEN_SELL_COOLDOWN_MS: z.coerce.number().min(0).default(60000), // 60s — 0 = disabled
 
+  // Pipeline optimization feature flags
+  POSITION_CACHE_ENABLED: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+  PARALLEL_DRAIN_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+
   // Order aggregation pool
   POOL_MIN_AMOUNT_USD: z.coerce.number().min(0.01).max(100).default(0.50), // min USD to pool paper trades
+  LIVE_POOL_MIN_AMOUNT_USD: z.coerce.number().min(0.01).max(1000).default(1.0), // min USD to fire live pool (CLOB $1 minimum)
   POOL_BURN_TIMEOUT_MS: z.coerce.number().default(180000), // 3 min per-entry FIFO burn window
 
   // Auto-claim: on-chain redemption of won conditional tokens

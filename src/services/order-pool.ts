@@ -133,6 +133,7 @@ export async function addToPool(
   log.info('POOLED trade', {
     trader: trade.proxyWallet.slice(0, 10),
     side: trade.side,
+    mode: allocation.isPaper ? 'PAPER' : 'LIVE',
     amount: copyAmountUsd.toFixed(4),
     poolTotal: bucket.totalAmountUsd.toFixed(4),
     poolSize: bucket.entries.length,
@@ -140,7 +141,8 @@ export async function addToPool(
   });
 
   // 4. Fire immediately if threshold reached
-  if (bucket.totalAmountUsd >= config.POOL_MIN_AMOUNT_USD) {
+  const fireThreshold = bucket.isPaper ? config.POOL_MIN_AMOUNT_USD : config.LIVE_POOL_MIN_AMOUNT_USD;
+  if (bucket.totalAmountUsd >= fireThreshold) {
     await fireBucket(bucket);
     pool.delete(key);
   }
@@ -239,7 +241,8 @@ export async function rehydratePool(): Promise<void> {
 
   // Check if any rehydrated buckets now exceed threshold
   for (const [key, bucket] of pool) {
-    if (bucket.totalAmountUsd >= config.POOL_MIN_AMOUNT_USD) {
+    const fireThreshold = bucket.isPaper ? config.POOL_MIN_AMOUNT_USD : config.LIVE_POOL_MIN_AMOUNT_USD;
+    if (bucket.totalAmountUsd >= fireThreshold) {
       await fireBucket(bucket);
       pool.delete(key);
     }

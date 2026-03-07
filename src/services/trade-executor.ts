@@ -116,6 +116,14 @@ async function getMarketMetadata(tokenId: string): Promise<{ tickSize: TickSize;
   return metadata;
 }
 
+/** Pre-warm metadata cache for a batch of tokenIds (parallel, fail-safe). */
+export async function preWarmMetadata(tokenIds: string[]): Promise<void> {
+  if (!client) return;
+  const uncached = tokenIds.filter(id => !metadataCache.has(id));
+  if (uncached.length === 0) return;
+  await Promise.allSettled(uncached.map(id => getMarketMetadata(id).catch(() => {})));
+}
+
 function calculateSlippagePrice(detectedPrice: number, side: 'BUY' | 'SELL'): number {
   if (side === 'BUY') {
     // Fractional: sacrifice a fraction of remaining upside (distance to $1) for execution certainty
