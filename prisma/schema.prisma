@@ -354,6 +354,7 @@ model DetectedTrade {
   @@index([detectedAt(sort: Desc)])
   @@index([proxyWallet])
   @@index([proxyWallet, detectedAt(sort: Desc)])
+  @@index([conditionId])
 }
 
 // ─── CopyTrade (executed copy of a detected trade) ───

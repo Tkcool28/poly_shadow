@@ -205,40 +205,42 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     }
   }
 
-  // ─── Hedge guard: block low-probability BUY legs without sufficient opposite position ───
-  // When a trader buys both sides (e.g., $249 Down @83¢ + $9 Up @3¢), we often fail to fill
-  // the main bet (liquidity drained) but fill the cheap hedge — copying the intentional loss.
-  // This guard ensures we only copy hedge legs when we've already built the main position.
-  let hedgeMaxUsd = Infinity; // set by hedge guard; caps CLOB bump below
-  if (trade.side === 'BUY' && trade.price <= config.HEDGE_PRICE_THRESHOLD && config.HEDGE_PRICE_THRESHOLD > 0) {
-    const oppositeUsd = await getOppositePositionUsd(trade.conditionId, trade.asset, allocation.id, isPaper);
-    if (oppositeUsd < config.HEDGE_MIN_OPPOSITE_USD) {
-      log.info('Hedge guard: blocked low-probability trade without sufficient opposite position', {
-        trader: trade.proxyWallet.slice(0, 10),
-        price: trade.price,
-        threshold: config.HEDGE_PRICE_THRESHOLD,
-        oppositeUsd: oppositeUsd.toFixed(2),
-        minRequired: config.HEDGE_MIN_OPPOSITE_USD,
-        outcome: trade.outcome,
-        title: trade.title?.slice(0, 50),
-      });
-      await createSkippedRecord(
-        trade,
-        `hedge guard: trade @${trade.price.toFixed(2)} is ≤${config.HEDGE_PRICE_THRESHOLD} threshold, ` +
-        `opposite position $${oppositeUsd.toFixed(2)} < $${config.HEDGE_MIN_OPPOSITE_USD} minimum`,
-        allocation.id,
-        isPaper,
-      );
-      return;
-    }
-    hedgeMaxUsd = oppositeUsd * config.HEDGE_MAX_RATIO;
-    if (copyAmountUsd > hedgeMaxUsd) {
-      copyAmountUsd = hedgeMaxUsd;
-      log.info('Hedge guard: trimmed copy amount to max hedge ratio', {
-        trader: trade.proxyWallet.slice(0, 10),
-        tokenId: trade.asset, oppositeUsd: oppositeUsd.toFixed(2),
-        maxHedgeUsd: hedgeMaxUsd.toFixed(2), hedgeMaxRatio: config.HEDGE_MAX_RATIO,
-      });
+  // ─── Hedge guard (ratio-based): trade is a hedge if price < HEDGE_PRICE_RATIO * opposite avg buy price ───
+  let hedgeMaxUsd = Infinity;
+  // Pre-filter: since avgBuyPrice ≤ 1.0 on Polymarket, ratio * avgBuyPrice ≤ ratio.
+  // Any trade priced at or above the ratio itself cannot be a hedge.
+  if (trade.side === 'BUY' && config.HEDGE_PRICE_RATIO > 0 && trade.price < config.HEDGE_PRICE_RATIO) {
+    const oppositePos = await getOppositePosition(trade.conditionId, trade.asset, allocation.id, isPaper);
+    if (oppositePos.avgBuyPrice > 0 && trade.price < config.HEDGE_PRICE_RATIO * oppositePos.avgBuyPrice
+        && oppositePos.netUsd >= 0.01) { // skip if opposite position fully exited
+      if (oppositePos.netUsd < config.HEDGE_MIN_OPPOSITE_USD) {
+        log.info('Hedge guard: blocked hedge without sufficient opposite position', {
+          trader: trade.proxyWallet.slice(0, 10),
+          price: trade.price, avgBuyPrice: oppositePos.avgBuyPrice.toFixed(3),
+          threshold: (config.HEDGE_PRICE_RATIO * oppositePos.avgBuyPrice).toFixed(3),
+          oppositeUsd: oppositePos.netUsd.toFixed(2),
+          minRequired: config.HEDGE_MIN_OPPOSITE_USD,
+          outcome: trade.outcome, title: trade.title?.slice(0, 50),
+        });
+        await createSkippedRecord(
+          trade,
+          `hedge guard: trade @${trade.price.toFixed(2)} < ${config.HEDGE_PRICE_RATIO} * opposite avg ${oppositePos.avgBuyPrice.toFixed(3)}, ` +
+          `opposite position $${oppositePos.netUsd.toFixed(2)} < $${config.HEDGE_MIN_OPPOSITE_USD} minimum`,
+          allocation.id,
+          isPaper,
+        );
+        return;
+      }
+      hedgeMaxUsd = oppositePos.netUsd * config.HEDGE_MAX_RATIO;
+      if (copyAmountUsd > hedgeMaxUsd) {
+        copyAmountUsd = hedgeMaxUsd;
+        log.info('Hedge guard: trimmed copy amount to max hedge ratio', {
+          trader: trade.proxyWallet.slice(0, 10),
+          price: trade.price, avgBuyPrice: oppositePos.avgBuyPrice.toFixed(3),
+          oppositeUsd: oppositePos.netUsd.toFixed(2),
+          maxHedgeUsd: hedgeMaxUsd.toFixed(2), hedgeMaxRatio: config.HEDGE_MAX_RATIO,
+        });
+      }
     }
   }
 
@@ -572,16 +574,16 @@ async function getNetPositionUsd(
 }
 
 /**
- * Hedge guard helper: find our net position USD on the OPPOSITE outcome
+ * Hedge guard helper: find our position on the OPPOSITE outcome
  * of the same binary market (conditionId).
- * Uses DetectedTrade records to discover the other tokenId, then queries our fills.
+ * Returns netUsd and avgBuyPrice for ratio-based hedge detection.
  */
-async function getOppositePositionUsd(
+async function getOppositePosition(
   conditionId: string,
   currentAsset: string,
   followAllocationId: string,
   isPaper: boolean,
-): Promise<number> {
+): Promise<{ netUsd: number; avgBuyPrice: number }> {
   const oppositeToken = await prisma.detectedTrade.findFirst({
     where: {
       conditionId,
@@ -589,8 +591,37 @@ async function getOppositePositionUsd(
     },
     select: { asset: true },
   });
-  if (!oppositeToken) return 0;
-  return getNetPositionUsd(oppositeToken.asset, followAllocationId, isPaper);
+  if (!oppositeToken) return { netUsd: 0, avgBuyPrice: 0 };
+
+  const fills = await prisma.copyTrade.findMany({
+    where: { tokenId: oppositeToken.asset, followAllocationId, isPaper, status: { in: ['FILLED', 'PENDING'] } },
+    select: { side: true, filledSize: true, filledPrice: true, requestedAmount: true, requestedPrice: true },
+  });
+
+  let netUsd = 0;
+  let buyCost = 0;
+  let buyShares = 0;
+  for (const fill of fills) {
+    let usd: number;
+    let shares: number;
+    if (fill.filledSize != null && fill.filledPrice != null) {
+      usd = fill.filledSize * fill.filledPrice;
+      shares = fill.filledSize;
+    } else {
+      usd = fill.requestedAmount;
+      shares = fill.requestedAmount / (fill.filledPrice ?? fill.requestedPrice ?? 1);
+    }
+    if (fill.side === 'BUY') {
+      netUsd += usd;
+      buyCost += usd;
+      buyShares += shares;
+    } else {
+      netUsd -= usd;
+    }
+  }
+  netUsd = Math.max(netUsd, 0);
+  const avgBuyPrice = buyShares > 0 ? buyCost / buyShares : 0;
+  return { netUsd, avgBuyPrice };
 }
 
 // ─── Cached API position check for dust tiebreaker ───

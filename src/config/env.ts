@@ -73,7 +73,7 @@ const envSchema = z.object({
   MIN_SIGNAL_TRADE_USD: z.coerce.number().min(0).default(0), // Skip BUY trades where trader's USD < this (0 = disabled)
 
   // Hedge guard: block low-probability BUY trades unless opposite outcome has sufficient position
-  HEDGE_PRICE_THRESHOLD: z.coerce.number().min(0).max(0.20).default(0.099),  // ≤9.9¢ = potential hedge
+  HEDGE_PRICE_RATIO: z.coerce.number().min(0).max(0.50).default(0.25),  // trade.price < ratio * opposite avgBuyPrice = hedge (0 = disabled)
   HEDGE_MIN_OPPOSITE_USD: z.coerce.number().min(0).max(1000).default(5),     // need ≥$5 on opposite side
   HEDGE_MAX_RATIO: z.coerce.number().min(0).max(1.0).default(0.20),         // max 20% of opposite (5:1)
 

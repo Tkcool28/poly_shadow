@@ -54,10 +54,11 @@ function getOrCreateMutex(allocationId: string): Mutex {
 
 // ─── DrainCache (Change 3) ───
 
-interface CachedPosition { netShares: number; netUsd: number; }
+interface CachedPosition { netShares: number; netUsd: number; buyCost: number; buyShares: number; }
 
 interface DrainCache {
   getPosition(tokenId: string, allocationId: string, isPaper: boolean): CachedPosition;
+  getOppositeTokenId(conditionId: string, currentAsset: string): string | null;
   addPending(tokenId: string, allocationId: string, isPaper: boolean,
              usd: number, shares: number, side: 'BUY' | 'SELL'): void;
   getPendingCapital(allocationId: string): number;
@@ -67,11 +68,12 @@ interface DrainCache {
 
 async function buildDrainCache(
   conditionIds: string[],
+  batchTokenMap: Map<string, Set<string>>,
 ): Promise<DrainCache> {
-  // Query 1: Positions (FILLED + PENDING)
+  // Query 1: Positions (FILLED + PENDING) + BUY-side cost basis for hedge ratio
   const positionRows = await prisma.$queryRaw<Array<{
     tokenId: string; followAllocationId: string; isPaper: boolean;
-    netShares: number; netUsd: number;
+    netShares: number; netUsd: number; buyCost: number; buyShares: number;
   }>>`
     SELECT "tokenId", "followAllocationId", "isPaper",
       SUM(CASE
@@ -81,7 +83,9 @@ async function buildDrainCache(
       SUM(CASE
         WHEN side='BUY' THEN COALESCE("filledSize" * "filledPrice", "requestedAmount", 0)
         ELSE -COALESCE("filledSize" * "filledPrice", "requestedAmount", 0)
-      END)::float as "netUsd"
+      END)::float as "netUsd",
+      SUM(CASE WHEN side='BUY' THEN COALESCE("filledSize" * "filledPrice", "requestedAmount", 0) ELSE 0 END)::float as "buyCost",
+      SUM(CASE WHEN side='BUY' THEN COALESCE("filledSize", "requestedAmount" / NULLIF("requestedPrice", 0), 0) ELSE 0 END)::float as "buyShares"
     FROM "CopyTrade" WHERE status IN ('FILLED', 'PENDING')
     GROUP BY "tokenId", "followAllocationId", "isPaper"
   `;
@@ -92,6 +96,8 @@ async function buildDrainCache(
     positionCache.set(key, {
       netShares: Math.max(row.netShares ?? 0, 0),
       netUsd: Math.max(row.netUsd ?? 0, 0),
+      buyCost: Math.max(row.buyCost ?? 0, 0),
+      buyShares: Math.max(row.buyShares ?? 0, 0),
     });
   }
 
@@ -156,18 +162,52 @@ async function buildDrainCache(
     }
   }
 
+  // Build opposite token map: conditionId → Set<tokenId>
+  // Start from batch trades (zero-cost), then fill gaps from DB
+  const oppositeTokenMap = new Map<string, Set<string>>();
+  for (const [cid, tokens] of batchTokenMap) {
+    oppositeTokenMap.set(cid, new Set(tokens));
+  }
+  const needDbLookup = uniqueConditionIds.filter(cid => {
+    const s = oppositeTokenMap.get(cid);
+    return !s || s.size < 2;
+  });
+  if (needDbLookup.length > 0) {
+    const knownTokenRows = await prisma.detectedTrade.findMany({
+      where: { conditionId: { in: needDbLookup } },
+      distinct: ['conditionId', 'asset'],
+      select: { conditionId: true, asset: true },
+    });
+    for (const row of knownTokenRows) {
+      const set = oppositeTokenMap.get(row.conditionId) ?? new Set();
+      set.add(row.asset);
+      oppositeTokenMap.set(row.conditionId, set);
+    }
+  }
+
   return {
     getPosition(tokenId, allocationId, isPaper) {
       const key = `${tokenId}:${allocationId}:${isPaper}`;
-      return positionCache.get(key) ?? { netShares: 0, netUsd: 0 };
+      return positionCache.get(key) ?? { netShares: 0, netUsd: 0, buyCost: 0, buyShares: 0 };
+    },
+
+    getOppositeTokenId(conditionId, currentAsset) {
+      const tokens = oppositeTokenMap.get(conditionId);
+      if (!tokens) return null;
+      for (const t of tokens) {
+        if (t !== currentAsset) return t;
+      }
+      return null;
     },
 
     addPending(tokenId, allocationId, isPaper, usd, shares, side) {
       const key = `${tokenId}:${allocationId}:${isPaper}`;
-      const pos = positionCache.get(key) ?? { netShares: 0, netUsd: 0 };
+      const pos = positionCache.get(key) ?? { netShares: 0, netUsd: 0, buyCost: 0, buyShares: 0 };
       if (side === 'BUY') {
         pos.netShares += shares;
         pos.netUsd += usd;
+        pos.buyCost += usd;
+        pos.buyShares += shares;
       } else {
         pos.netShares -= shares;
         pos.netUsd -= usd;
@@ -175,6 +215,8 @@ async function buildDrainCache(
       positionCache.set(key, {
         netShares: Math.max(pos.netShares, 0),
         netUsd: Math.max(pos.netUsd, 0),
+        buyCost: pos.buyCost,
+        buyShares: pos.buyShares,
       });
       if (side === 'BUY') {
         pendingCapitalMap.set(allocationId, (pendingCapitalMap.get(allocationId) ?? 0) + usd);
@@ -316,26 +358,44 @@ async function phaseA(
     if (copyAmountUsd > remaining) copyAmountUsd = remaining;
   }
 
-  // Hedge guard
+  // Hedge guard (ratio-based): trade is a hedge if price < HEDGE_PRICE_RATIO * opposite avg buy price
   let hedgeMaxUsd = Infinity;
-  if (trade.side === 'BUY' && trade.price <= config.HEDGE_PRICE_THRESHOLD && config.HEDGE_PRICE_THRESHOLD > 0) {
-    // Opposite token discovery still needs DB
-    const oppositeToken = await prisma.detectedTrade.findFirst({
-      where: { conditionId: trade.conditionId, asset: { not: trade.asset } },
-      select: { asset: true },
-    });
-    const oppositeUsd = oppositeToken
-      ? cache.getPosition(oppositeToken.asset, allocation.id, isPaper).netUsd
-      : 0;
-    if (oppositeUsd < config.HEDGE_MIN_OPPOSITE_USD) {
-      await createSkippedRecord(trade,
-        `hedge guard: trade @${trade.price.toFixed(2)} is ≤${config.HEDGE_PRICE_THRESHOLD} threshold, ` +
-        `opposite position $${oppositeUsd.toFixed(2)} < $${config.HEDGE_MIN_OPPOSITE_USD} minimum`,
-        allocation.id, isPaper);
-      return null;
+  // Pre-filter: since avgBuyPrice ≤ 1.0 on Polymarket, ratio * avgBuyPrice ≤ ratio.
+  // Any trade priced at or above the ratio itself cannot be a hedge.
+  if (trade.side === 'BUY' && config.HEDGE_PRICE_RATIO > 0 && trade.price < config.HEDGE_PRICE_RATIO) {
+    const oppositeTokenId = cache.getOppositeTokenId(trade.conditionId, trade.asset);
+    if (oppositeTokenId) {
+      const oppositePos = cache.getPosition(oppositeTokenId, allocation.id, isPaper);
+      const avgBuyPrice = oppositePos.buyShares > 0 ? oppositePos.buyCost / oppositePos.buyShares : 0;
+      if (avgBuyPrice > 0 && trade.price < config.HEDGE_PRICE_RATIO * avgBuyPrice
+          && oppositePos.netUsd >= 0.01) { // skip if opposite position fully exited
+        if (oppositePos.netUsd < config.HEDGE_MIN_OPPOSITE_USD) {
+          log.info('Hedge guard: blocked hedge without sufficient opposite position', {
+            trader: trade.proxyWallet.slice(0, 10),
+            price: trade.price, avgBuyPrice: avgBuyPrice.toFixed(3),
+            threshold: (config.HEDGE_PRICE_RATIO * avgBuyPrice).toFixed(3),
+            oppositeUsd: oppositePos.netUsd.toFixed(2),
+            minRequired: config.HEDGE_MIN_OPPOSITE_USD,
+            outcome: trade.outcome, title: trade.title?.slice(0, 50),
+          });
+          await createSkippedRecord(trade,
+            `hedge guard: trade @${trade.price.toFixed(2)} < ${config.HEDGE_PRICE_RATIO} * opposite avg ${avgBuyPrice.toFixed(3)}, ` +
+            `opposite position $${oppositePos.netUsd.toFixed(2)} < $${config.HEDGE_MIN_OPPOSITE_USD} minimum`,
+            allocation.id, isPaper);
+          return null;
+        }
+        hedgeMaxUsd = oppositePos.netUsd * config.HEDGE_MAX_RATIO;
+        if (copyAmountUsd > hedgeMaxUsd) {
+          copyAmountUsd = hedgeMaxUsd;
+          log.info('Hedge guard: trimmed copy amount to max hedge ratio', {
+            trader: trade.proxyWallet.slice(0, 10),
+            price: trade.price, avgBuyPrice: avgBuyPrice.toFixed(3),
+            oppositeUsd: oppositePos.netUsd.toFixed(2),
+            maxHedgeUsd: hedgeMaxUsd.toFixed(2), hedgeMaxRatio: config.HEDGE_MAX_RATIO,
+          });
+        }
+      }
     }
-    hedgeMaxUsd = oppositeUsd * config.HEDGE_MAX_RATIO;
-    if (copyAmountUsd > hedgeMaxUsd) copyAmountUsd = hedgeMaxUsd;
   }
 
   // CLOB $1 minimum (live BUY only)
@@ -570,9 +630,15 @@ async function drainParallel(
   pending: DetectedTradeRow[],
   isShutdown: () => boolean,
 ): Promise<number> {
-  // 1. Build drain cache (3 bulk SQL queries)
+  // 1. Build drain cache (3 bulk SQL queries + opposite token map)
   const conditionIds = pending.map(t => t.conditionId);
-  const drainCache = await buildDrainCache(conditionIds);
+  const batchTokenMap = new Map<string, Set<string>>();
+  for (const trade of pending) {
+    const set = batchTokenMap.get(trade.conditionId) ?? new Set();
+    set.add(trade.asset);
+    batchTokenMap.set(trade.conditionId, set);
+  }
+  const drainCache = await buildDrainCache(conditionIds, batchTokenMap);
 
   // 2. Group trades by proxyWallet (preserves SELLs-first order within each group)
   const tradesByWallet = new Map<string, DetectedTradeRow[]>();
