@@ -83,6 +83,14 @@ const envSchema = z.object({
   // Anti-cycle: per-token cool-down after a SELL fill to prevent market-making spread loss
   TOKEN_SELL_COOLDOWN_MS: z.coerce.number().min(0).default(60000), // 60s — 0 = disabled
 
+  // Midpoint WS cache (eliminates REST getMidpoint() in stale-signal guard)
+  MIDPOINT_CACHE_ENABLED: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+  MIDPOINT_CACHE_MAX_AGE_MS: z.coerce.number().default(5_000),    // 5s cache TTL
+  MIDPOINT_CACHE_PRUNE_MS: z.coerce.number().default(600_000),    // 10min subscription TTL
+
   // Pipeline optimization feature flags
   POSITION_CACHE_ENABLED: z
     .string()

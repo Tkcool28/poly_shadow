@@ -28,6 +28,7 @@ import { sweepPreResolutionSells } from '../services/pre-resolution-seller';
 import { resolveMarkets } from '../services/market-resolver';
 import { computeSellCostBasis } from '../lib/cost-basis';
 import { auditAllAllocations, auditPhantomPositions } from '../lib/capital-audit';
+import { initMidpointCache, closeMidpointCache, ensureSubscribed } from '../services/midpoint-cache';
 import { PgListener } from '../lib/pg-listen';
 
 const JOB_NAME = 'copy-trader';
@@ -742,6 +743,7 @@ async function main() {
     if (shuttingDown) return;
     shuttingDown = true;
     log.info(`Received ${signal} during init, shutting down...`);
+    closeMidpointCache();
     stopPortfolioRefresh();
     await prisma.$disconnect();
     process.exit(0);
@@ -759,6 +761,9 @@ async function main() {
       && config.CLOB_API_PASSPHRASE && config.FUNDER_ADDRESS) {
     try {
       await initExecutor();
+      if (config.MIDPOINT_CACHE_ENABLED) {
+        initMidpointCache();
+      }
       log.info('Copy-trader daemon started (live + paper trading available)');
     } catch (err: any) {
       log.error(`CLOB executor init failed — LIVE TRADING UNAVAILABLE: ${err.message}`);
@@ -892,8 +897,11 @@ async function main() {
       }
 
       // Pre-warm CLOB metadata cache for all unique tokens in this batch
-      const uniqueTokenIds = [...new Set(pending.map(t => t.asset))];
+      const uniqueTokenIds = [...new Set(pending.map(t => t.asset))].filter(Boolean);
       await preWarmMetadata(uniqueTokenIds);
+
+      // Feed tokenIds to midpoint WS cache for stale-signal guard
+      if (uniqueTokenIds.length > 0) ensureSubscribed(uniqueTokenIds);
 
       if (parallelDrainEnabled) {
         processedCount = await drainParallel(pending, () => shuttingDown || isShuttingDown());
@@ -1047,6 +1055,7 @@ async function main() {
         setTimeout(() => { clearInterval(check); resolve(); }, 10_000);
       });
     }
+    closeMidpointCache();
     await prisma.$disconnect();
     process.exit(0);
   };

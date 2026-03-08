@@ -3,6 +3,7 @@ import type { ApiKeyCreds, TickSize } from '@polymarket/clob-client';
 import { Wallet } from '@ethersproject/wallet';
 import { createJobLogger } from '../lib/logger';
 import { config } from '../config/env';
+import { getMidFromCache } from './midpoint-cache';
 
 const log = createJobLogger('trade-executor');
 
@@ -194,12 +195,22 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
   // Fail-open: getMidpoint errors proceed with the order normally.
   if (side === 'BUY' && detectedPrice > 0.005) {
     try {
-      const midpointResp = await client.getMidpoint(tokenId);
-      const currentMid = parseFloat(midpointResp?.mid ?? '1');
+      // Tier 1: WebSocket cache (0ms)
+      let currentMid = getMidFromCache(tokenId);
+      let midSource: 'cache' | 'api' = 'cache';
+
+      // Tier 2: API fallback if cache miss or stale
+      if (currentMid === null) {
+        midSource = 'api';
+        const midpointResp = await client.getMidpoint(tokenId);
+        currentMid = parseFloat(midpointResp?.mid ?? '1');
+      }
+
       if (currentMid <= 0.01 || currentMid < detectedPrice * 0.30) {
         log.warn('Stale signal: market price at floor or collapsed vs signal — skipping', {
           detectedPrice,
           currentMid,
+          midSource,
           dropPct: (((detectedPrice - currentMid) / detectedPrice) * 100).toFixed(1),
         });
         return {

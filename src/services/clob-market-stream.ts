@@ -139,6 +139,11 @@ export class ClobMarketStream {
           if (item.event_type === 'last_trade_price') {
             this.tradesReceived++;
             this.onTrade(item as ClobTradeEvent);
+          } else if (item.event_type) {
+            log.debug('CLOB WS non-trade event', {
+              event_type: item.event_type,
+              asset_id: item.asset_id,
+            });
           }
         }
       } catch {
