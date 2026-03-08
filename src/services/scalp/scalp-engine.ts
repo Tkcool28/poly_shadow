@@ -170,7 +170,7 @@ export class ScalpEngine {
     }
 
     // Daily loss check
-    const capital = await prisma.scalpCapital.findUnique({
+    const capital = await prisma.scalpCapital.findFirst({
       where: { isPaper: config.SCALP_IS_PAPER },
     });
     if (!capital) {
@@ -181,7 +181,7 @@ export class ScalpEngine {
     // Reset daily loss at midnight UTC
     const now = new Date();
     if (capital.dailyLossResetAt.toISOString().slice(0, 10) !== now.toISOString().slice(0, 10)) {
-      await prisma.scalpCapital.update({
+      await prisma.scalpCapital.updateMany({
         where: { isPaper: config.SCALP_IS_PAPER },
         data: { dailyLossUsd: 0, dailyLossResetAt: now },
       });
@@ -198,15 +198,40 @@ export class ScalpEngine {
       return;
     }
 
-    // Paper mode: check real orderbook liquidity
+    // Bid-side spread check (applies to BOTH paper and live modes)
+    const entryBook = await scalpGetOrderBook(signal.tokenId);
+    if (!entryBook) {
+      log.warn('Orderbook unavailable, skipping', { slug: signal.slug, tokenId: signal.tokenId.slice(0, 20) });
+      await recordCycle(signal, 'SKIPPED', 'orderbook unavailable');
+      return;
+    }
+
+    const bestBid = parseFloat(entryBook?.bids?.[0]?.price ?? '0');
+    if (bestBid < config.SCALP_MIN_MEANINGFUL_BID) {
+      log.info('No bid liquidity, skipping', {
+        slug: signal.slug,
+        bestBid: bestBid.toFixed(2),
+        currentAsk: signal.currentAsk.toFixed(2),
+      });
+      await recordCycle(signal, 'SKIPPED', `no bid liquidity: bestBid=${bestBid.toFixed(2)}`);
+      return;
+    }
+
+    const spread = signal.currentAsk - bestBid;
+    if (spread > config.SCALP_MAX_ENTRY_SPREAD) {
+      log.info('Spread too wide, skipping', {
+        slug: signal.slug,
+        spread: spread.toFixed(2),
+        bestBid: bestBid.toFixed(2),
+        ask: signal.currentAsk.toFixed(2),
+      });
+      await recordCycle(signal, 'SKIPPED', `spread too wide: ${spread.toFixed(2)}`);
+      return;
+    }
+
+    // Paper mode: ALSO check ask-side liquidity (uses same book, no extra API call)
     if (config.SCALP_IS_PAPER) {
-      const book = await scalpGetOrderBook(signal.tokenId);
-      if (!book) {
-        log.warn('Orderbook unavailable, skipping', { slug: signal.slug, tokenId: signal.tokenId.slice(0, 20) });
-        await recordCycle(signal, 'SKIPPED', 'orderbook unavailable');
-        return;
-      }
-      const availableShares = (book.asks ?? [])
+      const availableShares = (entryBook.asks ?? [])
         .filter((a) => parseFloat(a.price) <= signal.currentAsk + 0.02)
         .reduce((sum, a) => sum + parseFloat(a.size), 0);
       const requiredShares = config.SCALP_POSITION_SIZE_USD / signal.currentAsk;

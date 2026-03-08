@@ -91,7 +91,14 @@ export class ScalpExitManager {
     const book = await scalpGetOrderBook(exit.tokenId);
     const bestBid = parseFloat(book?.bids?.[0]?.price ?? '0');
 
-    if (bestBid <= 0) return; // No bids available
+    if (bestBid < config.SCALP_MIN_MEANINGFUL_BID) {
+      log.debug('Bid below meaningful threshold, holding for settlement', {
+        cycleId: cycleId.slice(0, 12),
+        bestBid: bestBid.toFixed(4),
+        threshold: config.SCALP_MIN_MEANINGFUL_BID,
+      });
+      return; // Skip stop-loss — let convergence timeout → settlement handle it
+    }
 
     // Stop-loss check
     const stopLossPrice = exit.entryPrice - config.SCALP_STOP_LOSS_CENTS / 100;
@@ -167,6 +174,7 @@ export class ScalpExitManager {
     log.info(`Exit: ${method}`, {
       cycleId: cycleId.slice(0, 12),
       entryPrice: exit.entryPrice.toFixed(4),
+      bestBid: bidPrice.toFixed(4),
       exitPrice: sellPrice.toFixed(4),
       pnl: pnl.toFixed(4),
       method,

@@ -27,7 +27,7 @@ let botDetector: ScalpBotDetector | null = null;
  * Bootstrap ScalpCapital record if it doesn't exist.
  */
 async function bootstrapCapital(): Promise<void> {
-  const existing = await prisma.scalpCapital.findUnique({
+  const existing = await prisma.scalpCapital.findFirst({
     where: { isPaper: config.SCALP_IS_PAPER },
   });
 

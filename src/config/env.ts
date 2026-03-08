@@ -228,6 +228,8 @@ const envSchema = z.object({
   SCALP_MAX_DAILY_LOSS_USD: z.coerce.number().min(1).default(30),
   SCALP_MIN_EDGE_CENTS: z.coerce.number().min(1).default(5),
   SCALP_STOP_LOSS_CENTS: z.coerce.number().min(1).default(15),
+  SCALP_MIN_MEANINGFUL_BID: z.coerce.number().default(0.05),        // below this = no liquid bids
+  SCALP_MAX_ENTRY_SPREAD: z.coerce.number().default(0.30),          // skip entry if spread > 30¢
 
   // Scalp exit
   SCALP_CONVERGENCE_SELL_TIMEOUT_MS: z.coerce.number().default(120000),       // 2 min
