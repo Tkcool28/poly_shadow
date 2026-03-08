@@ -58,6 +58,10 @@ export class ChainTradeWatcher {
   private getLiveWallets: () => Set<string>; // returns only live-allocation wallets (~7)
   private subscribedWallets: Set<string> = new Set();
   private recentTxHashes: Map<string, number> = new Map(); // dedupKey → timestamp ms
+  // Suppress complementary-side fills: CTF exchange emits OrderFilled for both
+  // sides of a binary market fill (BUY Down + phantom SELL Up from same tx).
+  // Track first-seen side per tx+wallet to suppress the opposite-side phantom.
+  private recentTxSides: Map<string, string> = new Map(); // "txHash:wallet" → first side seen
   private heartbeatCount = 0;
 
   // Per-wallet subscription tracking: id → confirmed
@@ -226,6 +230,14 @@ export class ChainTradeWatcher {
         if (ts < cutoff) this.recentTxHashes.delete(key);
       }
     }
+    // Evict recentTxSides in sync (same lifecycle — insertion-ordered, cap at 500)
+    if (this.recentTxSides.size > 500) {
+      let i = 0;
+      for (const key of this.recentTxSides.keys()) {
+        if (i++ >= 250) break;
+        this.recentTxSides.delete(key);
+      }
+    }
 
     this.eventsReceived++;
     this.lastEventAt = new Date();
@@ -308,6 +320,26 @@ export class ChainTradeWatcher {
             txHash: logEntry.transactionHash?.slice(0, 18),
           });
           return;
+        }
+
+        // Suppress opposite-side fills from same tx+wallet (complementary match phantoms).
+        // When a trader BUYs Down, the CTF exchange can emit an OrderFilled for the Up
+        // side as well (complementary token matching). The first-seen side per tx wins.
+        // Synchronous check → zero race condition risk (Node.js single-threaded event loop).
+        const txWalletKey = `${logEntry.transactionHash}:${matchedWallet}`;
+        const firstSide = this.recentTxSides.get(txWalletKey);
+        if (firstSide !== undefined && firstSide !== side) {
+          log.debug('Suppressed opposite-side fill from same tx (complementary match)', {
+            wallet: matchedWallet.slice(0, 10),
+            suppressedSide: side,
+            existingSide: firstSide,
+            tokenId: tokenId.slice(0, 16),
+            txHash: logEntry.transactionHash?.slice(0, 18),
+          });
+          return;
+        }
+        if (firstSide === undefined) {
+          this.recentTxSides.set(txWalletKey, side);
         }
 
         log.debug('OrderFilled decoded', {

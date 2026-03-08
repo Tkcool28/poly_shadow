@@ -244,8 +244,11 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
     slippagePrice,
   });
 
+  const t0 = Date.now();
+  let t1: number | null = null;
   try {
     const { tickSize, negRisk } = await getMarketMetadata(tokenId);
+    t1 = Date.now();
 
     const response = await client.createAndPostMarketOrder(
       {
@@ -257,6 +260,15 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
       { tickSize, negRisk },
       OrderType.FAK,
     );
+    const t2 = Date.now();
+
+    log.info('Executor timing', {
+      metadataMs: t1! - t0,
+      clobOrderMs: t2 - t1!,
+      totalMs: t2 - t0,
+      side,
+      tokenId: tokenId.slice(0, 20) + '...',
+    });
 
     if (response?.success === false || response?.errorMsg) {
       const errorMsg: string = response.errorMsg || 'Unknown order error';
@@ -450,6 +462,15 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
       transactionHashes: txHashes,
     };
   } catch (err: any) {
+    const tErr = Date.now();
+    log.info('Executor timing (error path)', {
+      metadataMs: t1 ? t1 - t0 : null,
+      totalMs: tErr - t0,
+      side,
+      tokenId: tokenId.slice(0, 20) + '...',
+      error: (err.message || String(err)).slice(0, 80),
+    });
+
     const msg: string = err.message || String(err);
 
     // Expired orderbook — market closed, tokenId no longer valid.

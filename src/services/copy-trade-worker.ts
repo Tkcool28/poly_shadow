@@ -325,6 +325,8 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
 
   // ─── Execute ───
 
+  const preExecMs = Date.now();
+
   // Create PENDING record (always store requestedAmount as USD)
   // P2002 guard: if another concurrent call already claimed this detectedTradeId,
   // silently return — the unique constraint on detectedTradeId prevents duplicate CLOB orders.
@@ -347,6 +349,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     throw err;
   }
 
+  const postPendingMs = Date.now();
   const executeFn = isPaper ? paperExecute : realExecute;
 
   let result: ExecuteOrderResult;
@@ -369,7 +372,19 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     };
   }
 
-  const latencyMs = Date.now() - startMs;
+  const postExecMs = Date.now();
+  const latencyMs = postExecMs - startMs;
+
+  log.info('Copy trade timing', {
+    trader: trade.proxyWallet.slice(0, 10),
+    side: trade.side,
+    status: result.status,
+    dbChecksMs: preExecMs - startMs,
+    pendingInsertMs: postPendingMs - preExecMs,
+    executorMs: postExecMs - postPendingMs,
+    totalMs: latencyMs,
+    detectionSource: trade.detectionSource,
+  });
 
   // Calculate slippage if filled
   let slippageBps: number | null = null;
