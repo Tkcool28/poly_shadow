@@ -424,6 +424,14 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
         where: { id: allocation.id },
       });
 
+      // Guard: if allocation was deactivated mid-flight (e.g. circuit breaker), skip capital update
+      if (!fresh.isActive) {
+        log.warn('Allocation deactivated mid-flight, skipping capital update', {
+          tradeId: copyTrade.id, allocationId: allocation.id,
+        });
+        return;
+      }
+
       if (trade.side === 'BUY') {
         // Defense-in-depth: cap decrement to available capital to prevent negative balance
         const safeDecrement = Math.min(usdValue, Math.max(fresh.currentCapital, 0));

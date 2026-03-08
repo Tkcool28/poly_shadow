@@ -124,6 +124,20 @@ const envSchema = z.object({
   STALE_TRADE_CUTOFF_MS: z.coerce.number().default(600000), // 10 min (was hardcoded 5 min)
   MARKET_END_GATEKEEP_ENABLED: z.string().default('true').transform((v) => v === 'true'),
 
+  // Phantom position auto-cleanup (runs on hourly capital audit timer)
+  PHANTOM_AUTO_CLEANUP_ENABLED: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+  PHANTOM_AUTO_CLEANUP_MAX_COST_USD: z.coerce.number().min(1).max(100).default(10),
+
+  // Per-allocation circuit breaker: auto-deactivate live allocations on deep drawdown
+  ALLOCATION_CIRCUIT_BREAKER_ENABLED: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+  ALLOCATION_CIRCUIT_BREAKER_THRESHOLD: z.coerce.number().min(0).max(1.0).default(0.30), // trip at (CC+DC)/initial < 30%
+
   // CLOB reconciliation & balance check
   BALANCE_CHECK_INTERVAL_MS: z.coerce.number().default(600000), // 10 min
   BALANCE_MISMATCH_THRESHOLD: z.coerce.number().default(5), // $5 warn threshold

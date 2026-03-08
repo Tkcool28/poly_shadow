@@ -1,6 +1,8 @@
 import { prisma } from './prisma';
 import { createJobLogger } from './logger';
 import { getAllPositions } from '../api/data-api';
+import { getOrCreateMutex } from './allocation-mutex';
+import { config } from '../config/env';
 
 const log = createJobLogger('capital-audit');
 
@@ -273,6 +275,13 @@ export async function auditPhantomPositions(funderAddress: string): Promise<Phan
 
   // 2. Fetch API positions
   const apiPositions = await getAllPositions(funderAddress);
+
+  // GUARD: If API returned 0 positions but DB shows active fills, likely API outage — abort to prevent mass phantom marking
+  if (apiPositions.length === 0 && positionMap.size > 0) {
+    log.warn('Phantom audit aborted: API returned 0 positions but DB has active fills (possible API outage)');
+    return [];
+  }
+
   const apiMap = new Map<string, number>();
   for (const pos of apiPositions) {
     apiMap.set(pos.asset, pos.size);
@@ -327,4 +336,178 @@ export async function auditPhantomPositions(funderAddress: string): Promise<Phan
   }
 
   return results;
+}
+
+// ─── Phantom Auto-Cleanup ───
+
+export interface PhantomCleanupResult {
+  cleaned: number;
+  capitalCorrections: number;
+}
+
+/**
+ * Detect and auto-fix phantom positions: mark phantom FILLED trades as SKIPPED,
+ * then replay capital to correct CC/DC on affected allocations.
+ *
+ * Safeguards:
+ *  - Cost basis threshold prevents auto-fixing real positions during API glitches
+ *  - Annotation dedup prevents double cleanup
+ *  - Per-allocation mutex prevents race conditions with drain pipeline
+ */
+export async function cleanupPhantomPositions(funderAddress: string): Promise<PhantomCleanupResult> {
+  const maxCost = config.PHANTOM_AUTO_CLEANUP_MAX_COST_USD;
+  const phantomResults = await auditPhantomPositions(funderAddress);
+  const confirmedPhantoms = phantomResults.filter(p => p.isPhantom);
+
+  if (confirmedPhantoms.length === 0) {
+    return { cleaned: 0, capitalCorrections: 0 };
+  }
+
+  let cleaned = 0;
+  const affectedAllocations = new Set<string>();
+
+  for (const phantom of confirmedPhantoms) {
+    // Conservative guard: skip high-cost positions that might be real but API-inconsistent
+    if (phantom.dbCostBasis > maxCost) {
+      log.warn('Phantom cleanup: skipping high-cost position (manual review needed)', {
+        tokenId: phantom.tokenId.slice(0, 16),
+        allocation: phantom.followAllocationId,
+        dbCost: phantom.dbCostBasis.toFixed(2),
+        maxCost,
+      });
+      continue;
+    }
+
+    // Find all FILLED trades for this phantom token+allocation
+    const trades = await prisma.copyTrade.findMany({
+      where: {
+        tokenId: phantom.tokenId,
+        followAllocationId: phantom.followAllocationId,
+        status: 'FILLED',
+        isPaper: false,
+      },
+      select: { id: true, status: true, filledSize: true, filledPrice: true, failReason: true },
+    });
+
+    if (trades.length === 0) continue;
+
+    // Mark phantom trades as SKIPPED with annotation (skip if already annotated)
+    let markedCount = 0;
+    for (const trade of trades) {
+      if (trade.failReason?.includes('[phantom-fix')) continue; // idempotent: skip already-fixed trades
+
+      const annotation = `[phantom-fix-auto] original: status=${trade.status}, filledSize=${trade.filledSize}, filledPrice=${trade.filledPrice}`;
+      await prisma.copyTrade.update({
+        where: { id: trade.id },
+        data: {
+          status: 'SKIPPED',
+          failReason: trade.failReason ? `${trade.failReason} | ${annotation}` : annotation,
+        },
+      });
+      markedCount++;
+    }
+
+    if (markedCount > 0) {
+      cleaned += markedCount;
+      affectedAllocations.add(phantom.followAllocationId);
+      log.info('Phantom cleanup: marked trades as SKIPPED', {
+        tokenId: phantom.tokenId.slice(0, 16),
+        allocation: phantom.followAllocationId,
+        tradesFixed: markedCount,
+        dbShares: phantom.dbShares.toFixed(4),
+        dbCost: phantom.dbCostBasis.toFixed(2),
+      });
+    }
+  }
+
+  // Replay capital for affected allocations under mutex to prevent race with drain pipeline
+  let capitalCorrections = 0;
+  for (const allocId of affectedAllocations) {
+    try {
+      const mutex = getOrCreateMutex(allocId);
+      await mutex.runExclusive(async () => {
+        const audit = await auditAllocation(allocId);
+        await prisma.followAllocation.update({
+          where: { id: allocId },
+          data: {
+            currentCapital: audit.computedCC,
+            deployedCapital: audit.computedDC,
+          },
+        });
+        log.info('Phantom cleanup: corrected capital', {
+          allocationId: allocId,
+          ccBefore: audit.actualCC.toFixed(2),
+          ccAfter: audit.computedCC.toFixed(2),
+          dcBefore: audit.actualDC.toFixed(2),
+          dcAfter: audit.computedDC.toFixed(2),
+        });
+      });
+      capitalCorrections++;
+    } catch (err: any) {
+      log.error('Phantom cleanup: capital correction failed', {
+        allocationId: allocId,
+        error: err.message,
+      });
+    }
+  }
+
+  return { cleaned, capitalCorrections };
+}
+
+// ─── Per-Allocation Circuit Breaker ───
+
+export interface CircuitBreakerResult {
+  allocationId: string;
+  proxyWallet: string;
+  traderName: string | null;
+  initialCapital: number;
+  remainingCapital: number;
+  drawdownPercent: number;
+}
+
+/**
+ * Check all active live allocations for deep drawdown and auto-deactivate.
+ * Scoped to live only (isPaper=false) — paper allocations don't risk real capital.
+ */
+export async function checkCircuitBreakers(threshold: number): Promise<CircuitBreakerResult[]> {
+  const allocations = await prisma.followAllocation.findMany({
+    where: { isActive: true, isPaper: false },
+    include: { trader: { select: { userName: true } } },
+  });
+
+  const tripped: CircuitBreakerResult[] = [];
+
+  for (const alloc of allocations) {
+    if (alloc.initialCapital <= 0) continue; // guard: avoid division by zero from bad data
+
+    const remaining = alloc.currentCapital + alloc.deployedCapital;
+    const ratio = remaining / alloc.initialCapital;
+
+    if (ratio < threshold) {
+      await prisma.followAllocation.update({
+        where: { id: alloc.id },
+        data: { isActive: false },
+      });
+
+      const result: CircuitBreakerResult = {
+        allocationId: alloc.id,
+        proxyWallet: alloc.proxyWallet,
+        traderName: alloc.trader?.userName ?? null,
+        initialCapital: alloc.initialCapital,
+        remainingCapital: remaining,
+        drawdownPercent: (1 - ratio) * 100,
+      };
+      tripped.push(result);
+
+      log.warn('Circuit breaker tripped: deactivating allocation', {
+        trader: result.traderName ?? alloc.proxyWallet.slice(0, 10),
+        initialCapital: alloc.initialCapital.toFixed(2),
+        remainingCapital: remaining.toFixed(2),
+        drawdownPercent: result.drawdownPercent.toFixed(1),
+        threshold: (threshold * 100).toFixed(0) + '%',
+      });
+    }
+  }
+
+  return tripped;
 }

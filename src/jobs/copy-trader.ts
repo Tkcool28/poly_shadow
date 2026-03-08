@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import https from 'https';
 import axios from 'axios';
-import { Mutex } from 'async-mutex';
 import pLimit from 'p-limit';
 import { createJobLogger } from '../lib/logger';
 import { prisma } from '../lib/prisma';
@@ -27,8 +26,9 @@ import { reconcileStalePending } from '../services/clob-reconciler';
 import { sweepPreResolutionSells } from '../services/pre-resolution-seller';
 import { resolveMarkets } from '../services/market-resolver';
 import { computeSellCostBasis } from '../lib/cost-basis';
-import { auditAllAllocations, auditPhantomPositions } from '../lib/capital-audit';
+import { auditAllAllocations, auditPhantomPositions, cleanupPhantomPositions, checkCircuitBreakers } from '../lib/capital-audit';
 import { initMidpointCache, closeMidpointCache, ensureSubscribed } from '../services/midpoint-cache';
+import { getOrCreateMutex } from '../lib/allocation-mutex';
 import { PgListener } from '../lib/pg-listen';
 
 const JOB_NAME = 'copy-trader';
@@ -37,21 +37,7 @@ const CAPITAL_AUDIT_INTERVAL_MS = 3_600_000; // 1 hour
 
 // ─── Pipeline infrastructure (Change 5) ───
 
-const allocationMutexes = new Map<string, Mutex>();
 const clobLimiter = pLimit(10);
-
-function getOrCreateMutex(allocationId: string): Mutex {
-  let mutex = allocationMutexes.get(allocationId);
-  if (!mutex) {
-    // Safety cap: prevent unbounded growth from stale allocation IDs
-    if (allocationMutexes.size > 100) {
-      allocationMutexes.clear();
-    }
-    mutex = new Mutex();
-    allocationMutexes.set(allocationId, mutex);
-  }
-  return mutex;
-}
 
 // ─── DrainCache (Change 3) ───
 
@@ -1002,8 +988,18 @@ async function main() {
     if (shuttingDown || isShuttingDown()) return;
     try {
       await auditAllAllocations({ isPaper: false, threshold: 1.0 });
-      // Phantom position check — detection only, no auto-fix
-      if (config.FUNDER_ADDRESS) {
+
+      // Phantom position auto-cleanup (or detection-only fallback)
+      if (config.PHANTOM_AUTO_CLEANUP_ENABLED && config.FUNDER_ADDRESS) {
+        const result = await cleanupPhantomPositions(config.FUNDER_ADDRESS);
+        if (result.cleaned > 0) {
+          log.info('Phantom auto-cleanup completed', {
+            tradesCleaned: result.cleaned,
+            allocationsFixed: result.capitalCorrections,
+          });
+        }
+      } else if (config.FUNDER_ADDRESS) {
+        // Fallback: detection-only (original behavior)
         const phantomResults = await auditPhantomPositions(config.FUNDER_ADDRESS);
         const confirmedPhantoms = phantomResults.filter(p => p.isPhantom);
         if (confirmedPhantoms.length > 0) {
@@ -1014,6 +1010,16 @@ async function main() {
               dbShares: p.dbShares.toFixed(4),
               dbCost: p.dbCostBasis.toFixed(2),
             })),
+          });
+        }
+      }
+
+      // Per-allocation circuit breaker (live only)
+      if (config.ALLOCATION_CIRCUIT_BREAKER_ENABLED) {
+        const tripped = await checkCircuitBreakers(config.ALLOCATION_CIRCUIT_BREAKER_THRESHOLD);
+        if (tripped.length > 0) {
+          log.warn(`Circuit breaker: ${tripped.length} allocation(s) deactivated`, {
+            traders: tripped.map(t => t.traderName ?? t.proxyWallet.slice(0, 10)),
           });
         }
       }

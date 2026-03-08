@@ -3,6 +3,7 @@ import { createJobLogger } from '../lib/logger';
 import { normalizeOutcome } from '../lib/normalize';
 import { getMarketsByConditionIds } from '../api/gamma-api';
 import { redeemWinningPositions, type ClaimablePosition } from './position-claim';
+import { config } from '../config/env';
 
 const log = createJobLogger('position-settlement');
 
@@ -234,6 +235,26 @@ export async function sweepPositionSettlements(): Promise<void> {
         },
         data: { status: 'SETTLED', settledAt: now },
       });
+
+      // Circuit breaker: check if settlement loss pushed allocation below threshold (live only)
+      if (config.ALLOCATION_CIRCUIT_BREAKER_ENABLED && !pos.isPaper && pnl < 0) {
+        const updated = await tx.followAllocation.findUniqueOrThrow({
+          where: { id: pos.followAllocationId },
+        });
+        if (updated.initialCapital <= 0) return; // guard: avoid division by zero from bad data
+        const ratio = (updated.currentCapital + updated.deployedCapital) / updated.initialCapital;
+        if (ratio < config.ALLOCATION_CIRCUIT_BREAKER_THRESHOLD) {
+          await tx.followAllocation.update({
+            where: { id: pos.followAllocationId },
+            data: { isActive: false },
+          });
+          log.warn('Circuit breaker tripped after settlement loss', {
+            allocationId: pos.followAllocationId,
+            ratio: ratio.toFixed(3),
+            pnl: pnl.toFixed(2),
+          });
+        }
+      }
     });
 
     settledCount++;
