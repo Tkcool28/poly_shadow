@@ -101,12 +101,12 @@ services:
     command: ["src/jobs/history-backfiller.ts"]
     environment:
       NODE_ENV: production
-      NODE_OPTIONS: --max-old-space-size=8192
+      NODE_OPTIONS: --max-old-space-size=1536
     stop_grace_period: 30s
     deploy:
       resources:
         limits:
-          memory: 9G
+          memory: 2G
 
   # ===========================================================================
   # Scheduled Workers (sleep-loop replicating PM2 cron_restart)
