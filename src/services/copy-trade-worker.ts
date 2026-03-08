@@ -54,6 +54,7 @@ export interface DetectedTradeRow {
   timestamp: number;
   compositeScore: number | null;
   detectedAt: Date;
+  detectionSource: string | null;
 }
 
 export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
@@ -355,6 +356,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       side: trade.side as 'BUY' | 'SELL',
       amount: executorAmount,
       detectedPrice: trade.price,
+      detectionSource: trade.detectionSource ?? undefined,
     });
   } catch (err: any) {
     result = {

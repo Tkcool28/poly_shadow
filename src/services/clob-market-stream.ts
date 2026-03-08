@@ -139,6 +139,22 @@ export class ClobMarketStream {
           if (item.event_type === 'last_trade_price') {
             this.tradesReceived++;
             this.onTrade(item as ClobTradeEvent);
+          } else if (item.event_type === 'price_change' && item.price_changes) {
+            for (const pc of item.price_changes) {
+              if (!pc.asset_id || !pc.price || !pc.size || !pc.side) continue;
+              this.tradesReceived++;
+              this.onTrade({
+                asset_id: pc.asset_id,
+                market: item.market || '',
+                price: pc.price,
+                size: pc.size,
+                side: pc.side,
+                fee_rate_bps: '',
+                timestamp: item.timestamp || String(Date.now()),
+                transaction_hash: '',  // Not available in price_change (hash is orderbook content hash)
+                event_type: 'last_trade_price',
+              } as ClobTradeEvent);
+            }
           } else if (item.event_type) {
             log.debug('CLOB WS non-trade event', {
               event_type: item.event_type,

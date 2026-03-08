@@ -259,6 +259,7 @@ interface PhaseAResult {
   maxPerTrade: number;
   maxPerPrediction: number;
   tradeInfo: { proxyWallet: string; userName: string | null; outcome: string; title: string | null };
+  detectionSource?: string;
 }
 
 // ─── Phase A: checks + PENDING create (under mutex) ───
@@ -497,6 +498,7 @@ async function phaseA(
       outcome: trade.outcome,
       title: trade.title,
     },
+    detectionSource: trade.detectionSource ?? undefined,
   };
 }
 
@@ -690,6 +692,7 @@ async function drainParallel(
               side: result.side,
               amount: result.executorAmount,
               detectedPrice: result.detectedPrice,
+              detectionSource: result.detectionSource,
             });
             return { result: clobResult, clobMs: Date.now() - clobStart };
           });

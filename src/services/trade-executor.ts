@@ -12,6 +12,7 @@ export interface ExecuteOrderParams {
   side: 'BUY' | 'SELL';
   amount: number; // BUY: USD amount, SELL: shares
   detectedPrice: number; // price from detected trade (for slippage calc)
+  detectionSource?: string; // 'CHAIN', 'POLL', 'WS' — used to skip stale-signal API for fresh signals
   _isRetry?: boolean; // internal: prevent infinite retry recursion
 }
 
@@ -144,7 +145,7 @@ export const CLOB_MIN_ORDER_USD = 1.0; // Polymarket hard minimum per live order
 export async function executeMarketOrder(params: ExecuteOrderParams): Promise<ExecuteOrderResult> {
   if (!client) throw new Error('CLOB client not initialized');
 
-  const { tokenId, side, amount, detectedPrice } = params;
+  const { tokenId, side, amount, detectedPrice, detectionSource } = params;
 
   // Guard: BUY USD amount must meet Polymarket's $1 minimum order size
   if (side === 'BUY' && amount < CLOB_MIN_ORDER_USD) {
@@ -197,20 +198,26 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
     try {
       // Tier 1: WebSocket cache (0ms)
       let currentMid = getMidFromCache(tokenId);
-      let midSource: 'cache' | 'api' = 'cache';
+      let midSource: 'cache' | 'api' | 'chain-skip' = 'cache';
 
       // Tier 2: API fallback if cache miss or stale
       if (currentMid === null) {
-        midSource = 'api';
-        const midpointResp = await client.getMidpoint(tokenId);
-        currentMid = parseFloat(midpointResp?.mid ?? '1');
+        if (detectionSource === 'CHAIN') {
+          // CHAIN signals are <2s old — skip 50-100ms API roundtrip (fail-open)
+          midSource = 'chain-skip';
+        } else {
+          midSource = 'api';
+          const midpointResp = await client.getMidpoint(tokenId);
+          currentMid = parseFloat(midpointResp?.mid ?? '1');
+        }
       }
 
-      if (currentMid <= 0.01 || currentMid < detectedPrice * 0.30) {
+      if (currentMid !== null && (currentMid <= 0.01 || currentMid < detectedPrice * 0.30)) {
         log.warn('Stale signal: market price at floor or collapsed vs signal — skipping', {
           detectedPrice,
           currentMid,
           midSource,
+          detectionSource,
           dropPct: (((detectedPrice - currentMid) / detectedPrice) * 100).toFixed(1),
         });
         return {

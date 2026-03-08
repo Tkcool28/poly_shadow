@@ -145,8 +145,11 @@ export class MidpointCache {
             this.onBestBidAsk(item);
           } else if (item.event_type === 'book' && item.asset_id) {
             this.onBook(item);
+          } else if (item.event_type === 'price_change' && item.price_changes) {
+            this.onPriceChange(item);
+          } else if (item.event_type === 'last_trade_price' && item.asset_id) {
+            this.onLastTradePrice(item);
           }
-          // Silently ignore other event types (price_change, last_trade_price, etc.)
         }
       } catch { /* non-JSON silently ignored */ }
     });
@@ -190,6 +193,33 @@ export class MidpointCache {
     }
     if (bestBid <= 0 || bestAsk === Infinity) return;
     this.cache.set(event.asset_id, { mid: (bestBid + bestAsk) / 2, updatedAt: Date.now() });
+  }
+
+  /**
+   * Extract best_bid/best_ask from price_change entries. Same data quality as
+   * onBestBidAsk — these are post-event bid/ask snapshots per fill.
+   */
+  private onPriceChange(event: { price_changes?: { asset_id: string; best_bid?: string; best_ask?: string }[] }): void {
+    if (!event.price_changes) return;
+    for (const pc of event.price_changes) {
+      if (!pc.asset_id || !pc.best_bid || !pc.best_ask) continue;
+      const bid = parseFloat(pc.best_bid);
+      const ask = parseFloat(pc.best_ask);
+      if (isNaN(bid) || isNaN(ask) || bid <= 0 || ask <= 0) continue;
+      this.cache.set(pc.asset_id, { mid: (bid + ask) / 2, updatedAt: Date.now() });
+    }
+  }
+
+  /**
+   * Use last_trade_price as tertiary fallback. Less accurate than bid/ask
+   * midpoint (single execution price), so only write when no fresh entry exists.
+   */
+  private onLastTradePrice(event: { asset_id: string; price: string }): void {
+    const price = parseFloat(event.price);
+    if (isNaN(price) || price <= 0 || price > 1.0) return;
+    const existing = this.cache.get(event.asset_id);
+    if (existing && (Date.now() - existing.updatedAt) < config.MIDPOINT_CACHE_MAX_AGE_MS / 2) return;
+    this.cache.set(event.asset_id, { mid: price, updatedAt: Date.now() });
   }
 
   private sendSubscription(): void {
