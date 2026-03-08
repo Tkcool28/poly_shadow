@@ -198,7 +198,7 @@ export async function createDetectedTradeFromChain(
         transactionHash: data.transactionHash,
         timestamp,
         compositeScore,
-        detectionSource: 'CHAIN',
+        detectionSource: data.isMaker ? 'CHAIN_MAKER' : 'CHAIN',
       },
     });
 
@@ -220,6 +220,7 @@ export async function createDetectedTradeFromChain(
       trader: normalizedWallet.slice(0, 10),
       userName,
       side: data.side,
+      isMaker: data.isMaker,
       outcome,
       tokenId: data.tokenId.slice(0, 16),
       usdValue: `$${usdValue}`,

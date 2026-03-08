@@ -202,7 +202,7 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
 
       // Tier 2: API fallback if cache miss or stale
       if (currentMid === null) {
-        if (detectionSource === 'CHAIN') {
+        if (detectionSource === 'CHAIN' || detectionSource === 'CHAIN_MAKER') {
           // CHAIN signals are <2s old — skip 50-100ms API roundtrip (fail-open)
           midSource = 'chain-skip';
         } else {

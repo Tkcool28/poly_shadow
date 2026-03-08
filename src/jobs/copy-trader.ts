@@ -880,7 +880,10 @@ async function main() {
         detectedAt: { gte: staleCutoff },
         timestamp: { gte: Math.floor(staleCutoff.getTime() / 1000) },
         // LIVE_POLL is a gap-filler for monitoring only — too high latency for copy signals
-        detectionSource: { not: 'LIVE_POLL' as const },
+        // CHAIN_MAKER = passive maker fills (resting limit orders filled by someone else) — typically losing hedge legs
+        detectionSource: config.SKIP_CHAIN_MAKER_FILLS
+          ? { notIn: ['LIVE_POLL', 'CHAIN_MAKER'] }
+          : { not: 'LIVE_POLL' as const },
       };
       const pendingSells = await prisma.detectedTrade.findMany({
         where: { ...baseWhere, side: 'SELL', proxyWallet: { in: allActiveWallets } },

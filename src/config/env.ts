@@ -47,6 +47,10 @@ const envSchema = z.object({
     .string()
     .default('false') // default off; enable explicitly after verifying WS works
     .transform((v) => v === 'true'),
+  SKIP_CHAIN_MAKER_FILLS: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
 
   // Copy-trade wallet credentials (required when COPY_TRADE_ENABLED=true)
   PRIVATE_KEY: z.string().optional(),

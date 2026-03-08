@@ -40,6 +40,7 @@ export interface ChainTradeData {
   transactionHash: string;
   isNegRisk: boolean;
   contract: string;      // exchange contract address
+  isMaker: boolean;      // true if tracked wallet was the maker (resting limit order filled by someone else)
 }
 
 export type ChainTradeCallback = (data: ChainTradeData) => Promise<void>;
@@ -312,6 +313,7 @@ export class ChainTradeWatcher {
         log.debug('OrderFilled decoded', {
           wallet: matchedWallet.slice(0, 10),
           side,
+          isMaker,
           tokenId: tokenId.slice(0, 16),
           size: size.toFixed(4),
           price: price.toFixed(4),
@@ -328,6 +330,7 @@ export class ChainTradeWatcher {
           transactionHash: logEntry.transactionHash,
           isNegRisk,
           contract: logEntry.address,
+          isMaker,
         }).catch((err: any) =>
           log.error('Trade detection handler error', { error: err.message }),
         );
