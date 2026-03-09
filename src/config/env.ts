@@ -123,6 +123,8 @@ const envSchema = z.object({
   SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(300000), // 5 minutes
   STALE_TRADE_CUTOFF_MS: z.coerce.number().default(600000), // 10 min (was hardcoded 5 min)
   MARKET_END_GATEKEEP_ENABLED: z.string().default('true').transform((v) => v === 'true'),
+  SETTLEMENT_ONCHAIN_FALLBACK_ENABLED: z.string().default('true').transform((v) => v === 'true'),
+  SETTLEMENT_ENDDATE_GRACE_MS: z.coerce.number().default(86400000), // 24h grace (sports endDate = game start, not close)
 
   // Phantom position auto-cleanup (runs on hourly capital audit timer)
   PHANTOM_AUTO_CLEANUP_ENABLED: z

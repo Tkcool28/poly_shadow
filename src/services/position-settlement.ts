@@ -3,6 +3,7 @@ import { createJobLogger } from '../lib/logger';
 import { normalizeOutcome } from '../lib/normalize';
 import { getMarketsByConditionIds } from '../api/gamma-api';
 import { redeemWinningPositions, type ClaimablePosition } from './position-claim';
+import { checkOnChainResolution } from '../lib/ctf-resolution';
 import { config } from '../config/env';
 
 const log = createJobLogger('position-settlement');
@@ -104,6 +105,7 @@ async function doSweepPositionSettlements(): Promise<void> {
             closed: market.closed,
             active: market.active,
             outcomePrices: market.outcomePrices ?? null,
+            endDate: market.endDate ? new Date(market.endDate) : undefined,
           },
         })
       )
@@ -118,6 +120,50 @@ async function doSweepPositionSettlements(): Promise<void> {
         outcomes: market.outcomes ?? '[]',
         outcomePrices: market.outcomePrices,
       });
+    }
+  }
+
+  // ── Fallback: on-chain resolution for overdue markets ──
+  if (config.SETTLEMENT_ONCHAIN_FALLBACK_ENABLED) {
+    const unresolvedConditionIds = uniqueConditionIds.filter(cid => !resolvedMarkets.has(cid));
+    if (unresolvedConditionIds.length > 0) {
+      const marketEndDates = await prisma.market.findMany({
+        where: { conditionId: { in: unresolvedConditionIds } },
+        select: { conditionId: true, endDate: true, outcomes: true },
+      });
+
+      const graceMs = config.SETTLEMENT_ENDDATE_GRACE_MS;
+      const now = Date.now();
+      const overdueMarkets = marketEndDates.filter(
+        m => m.endDate && m.endDate.getTime() + graceMs < now
+      );
+
+      if (overdueMarkets.length > 0) {
+        log.info(`Settlement: checking ${overdueMarkets.length} overdue market(s) on-chain`);
+
+        const onChainResults = await Promise.allSettled(
+          overdueMarkets.map(async (m) => {
+            const outcomes: string[] = JSON.parse(m.outcomes);
+            const resolution = await checkOnChainResolution(m.conditionId, outcomes.length);
+            return { conditionId: m.conditionId, outcomes, resolution };
+          })
+        );
+
+        for (const result of onChainResults) {
+          if (result.status !== 'fulfilled') continue;
+          const { conditionId, outcomes, resolution } = result.value;
+          if (!resolution.resolved) continue;
+
+          resolvedMarkets.set(conditionId, {
+            outcomes: JSON.stringify(outcomes),
+            outcomePrices: JSON.stringify(resolution.payouts),
+          });
+          log.warn('Settlement: resolved via on-chain fallback (Gamma API lag)', {
+            conditionId,
+            payouts: resolution.payouts,
+          });
+        }
+      }
     }
   }
 
