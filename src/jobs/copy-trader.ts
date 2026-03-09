@@ -814,6 +814,7 @@ async function main() {
   // Parallel mode: phaseA() under per-allocation mutex → pLimit(10) CLOB → batchSettle().
   let drainScheduled = false;
   let drainRunning = false;
+  let emptyDrainCount = 0;
 
   function scheduleDrain(source?: string) {
     if (drainScheduled || drainRunning) return;
@@ -852,11 +853,15 @@ async function main() {
       // BUYs only need wallets with buying power (filters out broke allocations)
       const allActiveAllocations = await prisma.followAllocation.findMany({
         where: { isActive: true },
-        select: { proxyWallet: true, currentCapital: true },
+        select: { proxyWallet: true, currentCapital: true, copyMakerFills: true },
       });
       const allActiveWallets = allActiveAllocations.map(a => a.proxyWallet);
       const buyEligibleWallets = allActiveAllocations
         .filter(a => a.currentCapital > 0)
+        .map(a => a.proxyWallet);
+      // Wallets opted into receiving CHAIN_MAKER signals (per-allocation override)
+      const makerFillWallets = allActiveAllocations
+        .filter(a => a.copyMakerFills)
         .map(a => a.proxyWallet);
 
       if (allActiveWallets.length === 0) {
@@ -868,32 +873,67 @@ async function main() {
       // Fetch unprocessed detected trades (no linked CopyTrade, within stale cutoff window)
       // SELLs are processed first — exits are time-sensitive and must not wait behind a BUY backlog
       const staleCutoff = new Date(Date.now() - config.STALE_TRADE_CUTOFF_MS);
-      const baseWhere = {
+
+      // ── Standard signals (CHAIN + POLL) — all active wallets ──
+      const standardWhere = {
         copyTrade: null,
         detectedAt: { gte: staleCutoff },
         timestamp: { gte: Math.floor(staleCutoff.getTime() / 1000) },
         // LIVE_POLL is a gap-filler for monitoring only — too high latency for copy signals
-        // CHAIN_MAKER = passive maker fills (resting limit orders filled by someone else) — typically losing hedge legs
+        // CHAIN_MAKER = passive maker fills — excluded globally unless per-allocation override
         detectionSource: config.SKIP_CHAIN_MAKER_FILLS
           ? { notIn: ['LIVE_POLL', 'CHAIN_MAKER'] }
           : { not: 'LIVE_POLL' as const },
       };
       const pendingSells = await prisma.detectedTrade.findMany({
-        where: { ...baseWhere, side: 'SELL', proxyWallet: { in: allActiveWallets } },
+        where: { ...standardWhere, side: 'SELL', proxyWallet: { in: allActiveWallets } },
         orderBy: { detectedAt: 'asc' },
       });
       const pendingBuys = await prisma.detectedTrade.findMany({
-        where: { ...baseWhere, side: 'BUY', proxyWallet: { in: buyEligibleWallets } },
+        where: { ...standardWhere, side: 'BUY', proxyWallet: { in: buyEligibleWallets } },
         orderBy: { detectedAt: 'asc' },
       });
-      const pending = [...pendingSells, ...pendingBuys];
+
+      // ── Maker-fill signals (CHAIN_MAKER) — only opted-in wallets ──
+      let makerSells: typeof pendingSells = [];
+      let makerBuys: typeof pendingBuys = [];
+
+      if (config.SKIP_CHAIN_MAKER_FILLS && makerFillWallets.length > 0) {
+        const makerWhere = {
+          copyTrade: null,
+          detectedAt: { gte: staleCutoff },
+          timestamp: { gte: Math.floor(staleCutoff.getTime() / 1000) },
+          detectionSource: 'CHAIN_MAKER',
+        };
+
+        makerSells = await prisma.detectedTrade.findMany({
+          where: { ...makerWhere, side: 'SELL', proxyWallet: { in: makerFillWallets } },
+          orderBy: { detectedAt: 'asc' },
+        });
+
+        const makerBuyWallets = makerFillWallets.filter(w => buyEligibleWallets.includes(w));
+        if (makerBuyWallets.length > 0) {
+          makerBuys = await prisma.detectedTrade.findMany({
+            where: { ...makerWhere, side: 'BUY', proxyWallet: { in: makerBuyWallets } },
+            orderBy: { detectedAt: 'asc' },
+          });
+        }
+      }
+
+      // SELLs first (exits are time-sensitive), then BUYs
+      const pending = [...pendingSells, ...makerSells, ...pendingBuys, ...makerBuys];
 
       if (pending.length === 0) {
+        emptyDrainCount++;
+        if (emptyDrainCount % 20 === 1) {
+          log.debug(`Drain empty (×${emptyDrainCount}), ${allActiveAllocations.length} allocs, ${makerFillWallets.length} maker-fill`);
+        }
         await sweepPool();
         const duration = Date.now() - start;
         await updateHealth(duration, 'success', 0);
         return;
       }
+      emptyDrainCount = 0;
 
       // Pre-warm CLOB metadata cache for all unique tokens in this batch
       const uniqueTokenIds = [...new Set(pending.map(t => t.asset))].filter(Boolean);
