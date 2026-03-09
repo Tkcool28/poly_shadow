@@ -874,54 +874,56 @@ async function main() {
       // SELLs are processed first — exits are time-sensitive and must not wait behind a BUY backlog
       const staleCutoff = new Date(Date.now() - config.STALE_TRADE_CUTOFF_MS);
 
-      // ── Standard signals (CHAIN + POLL) — all active wallets ──
-      const standardWhere = {
+      const baseWhere = {
         copyTrade: null,
         detectedAt: { gte: staleCutoff },
         timestamp: { gte: Math.floor(staleCutoff.getTime() / 1000) },
-        // LIVE_POLL is a gap-filler for monitoring only — too high latency for copy signals
-        // CHAIN_MAKER = passive maker fills — excluded globally unless per-allocation override
+      };
+
+      // ── SELLs: never filter CHAIN_MAKER — exits are always safe ──
+      // (if we don't hold shares, processCopyTrade skips with "no shares held to sell")
+      const pendingSells = await prisma.detectedTrade.findMany({
+        where: {
+          ...baseWhere,
+          side: 'SELL',
+          proxyWallet: { in: allActiveWallets },
+          detectionSource: { not: 'LIVE_POLL' },
+        },
+        orderBy: { detectedAt: 'asc' },
+      });
+
+      // ── BUYs: filter CHAIN_MAKER globally, allow for copyMakerFills opt-in ──
+      const buyWhere = {
+        ...baseWhere,
+        side: 'BUY' as const,
         detectionSource: config.SKIP_CHAIN_MAKER_FILLS
           ? { notIn: ['LIVE_POLL', 'CHAIN_MAKER'] }
           : { not: 'LIVE_POLL' as const },
       };
-      const pendingSells = await prisma.detectedTrade.findMany({
-        where: { ...standardWhere, side: 'SELL', proxyWallet: { in: allActiveWallets } },
-        orderBy: { detectedAt: 'asc' },
-      });
       const pendingBuys = await prisma.detectedTrade.findMany({
-        where: { ...standardWhere, side: 'BUY', proxyWallet: { in: buyEligibleWallets } },
+        where: { ...buyWhere, proxyWallet: { in: buyEligibleWallets } },
         orderBy: { detectedAt: 'asc' },
       });
 
-      // ── Maker-fill signals (CHAIN_MAKER) — only opted-in wallets ──
-      let makerSells: typeof pendingSells = [];
+      // ── Maker-fill BUYs — only for opted-in wallets ──
       let makerBuys: typeof pendingBuys = [];
-
       if (config.SKIP_CHAIN_MAKER_FILLS && makerFillWallets.length > 0) {
-        const makerWhere = {
-          copyTrade: null,
-          detectedAt: { gte: staleCutoff },
-          timestamp: { gte: Math.floor(staleCutoff.getTime() / 1000) },
-          detectionSource: 'CHAIN_MAKER',
-        };
-
-        makerSells = await prisma.detectedTrade.findMany({
-          where: { ...makerWhere, side: 'SELL', proxyWallet: { in: makerFillWallets } },
-          orderBy: { detectedAt: 'asc' },
-        });
-
         const makerBuyWallets = makerFillWallets.filter(w => buyEligibleWallets.includes(w));
         if (makerBuyWallets.length > 0) {
           makerBuys = await prisma.detectedTrade.findMany({
-            where: { ...makerWhere, side: 'BUY', proxyWallet: { in: makerBuyWallets } },
+            where: {
+              ...baseWhere,
+              side: 'BUY',
+              proxyWallet: { in: makerBuyWallets },
+              detectionSource: 'CHAIN_MAKER',
+            },
             orderBy: { detectedAt: 'asc' },
           });
         }
       }
 
       // SELLs first (exits are time-sensitive), then BUYs
-      const pending = [...pendingSells, ...makerSells, ...pendingBuys, ...makerBuys];
+      const pending = [...pendingSells, ...pendingBuys, ...makerBuys];
 
       if (pending.length === 0) {
         emptyDrainCount++;
@@ -965,6 +967,7 @@ async function main() {
     } catch (err: any) {
       result = 'error';
       errorMessage = err.message?.slice(0, 500);
+      emptyDrainCount = 0;
       log.error(`Copy-trader drain failed: ${err.message}`, { stack: err.stack });
     }
 
