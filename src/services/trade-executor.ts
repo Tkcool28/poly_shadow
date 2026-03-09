@@ -1,3 +1,4 @@
+import pLimit from 'p-limit';
 import { AssetType, ClobClient, OrderType, Side, SignatureType } from '@polymarket/clob-client';
 import type { ApiKeyCreds, TickSize } from '@polymarket/clob-client';
 import { Wallet } from '@ethersproject/wallet';
@@ -28,6 +29,7 @@ export interface ExecuteOrderResult {
 
 // Market metadata cache (tickSize + negRisk don't change per market)
 const metadataCache = new Map<string, { tickSize: TickSize; negRisk: boolean }>();
+const metadataLimit = pLimit(5);
 
 let client: ClobClient | null = null;
 
@@ -123,7 +125,7 @@ export async function preWarmMetadata(tokenIds: string[]): Promise<void> {
   if (!client) return;
   const uncached = tokenIds.filter(id => !metadataCache.has(id));
   if (uncached.length === 0) return;
-  await Promise.allSettled(uncached.map(id => getMarketMetadata(id).catch(() => {})));
+  await Promise.allSettled(uncached.map(id => metadataLimit(() => getMarketMetadata(id).catch(() => {}))));
 }
 
 function calculateSlippagePrice(detectedPrice: number, side: 'BUY' | 'SELL'): number {

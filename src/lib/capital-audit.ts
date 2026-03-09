@@ -264,13 +264,20 @@ export async function auditPhantomPositions(funderAddress: string): Promise<Phan
       isPaper: false,
       followAllocation: { isActive: true },
     },
-    select: { tokenId: true, followAllocationId: true, filledSize: true },
+    select: { tokenId: true, followAllocationId: true, filledSize: true, filledPrice: true },
   });
   for (const t of filledSells) {
     if (!t.followAllocationId) continue;
     const key = `${t.tokenId}|${t.followAllocationId}`;
     const existing = positionMap.get(key);
-    if (existing) existing.shares -= t.filledSize ?? 0;
+    if (existing) {
+      existing.shares -= t.filledSize ?? 0;
+      existing.cost -= (t.filledSize ?? 0) * (t.filledPrice ?? 0);
+    }
+  }
+  // Floor cost to zero (SELLs can exceed BUY cost due to price appreciation)
+  for (const [, pos] of positionMap) {
+    pos.cost = Math.max(pos.cost, 0);
   }
 
   // 2. Fetch API positions
@@ -394,7 +401,7 @@ export async function cleanupPhantomPositions(funderAddress: string): Promise<Ph
     // Mark phantom trades as SKIPPED with annotation (skip if already annotated)
     let markedCount = 0;
     for (const trade of trades) {
-      if (trade.failReason?.includes('[phantom-fix')) continue; // idempotent: skip already-fixed trades
+      if (trade.failReason?.includes('[phantom-fix') || trade.failReason?.includes('[ghost-fill-recovered]')) continue; // idempotent: skip already-fixed or recovered trades
 
       const annotation = `[phantom-fix-auto] original: status=${trade.status}, filledSize=${trade.filledSize}, filledPrice=${trade.filledPrice}`;
       await prisma.copyTrade.update({
