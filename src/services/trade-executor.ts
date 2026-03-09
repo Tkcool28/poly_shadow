@@ -373,17 +373,48 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
 
     // Guard: FAK order submitted but not matched (no fill amounts) — treat as SKIPPED
     if (!filledSize || !filledPrice) {
+      // If CLOB accepted the order (orderId present), the fill may be propagating
+      // asynchronously. Verify via getOrder() before declaring unmatched.
+      if (orderId && client) {
+        await new Promise(r => setTimeout(r, 1000)); // allow matching engine propagation
+        try {
+          const order = await client.getOrder(orderId);
+          if (order?.status === 'MATCHED') {
+            const sizeMatched = parseFloat(order.size_matched || '0');
+            const orderPrice = parseFloat(order.price || '0');
+            // For SELL FAK, order.price is the $0.01 limit — use detectedPrice instead.
+            // For BUY FAK, order.price is the slippage-limited price — close to actual fill.
+            const recoveredPrice = (side === 'SELL') ? detectedPrice : orderPrice;
+            // Sanity: prediction market price must be in (0, 1.0]
+            if (sizeMatched > 0 && recoveredPrice > 0 && recoveredPrice <= 1.0) {
+              log.info('FAK ghost fill recovered via getOrder()', {
+                orderId, sizeMatched, recoveredPrice, orderPrice, side,
+              });
+              return {
+                orderId,
+                status: 'FILLED',
+                filledPrice: recoveredPrice,
+                filledSize: sizeMatched,
+                failReason: null,
+                transactionHashes: txHashes,
+              };
+            }
+          }
+        } catch (err: any) {
+          log.warn('FAK ghost fill verification failed (proceeding as SKIPPED)', {
+            orderId, error: err.message?.slice(0, 200),
+          });
+        }
+      }
+
       log.info('FAK order unmatched (no fill amounts)', {
-        orderId,
-        side,
+        orderId, side,
         makingAmount: response?.makingAmount,
         takingAmount: response?.takingAmount,
       });
       return {
-        orderId,
-        status: 'SKIPPED',
-        filledPrice: null,
-        filledSize: null,
+        orderId, status: 'SKIPPED',
+        filledPrice: null, filledSize: null,
         failReason: 'no matching orders (FAK unmatched)',
         transactionHashes: txHashes,
       };

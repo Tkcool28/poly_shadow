@@ -22,7 +22,7 @@ import { addToPool } from '../services/order-pool';
 import { startPortfolioRefresh, stopPortfolioRefresh } from '../services/portfolio-cache';
 import { rehydratePool, sweepPool } from '../services/order-pool';
 import { sweepPositionSettlements, sweepUnclaimedSettledPositions } from '../services/position-settlement';
-import { reconcileStalePending } from '../services/clob-reconciler';
+import { reconcileStalePending, reconcileSkippedGhostFills } from '../services/clob-reconciler';
 import { sweepPreResolutionSells } from '../services/pre-resolution-seller';
 import { resolveMarkets } from '../services/market-resolver';
 import { computeSellCostBasis } from '../lib/cost-basis';
@@ -800,6 +800,13 @@ async function main() {
     log.warn(`PENDING record reconciliation failed: ${err.message}`);
   }
 
+  // Recover SKIPPED FAK trades that actually filled on-chain (ghost fills)
+  try {
+    await reconcileSkippedGhostFills();
+  } catch (err: any) {
+    log.warn(`Ghost fill reconciliation failed: ${err.message}`);
+  }
+
   // ─── Event-driven trade processing ───
   // pg LISTEN/NOTIFY wakes us instantly on DetectedTrade INSERT.
   // Notification coalescing: multiple rapid notifications collapse into 1-2 drain cycles.
@@ -1026,6 +1033,9 @@ async function main() {
 
       // Sweep unclaimed settled positions (retry claims that failed or accumulated)
       await sweepUnclaimedSettledPositions();
+
+      // Recover SKIPPED FAK ghost fills (catches any that slipped past inline verification)
+      await reconcileSkippedGhostFills();
     } catch (err: any) {
       log.warn(`Capital audit failed: ${err.message}`);
     }

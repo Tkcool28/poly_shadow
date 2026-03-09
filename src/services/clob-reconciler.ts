@@ -2,6 +2,8 @@ import { prisma } from '../lib/prisma';
 import { createJobLogger } from '../lib/logger';
 import { getClient } from './trade-executor';
 import { computeSellCostBasis } from '../lib/cost-basis';
+import { auditAllocation } from '../lib/capital-audit';
+import { getOrCreateMutex } from '../lib/allocation-mutex';
 
 const log = createJobLogger('clob-reconciler');
 
@@ -143,4 +145,139 @@ export async function reconcileStalePending(): Promise<void> {
   }
 
   log.info(`Reconciled ${stalePending.length} stale PENDING records`);
+}
+
+/**
+ * Recover SKIPPED FAK trades that actually filled on-chain (ghost fills).
+ * The CLOB API can return success with zero amounts while the order fills asynchronously.
+ * Checks SKIPPED trades with orderId via getOrder(), recovers confirmed fills,
+ * then replays capital via auditAllocation() under mutex.
+ */
+export async function reconcileSkippedGhostFills(): Promise<void> {
+  const skippedWithOrderId = await prisma.copyTrade.findMany({
+    where: {
+      status: 'SKIPPED',
+      orderId: { not: null },
+      failReason: { contains: 'FAK unmatched' },
+      isPaper: false,
+      createdAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+    },
+  });
+
+  if (skippedWithOrderId.length === 0) return;
+  log.info(`Ghost fill reconciliation: checking ${skippedWithOrderId.length} SKIPPED FAK trades`);
+
+  const client = getClient();
+  if (!client) {
+    log.warn('Ghost fill reconciliation: CLOB client unavailable');
+    return;
+  }
+
+  let recovered = 0;
+  const affectedAllocations = new Set<string>();
+
+  for (const record of skippedWithOrderId) {
+    try {
+      const order = await client.getOrder(record.orderId!);
+
+      if (order?.status === 'MATCHED') {
+        const sizeMatched = parseFloat(order.size_matched || '0');
+        const orderPrice = parseFloat(order.price || '0');
+
+        // For SELL FAK, order.price is $0.01 (the limit floor) — use requestedPrice
+        // (= detected market price at signal time, stored on every CopyTrade record).
+        // For BUY FAK, order.price is the slippage-limited price — close to actual fill.
+        const recoveredPrice = (record.side === 'SELL')
+          ? record.requestedPrice
+          : orderPrice;
+
+        // Sanity: prediction market price must be in (0, 1.0]
+        if (sizeMatched > 0 && recoveredPrice > 0 && recoveredPrice <= 1.0) {
+          await prisma.copyTrade.update({
+            where: { id: record.id },
+            data: {
+              status: 'FILLED',
+              filledSize: sizeMatched,
+              filledPrice: recoveredPrice,
+              failReason: `[ghost-fill-recovered] original: SKIPPED FAK unmatched, orderPrice=${orderPrice}`,
+              filledAt: record.createdAt,
+              requestedAmount: sizeMatched * recoveredPrice,
+            },
+          });
+
+          recovered++;
+          if (record.followAllocationId) {
+            affectedAllocations.add(record.followAllocationId);
+          }
+
+          log.info('Ghost fill recovered', {
+            id: record.id, orderId: record.orderId,
+            sizeMatched, recoveredPrice, orderPrice, side: record.side,
+            tokenId: record.tokenId.slice(0, 20),
+          });
+        } else {
+          log.warn('Ghost fill: MATCHED but invalid price/size from CLOB', {
+            orderId: record.orderId, sizeMatched, orderPrice, recoveredPrice,
+          });
+        }
+      } else if (order?.status === 'LIVE' || order?.status === 'DELAYED') {
+        // FAK orders should never be LIVE/DELAYED — defensively cancel
+        try {
+          await client.cancelOrder({ orderID: record.orderId! });
+          log.warn('Ghost fill: cancelled stale FAK order on CLOB', {
+            orderId: record.orderId, clobStatus: order.status,
+          });
+        } catch (cancelErr: any) {
+          log.warn('Ghost fill: failed to cancel stale order', {
+            orderId: record.orderId, error: cancelErr.message,
+          });
+        }
+      } else {
+        log.debug('Ghost fill check: not MATCHED on CLOB', {
+          orderId: record.orderId,
+          clobStatus: order?.status ?? 'null (order not found)',
+        });
+      }
+    } catch (err: any) {
+      log.warn('Ghost fill check failed for order', {
+        id: record.id, orderId: record.orderId,
+        error: err.message?.slice(0, 200),
+      });
+    }
+  }
+
+  // Replay capital for all affected allocations via auditAllocation() under mutex
+  // (same pattern as cleanupPhantomPositions — capital-audit.ts:423-452)
+  for (const allocId of affectedAllocations) {
+    try {
+      const mutex = getOrCreateMutex(allocId);
+      await mutex.runExclusive(async () => {
+        const audit = await auditAllocation(allocId);
+        await prisma.followAllocation.update({
+          where: { id: allocId },
+          data: {
+            currentCapital: audit.computedCC,
+            deployedCapital: audit.computedDC,
+          },
+        });
+        log.info('Ghost fill: capital corrected via replay', {
+          allocationId: allocId,
+          ccBefore: audit.actualCC.toFixed(2),
+          ccAfter: audit.computedCC.toFixed(2),
+          dcBefore: audit.actualDC.toFixed(2),
+          dcAfter: audit.computedDC.toFixed(2),
+        });
+      });
+    } catch (err: any) {
+      log.error('Ghost fill: capital correction failed', {
+        allocationId: allocId, error: err.message,
+      });
+    }
+  }
+
+  if (recovered > 0) {
+    log.info(`Ghost fill reconciliation complete`, {
+      recovered, allocationsFixed: affectedAllocations.size,
+    });
+  }
 }
