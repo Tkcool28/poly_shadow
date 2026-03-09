@@ -21,7 +21,7 @@ import type { DetectedTradeRow } from '../services/copy-trade-worker';
 import { addToPool } from '../services/order-pool';
 import { startPortfolioRefresh, stopPortfolioRefresh } from '../services/portfolio-cache';
 import { rehydratePool, sweepPool } from '../services/order-pool';
-import { sweepPositionSettlements } from '../services/position-settlement';
+import { sweepPositionSettlements, sweepUnclaimedSettledPositions } from '../services/position-settlement';
 import { reconcileStalePending } from '../services/clob-reconciler';
 import { sweepPreResolutionSells } from '../services/pre-resolution-seller';
 import { resolveMarkets } from '../services/market-resolver';
@@ -1023,6 +1023,9 @@ async function main() {
           });
         }
       }
+
+      // Sweep unclaimed settled positions (retry claims that failed or accumulated)
+      await sweepUnclaimedSettledPositions();
     } catch (err: any) {
       log.warn(`Capital audit failed: ${err.message}`);
     }
@@ -1038,7 +1041,10 @@ async function main() {
   }, config.SETTLEMENT_SWEEP_INTERVAL_MS);
 
   // Fire housekeeping once on startup (matches old behavior where lastX=0 triggered first cycle)
-  sweepPositionSettlements().catch((err: any) => log.warn(`Settlement sweep failed: ${err.message}`));
+  // Chain unclaimed sweep after settlement to avoid overlap via shared sweepRunning guard
+  sweepPositionSettlements()
+    .then(() => sweepUnclaimedSettledPositions())
+    .catch((err: any) => log.warn(`Settlement/claim sweep failed: ${err.message}`));
   auditAllAllocations({ isPaper: false, threshold: 1.0 }).catch((err: any) => log.warn(`Capital audit failed: ${err.message}`));
   sweepPreResolutionSells().catch((err: any) => log.warn(`Pre-resolution sweep failed: ${err.message}`));
 

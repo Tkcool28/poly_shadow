@@ -93,8 +93,8 @@ export interface ClaimablePosition {
   followAllocationId: string; // for logging
 }
 
-export async function redeemWinningPositions(positions: ClaimablePosition[]): Promise<void> {
-  if (!config.AUTO_CLAIM_ENABLED || !config.PRIVATE_KEY) return;
+export async function redeemWinningPositions(positions: ClaimablePosition[]): Promise<string[]> {
+  if (!config.AUTO_CLAIM_ENABLED || !config.PRIVATE_KEY) return [];
 
   // GNOSIS_SAFE (type=2) needs multi-sig flow — out of scope
   if (config.SIGNATURE_TYPE === 2) {
@@ -102,29 +102,44 @@ export async function redeemWinningPositions(positions: ClaimablePosition[]): Pr
       log.warn('Auto-claim skipped: GNOSIS_SAFE (type=2) not supported — set AUTO_CLAIM_ENABLED=false');
       gnosisSafeWarned = true;
     }
-    return;
+    return [];
   }
 
-  // Merge new positions into retry queue, skipping dust below MIN_CLAIM_USD
+  // Aggregate netShares by conditionId across all allocations.
+  // On-chain redeemPositions claims ALL tokens for a conditionId
+  // regardless of our DB allocation split, so threshold must check the total.
+  const aggregated = new Map<string, ClaimablePosition>();
   for (const p of positions) {
+    const existing = aggregated.get(p.conditionId);
+    if (existing) {
+      existing.netShares += p.netShares;
+    } else {
+      aggregated.set(p.conditionId, { ...p });
+    }
+  }
+
+  for (const [conditionId, p] of aggregated) {
     if (p.netShares < config.MIN_CLAIM_USD) {
       log.info('Auto-claim skipped: below MIN_CLAIM_USD threshold', {
-        conditionId: p.conditionId,
+        conditionId,
         netShares: p.netShares.toFixed(4),
         minClaimUsd: config.MIN_CLAIM_USD,
       });
       continue;
     }
-    pendingRetries.set(p.conditionId, p);
+    pendingRetries.set(conditionId, p);
   }
 
-  if (pendingRetries.size === 0) return;
+  if (pendingRetries.size === 0) return [];
 
   await ensureReady();
 
+  const claimed: string[] = [];
   for (const pos of pendingRetries.values()) {
-    await claimOne(pos);
+    const success = await claimOne(pos);
+    if (success) claimed.push(pos.conditionId);
   }
+  return claimed;
 }
 
 // Poll for a transaction receipt directly instead of relying on ethers block-event listeners,
@@ -147,7 +162,7 @@ async function pollReceipt(
   throw new Error(`Tx ${txHash} not mined within ${timeoutMs / 1000}s`);
 }
 
-async function claimOne(pos: ClaimablePosition): Promise<void> {
+async function claimOne(pos: ClaimablePosition): Promise<boolean> {
   const indexSets = [1 << pos.outcomeIndex]; // Yes=0→[1], No=1→[2]
   const s = getSigner();
 
@@ -199,13 +214,26 @@ async function claimOne(pos: ClaimablePosition): Promise<void> {
       txHash,
       pendingRetries: pendingRetries.size,
     });
+    return true;
   } catch (err: any) {
-    // Non-fatal: DB is already settled. Position stays in pendingRetries for next sweep.
+    const msg = err.message?.toLowerCase() ?? '';
+    // CTF reverts with empty data when token balance=0 (already redeemed).
+    // Treat as success so DB gets marked claimed and we stop retrying.
+    if (msg.includes('execution reverted')) {
+      log.info('Auto-claim: position likely already redeemed, removing from queue', {
+        conditionId: pos.conditionId,
+        error: msg.slice(0, 200),
+      });
+      pendingRetries.delete(pos.conditionId);
+      return true;
+    }
+    // Transient failure: keep in retry queue for next sweep
     log.warn('Auto-claim failed (kept in retry queue)', {
       conditionId: pos.conditionId,
       tokenId: pos.tokenId.slice(0, 20),
       error: err.message?.slice(0, 300),
       pendingRetries: pendingRetries.size,
     });
+    return false;
   }
 }

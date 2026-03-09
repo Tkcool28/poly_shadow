@@ -384,6 +384,7 @@ model CopyTrade {
   settlementValue    Float?
   settlementPnl      Float?
   settledAt          DateTime?
+  claimedAt          DateTime?               // Set after on-chain CTF redemption succeeds
 
   @@index([status])
   @@index([createdAt(sort: Desc)])
@@ -392,6 +393,7 @@ model CopyTrade {
   @@index([isPaper])
   @@index([tokenId, followAllocationId, isPaper, status])  // settlement + getHeldShares
   @@index([status, side, createdAt])                        // daily spend check
+  @@index([status, settlementPrice, isPaper])               // unclaimed sweep lookup
 }
 
 // ─── ArbStrategyConfig (per-strategy runtime config — replaces per-strategy env vars) ───

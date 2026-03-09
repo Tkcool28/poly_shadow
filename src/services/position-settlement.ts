@@ -7,13 +7,50 @@ import { config } from '../config/env';
 
 const log = createJobLogger('position-settlement');
 
+// ─── Concurrency guard ──────────────────────────────────────────────────────
+// Prevents overlap between the 5-min timer, startup sweep, and unclaimed sweep.
+let sweepRunning = false;
+
 interface OpenPosition {
   tokenId: string;
   followAllocationId: string;
   isPaper: boolean;
 }
 
+// ─── Claim persistence helper ───────────────────────────────────────────────
+// Marks all CopyTrades for claimed conditionIds via DetectedTrade join,
+// correctly covering all allocations + tokenIds for the same market.
+async function markConditionsClaimed(conditionIds: string[]): Promise<void> {
+  if (conditionIds.length === 0) return;
+  for (const conditionId of conditionIds) {
+    await prisma.$executeRaw`
+      UPDATE "CopyTrade" ct SET "claimedAt" = NOW()
+      FROM "DetectedTrade" dt
+      WHERE ct."detectedTradeId" = dt.id
+        AND dt."conditionId" = ${conditionId}
+        AND ct."isPaper" = false
+        AND ct.status = 'SETTLED'
+        AND ct."settlementPrice" BETWEEN 0.9999 AND 1.0001
+        AND ct."claimedAt" IS NULL
+    `;
+  }
+  log.info('Claim status persisted', { conditionsClaimed: conditionIds.length });
+}
+
 export async function sweepPositionSettlements(): Promise<void> {
+  if (sweepRunning) {
+    log.debug('Settlement sweep: skipped (already running)');
+    return;
+  }
+  sweepRunning = true;
+  try {
+    await doSweepPositionSettlements();
+  } finally {
+    sweepRunning = false;
+  }
+}
+
+async function doSweepPositionSettlements(): Promise<void> {
   // Step 1: Find all open positions (tokens with net BUY > SELL, status FILLED)
   const openPositions = await prisma.$queryRaw<OpenPosition[]>`
     SELECT "tokenId", "followAllocationId", "isPaper"
@@ -261,7 +298,8 @@ export async function sweepPositionSettlements(): Promise<void> {
     totalPositionsSettled += fills.length;
 
     // Collect for on-chain claiming after all DB work is done
-    if (!pos.isPaper && settlementPrice === 1.0) {
+    // Use range check to handle float precision (e.g. 0.9999999 from Gamma API)
+    if (!pos.isPaper && settlementPrice >= 0.9999 && settlementPrice <= 1.0001) {
       claimablePositions.push({
         conditionId: meta.conditionId,
         outcomeIndex,
@@ -281,10 +319,12 @@ export async function sweepPositionSettlements(): Promise<void> {
     });
   }
 
-  // Trigger on-chain redemption for winning positions (non-blocking on failure)
-  await redeemWinningPositions(claimablePositions).catch((err: any) =>
-    log.warn('Auto-claim batch failed', { error: err.message }),
-  );
+  // Trigger on-chain redemption for winning positions and persist claim status
+  const claimedConditionIds = await redeemWinningPositions(claimablePositions).catch((err: any) => {
+    log.warn('Auto-claim batch failed', { error: err.message });
+    return [] as string[];
+  });
+  await markConditionsClaimed(claimedConditionIds);
 
   log.info('Settlement sweep complete', {
     marketsChecked: uniqueConditionIds.length,
@@ -292,4 +332,90 @@ export async function sweepPositionSettlements(): Promise<void> {
     positionsSettled: settledCount,
     tradesSettled: totalPositionsSettled,
   });
+}
+
+// ─── Unclaimed backlog sweep ────────────────────────────────────────────────
+// Recovers positions that were settled but never claimed on-chain:
+// - From previous container runs (in-memory retry queue lost on restart)
+// - Accumulated across cycles but individually below threshold
+// Runs at startup (chained after settlement) and hourly (capital audit timer).
+export async function sweepUnclaimedSettledPositions(): Promise<void> {
+  if (sweepRunning) {
+    log.debug('Unclaimed sweep: skipped (settlement running)');
+    return;
+  }
+  sweepRunning = true;
+  try {
+    await doSweepUnclaimedSettledPositions();
+  } finally {
+    sweepRunning = false;
+  }
+}
+
+async function doSweepUnclaimedSettledPositions(): Promise<void> {
+  // Aggregate ALL unclaimed settled wins by conditionId (across all allocations + cycles)
+  const rows = await prisma.$queryRaw<{
+    conditionId: string;
+    outcome: string;
+    tokenId: string;
+    followAllocationId: string;
+    netShares: number;
+  }[]>`
+    SELECT dt."conditionId", dt.outcome,
+           (array_agg(ct."tokenId"))[1] as "tokenId",
+           (array_agg(ct."followAllocationId"))[1] as "followAllocationId",
+           SUM(CASE WHEN ct.side='BUY' THEN COALESCE(ct."filledSize", ct."requestedAmount" / NULLIF(ct."filledPrice", 0)) ELSE 0 END) -
+           SUM(CASE WHEN ct.side='SELL' THEN COALESCE(ct."filledSize", 0) ELSE 0 END) as "netShares"
+    FROM "CopyTrade" ct
+    JOIN "DetectedTrade" dt ON ct."detectedTradeId" = dt.id
+    WHERE ct."isPaper" = false
+      AND ct.status = 'SETTLED'
+      AND ct."settlementPrice" BETWEEN 0.9999 AND 1.0001
+      AND ct."claimedAt" IS NULL
+    GROUP BY dt."conditionId", dt.outcome
+    HAVING SUM(CASE WHEN ct.side='BUY' THEN COALESCE(ct."filledSize", ct."requestedAmount" / NULLIF(ct."filledPrice", 0)) ELSE 0 END) >
+           SUM(CASE WHEN ct.side='SELL' THEN COALESCE(ct."filledSize", 0) ELSE 0 END)
+  `;
+
+  if (rows.length === 0) return;
+  log.info(`Unclaimed sweep: found ${rows.length} unclaimed conditionId(s)`);
+
+  // Derive outcomeIndex via Market table (batched query, same pattern as test-claim.ts)
+  const uniqueConditionIds = [...new Set(rows.map(r => r.conditionId))];
+  const markets = await prisma.market.findMany({
+    where: { conditionId: { in: uniqueConditionIds } },
+    select: { conditionId: true, outcomes: true },
+  });
+  const marketMap = new Map(markets.map(m => [m.conditionId, m.outcomes]));
+
+  const claimable: ClaimablePosition[] = [];
+  for (const r of rows) {
+    const outcomesRaw = marketMap.get(r.conditionId);
+    if (!outcomesRaw) continue;
+
+    let outcomes: string[];
+    try { outcomes = JSON.parse(outcomesRaw); } catch { continue; }
+
+    const outcomeIndex = outcomes.findIndex(
+      o => normalizeOutcome(o) === normalizeOutcome(r.outcome)
+    );
+    if (outcomeIndex < 0) continue;
+    if (r.netShares <= 0) continue;
+
+    claimable.push({
+      conditionId: r.conditionId,
+      outcomeIndex,
+      netShares: r.netShares,
+      tokenId: r.tokenId,
+      followAllocationId: r.followAllocationId,
+    });
+  }
+
+  if (claimable.length === 0) return;
+
+  const claimedIds = await redeemWinningPositions(claimable).catch(() => [] as string[]);
+  await markConditionsClaimed(claimedIds);
+  if (claimedIds.length > 0) {
+    log.info(`Unclaimed sweep: claimed ${claimedIds.length} conditionId(s)`);
+  }
 }
