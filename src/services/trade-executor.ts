@@ -4,7 +4,7 @@ import type { ApiKeyCreds, TickSize } from '@polymarket/clob-client';
 import { Wallet } from '@ethersproject/wallet';
 import { createJobLogger } from '../lib/logger';
 import { config } from '../config/env';
-import { getMidFromCache } from './midpoint-cache';
+import { getMidFromCache, getBBAFromCache } from './midpoint-cache';
 
 const log = createJobLogger('trade-executor');
 
@@ -142,6 +142,71 @@ function calculateSlippagePrice(detectedPrice: number, side: 'BUY' | 'SELL'): nu
   return 0.01; // CLOB minimum — effectively market order behavior
 }
 
+// --- FAK unmatched diagnostics (zero-latency) ---
+
+type BBA = { bestBid: number; bestAsk: number; mid: number };
+
+function diagnoseFakUnmatched(
+  side: string, slippagePrice: number, detectedPrice: number,
+  pre: BBA | null, post: BBA | null,
+): string {
+  const bba = post ?? pre; // prefer post-order snapshot
+  if (!bba) return 'NO_CACHE: no WS bid/ask data available';
+
+  if (side === 'BUY') {
+    if (bba.bestAsk > slippagePrice) {
+      const gapCents = ((bba.bestAsk - slippagePrice) * 100).toFixed(1);
+      return `PRICE_GAP: bestAsk ${bba.bestAsk} > limit ${slippagePrice} — gap ${gapCents}c`;
+    }
+    return `BOOK_SWEPT: bestAsk ${bba.bestAsk} <= limit ${slippagePrice} but no fill`;
+  }
+
+  // SELL: slippagePrice is always $0.01, so compare against detectedPrice
+  if (bba.bestBid <= 0) return `NO_BIDS: bestBid ${bba.bestBid} — no buy-side liquidity`;
+  if (bba.bestBid < detectedPrice * 0.5) {
+    return `SELL_PRICE_GAP: bestBid ${bba.bestBid} far below signal ${detectedPrice}`;
+  }
+  return `SELL_SWEPT: bestBid ${bba.bestBid} near signal ${detectedPrice} but no fill`;
+}
+
+const bookSnapshotDebounce = new Map<string, number>();
+
+function fireAsyncBookSnapshot(tokenId: string, orderId: string | null, side: string, limitPrice: number): void {
+  const now = Date.now();
+  const lastFetch = bookSnapshotDebounce.get(tokenId) ?? 0;
+  if (now - lastFetch < 5000) return; // 5s per-tokenId debounce
+  bookSnapshotDebounce.set(tokenId, now);
+
+  // Prune stale debounce entries to prevent unbounded Map growth
+  if (bookSnapshotDebounce.size > 100) {
+    for (const [key, ts] of bookSnapshotDebounce) {
+      if (now - ts > 60_000) bookSnapshotDebounce.delete(key);
+    }
+  }
+
+  // Follow existing pattern from background phantom verification (line ~476)
+  setTimeout(() => {
+    (async () => {
+      if (!client) return;
+      const book = await client.getOrderBook(tokenId);
+      const topBids = (book.bids ?? []).slice(0, 3).map((b: any) => ({ price: b.price, size: b.size }));
+      const topAsks = (book.asks ?? []).slice(0, 3).map((a: any) => ({ price: a.price, size: a.size }));
+      const totalAskDepthUsd = (book.asks ?? []).reduce((sum: number, a: any) =>
+        sum + parseFloat(a.price) * parseFloat(a.size), 0);
+      const totalBidDepthUsd = (book.bids ?? []).reduce((sum: number, b: any) =>
+        sum + parseFloat(b.price) * parseFloat(b.size), 0);
+      log.info('post-unmatched orderbook snapshot', {
+        tokenId: tokenId.slice(0, 16), orderId, side, limitPrice,
+        topBids, topAsks,
+        totalAskDepthUsd: totalAskDepthUsd.toFixed(2),
+        totalBidDepthUsd: totalBidDepthUsd.toFixed(2),
+        askLevels: book.asks?.length ?? 0,
+        bidLevels: book.bids?.length ?? 0,
+      });
+    })().catch(() => {}); // fail silently — purely diagnostic
+  }, 0);
+}
+
 export const CLOB_MIN_ORDER_USD = 1.0; // Polymarket hard minimum per live order
 
 export async function executeMarketOrder(params: ExecuteOrderParams): Promise<ExecuteOrderResult> {
@@ -238,12 +303,17 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
     }
   }
 
+  const preOrderBBA = getBBAFromCache(tokenId);
+
   log.info('Placing FAK market order', {
     tokenId: tokenId.slice(0, 20) + '...',
     side,
     amount,
     detectedPrice,
     slippagePrice,
+    preOrderBid: preOrderBBA?.bestBid ?? null,
+    preOrderAsk: preOrderBBA?.bestAsk ?? null,
+    preOrderMid: preOrderBBA?.mid ?? null,
   });
 
   const t0 = Date.now();
@@ -409,11 +479,24 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
         }
       }
 
-      log.info('FAK order unmatched (no fill amounts)', {
-        orderId, side,
+      const postOrderBBA = getBBAFromCache(tokenId);
+      const diagnosis = diagnoseFakUnmatched(side, slippagePrice, detectedPrice, preOrderBBA, postOrderBBA);
+      log.warn('FAK order unmatched — CLOB diagnostic', {
+        orderId, side, amount,
+        slippagePrice, detectedPrice,
+        responseStatus: response?.status,
+        responseErrorMsg: response?.errorMsg ?? null,
         makingAmount: response?.makingAmount,
         takingAmount: response?.takingAmount,
+        preOrderBid: preOrderBBA?.bestBid ?? null,
+        preOrderAsk: preOrderBBA?.bestAsk ?? null,
+        postOrderBid: postOrderBBA?.bestBid ?? null,
+        postOrderAsk: postOrderBBA?.bestAsk ?? null,
+        diagnosis,
+        metadataMs: t1! - t0,
+        clobMs: Date.now() - t1!,
       });
+      fireAsyncBookSnapshot(tokenId, orderId, side, slippagePrice);
       return {
         orderId, status: 'SKIPPED',
         filledPrice: null, filledSize: null,

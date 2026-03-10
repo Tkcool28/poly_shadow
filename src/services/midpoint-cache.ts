@@ -12,6 +12,8 @@ const PRUNE_INTERVAL_MS = 300_000; // 5 min
 
 interface CacheEntry {
   mid: number;
+  bestBid: number;
+  bestAsk: number;
   updatedAt: number;
 }
 
@@ -108,6 +110,18 @@ export class MidpointCache {
     return entry.mid;
   }
 
+  /**
+   * Synchronous O(1) best-bid/ask lookup. Returns null on miss, stale, or
+   * lastTradePrice-only entries (where bestBid/bestAsk are NaN).
+   */
+  getBBA(tokenId: string): { bestBid: number; bestAsk: number; mid: number } | null {
+    const entry = this.cache.get(tokenId);
+    if (!entry) return null;
+    if (Date.now() - entry.updatedAt > config.MIDPOINT_CACHE_MAX_AGE_MS) return null;
+    if (isNaN(entry.bestBid) || isNaN(entry.bestAsk)) return null;
+    return { bestBid: entry.bestBid, bestAsk: entry.bestAsk, mid: entry.mid };
+  }
+
   private maybeLogStats(): void {
     const total = this.cacheHits + this.cacheMisses;
     if (total > 0 && total % 100 === 0) {
@@ -177,7 +191,7 @@ export class MidpointCache {
     const bid = parseFloat(event.best_bid);
     const ask = parseFloat(event.best_ask);
     if (isNaN(bid) || isNaN(ask) || bid <= 0 || ask <= 0) return;
-    this.cache.set(event.asset_id, { mid: (bid + ask) / 2, updatedAt: Date.now() });
+    this.cache.set(event.asset_id, { mid: (bid + ask) / 2, bestBid: bid, bestAsk: ask, updatedAt: Date.now() });
   }
 
   /**
@@ -199,7 +213,7 @@ export class MidpointCache {
       if (p < bestAsk) bestAsk = p;
     }
     if (bestBid <= 0 || bestAsk === Infinity) return;
-    this.cache.set(event.asset_id, { mid: (bestBid + bestAsk) / 2, updatedAt: Date.now() });
+    this.cache.set(event.asset_id, { mid: (bestBid + bestAsk) / 2, bestBid, bestAsk, updatedAt: Date.now() });
   }
 
   /**
@@ -213,20 +227,21 @@ export class MidpointCache {
       const bid = parseFloat(pc.best_bid);
       const ask = parseFloat(pc.best_ask);
       if (isNaN(bid) || isNaN(ask) || bid <= 0 || ask <= 0) continue;
-      this.cache.set(pc.asset_id, { mid: (bid + ask) / 2, updatedAt: Date.now() });
+      this.cache.set(pc.asset_id, { mid: (bid + ask) / 2, bestBid: bid, bestAsk: ask, updatedAt: Date.now() });
     }
   }
 
   /**
    * Use last_trade_price as tertiary fallback. Less accurate than bid/ask
    * midpoint (single execution price), so only write when no fresh entry exists.
+   * NaN for bestBid/bestAsk ensures getBBA() returns null for these entries.
    */
   private onLastTradePrice(event: { asset_id: string; price: string }): void {
     const price = parseFloat(event.price);
     if (isNaN(price) || price <= 0 || price > 1.0) return;
     const existing = this.cache.get(event.asset_id);
     if (existing && (Date.now() - existing.updatedAt) < config.MIDPOINT_CACHE_MAX_AGE_MS / 2) return;
-    this.cache.set(event.asset_id, { mid: price, updatedAt: Date.now() });
+    this.cache.set(event.asset_id, { mid: price, bestBid: NaN, bestAsk: NaN, updatedAt: Date.now() });
   }
 
   private sendSubscription(): void {
@@ -332,4 +347,8 @@ export function ensureSubscribed(tokenIds: string[]): void {
 
 export function getMidFromCache(tokenId: string): number | null {
   return instance?.getMid(tokenId) ?? null;
+}
+
+export function getBBAFromCache(tokenId: string): { bestBid: number; bestAsk: number; mid: number } | null {
+  return instance?.getBBA(tokenId) ?? null;
 }
