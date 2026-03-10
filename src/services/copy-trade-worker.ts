@@ -7,7 +7,6 @@ import type { ExecuteOrderResult } from './trade-executor';
 import { addToPool } from './order-pool';
 import { resolveMarkets } from './market-resolver';
 import { computeSellCostBasis } from '../lib/cost-basis';
-import { getPositions } from '../api/data-api';
 
 const log = createJobLogger('copy-trade-worker');
 
@@ -120,10 +119,10 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
 
   if (trade.side === 'SELL') {
     const heldShares = await getHeldShares(trade.asset, allocation.id, isPaper);
-    // Threshold of 0.000001 shares (1 micro-share) guards against floating-point residuals
-    // from the getHeldShares fallback path (requestedAmount / price) that pass > 0 but
-    // round to 0 in CLOB integer conversion → HTTP 400 "amounts must be > 0"
-    if (heldShares < 0.000001) {
+    // getHeldShares() rounds sub-penny amounts (< 0.01 shares) to 0 — these are
+    // unsellable on CLOB (2dp floor → 0) and settle at market resolution. This
+    // catches both phantom dust (DB rounding artifacts) and real micro-dust.
+    if (heldShares === 0) {
       await createSkippedRecord(trade, 'no shares held to sell', allocation.id, isPaper);
       return;
     }
@@ -132,20 +131,6 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     // (e.g., send 2.409635 → fills 2.40, leaving 0.009635 orphaned).
     // By flooring upfront, the fill matches exactly what we send — zero dust created.
     sellShares = Math.floor(heldShares * 100) / 100;
-    if (sellShares < 0.01) {
-      // Remaining shares are sub-penny dust — cannot be sold on CLOB.
-      // For live allocations, verify against API (cached 60s) to distinguish phantom
-      // dust (DB rounding artifact) from real dust (resolves at settlement).
-      if (!isPaper) {
-        const existsOnChain = await checkApiPositionExists(trade.asset);
-        if (!existsOnChain) {
-          await createSkippedRecord(trade, 'no shares held to sell (API-verified phantom)', allocation.id, isPaper);
-          return;
-        }
-      }
-      await createSkippedRecord(trade, `dust position (${heldShares.toFixed(6)} shares): awaiting settlement`, allocation.id, isPaper);
-      return;
-    }
     copyAmountUsd = sellShares * trade.price;
   } else {
     // Guard: negative or zero capital means no buying power
@@ -565,7 +550,11 @@ async function getHeldShares(
       tokenId, followAllocationId, isPaper, netShares,
     });
   }
-  return Math.max(netShares, 0);
+  // Round away sub-penny dust: amounts < 0.01 shares are unsellable on CLOB
+  // (2dp floor → 0) and settle at market resolution. Eliminates phantom dust
+  // from floating-point accumulation in requestedAmount/price division.
+  const clamped = Math.max(netShares, 0);
+  return clamped < 0.01 ? 0 : clamped;
 }
 
 async function getNetPositionUsd(
@@ -595,7 +584,10 @@ async function getNetPositionUsd(
       tokenId, followAllocationId, isPaper, netUsd,
     });
   }
-  return Math.max(netUsd, 0);
+  // Round away sub-penny residuals: amounts < $0.01 are below CLOB minimum
+  // and represent floating-point accumulation artifacts, not real positions.
+  const clamped = Math.max(netUsd, 0);
+  return clamped < 0.01 ? 0 : clamped;
 }
 
 /**
@@ -647,46 +639,6 @@ async function getOppositePosition(
   netUsd = Math.max(netUsd, 0);
   const avgBuyPrice = buyShares > 0 ? buyCost / buyShares : 0;
   return { netUsd, avgBuyPrice };
-}
-
-// ─── Cached API position check for dust tiebreaker ───
-// Caches the full getPositions() response for 60s to avoid redundant calls.
-// MisTKy's 19 dust skips in 8h were all for the same tokenId — without cache,
-// each would fire a separate 200ms API call blocking the sequential trade loop.
-let positionCacheData: Awaited<ReturnType<typeof getPositions>> | null = null;
-let positionCacheExpiry = 0;
-const POSITION_CACHE_TTL_MS = 60_000;
-
-/**
- * API tiebreaker for dust-level positions: returns false if no on-chain position exists.
- * Fail-open on all error paths (returns true → existing dust behavior preserved).
- * Only called for live allocations in the dust band (< 0.01 shares).
- */
-export async function checkApiPositionExists(tokenId: string): Promise<boolean> {
-  if (!config.FUNDER_ADDRESS) return true;
-  try {
-    const now = Date.now();
-    if (!positionCacheData || now > positionCacheExpiry) {
-      positionCacheData = await getPositions({ user: config.FUNDER_ADDRESS, sizeThreshold: 0 });
-      positionCacheExpiry = now + POSITION_CACHE_TTL_MS;
-    }
-    const match = positionCacheData.find((p) => p.asset === tokenId);
-    if (!match || match.size <= 0) {
-      log.debug('API position check: no on-chain position (phantom dust)', {
-        tokenId: tokenId.slice(0, 20),
-      });
-      return false;
-    }
-    return true;
-  } catch (err: any) {
-    log.warn('API position check failed (proceeding with DB value)', {
-      tokenId: tokenId.slice(0, 20),
-      error: err.message?.slice(0, 200),
-    });
-    positionCacheData = null;
-    positionCacheExpiry = 0;
-    return true;
-  }
 }
 
 /**

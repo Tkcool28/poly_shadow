@@ -15,7 +15,7 @@ import { executeMarketOrder as paperExecute } from '../services/paper-executor';
 import type { ExecuteOrderResult } from '../services/trade-executor';
 import {
   processCopyTrade, isInSellCooldown, recordSellFill,
-  checkApiPositionExists, createSkippedRecord,
+  createSkippedRecord,
 } from '../services/copy-trade-worker';
 import type { DetectedTradeRow } from '../services/copy-trade-worker';
 import { addToPool } from '../services/order-pool';
@@ -80,9 +80,13 @@ async function buildDrainCache(
   const positionCache = new Map<string, CachedPosition>();
   for (const row of positionRows) {
     const key = `${row.tokenId}:${row.followAllocationId}:${row.isPaper}`;
+    // Round sub-penny residuals to 0: amounts < 0.01 shares/USD are unsellable
+    // on CLOB and represent floating-point accumulation artifacts.
+    const clampShares = Math.max(row.netShares ?? 0, 0);
+    const clampUsd = Math.max(row.netUsd ?? 0, 0);
     positionCache.set(key, {
-      netShares: Math.max(row.netShares ?? 0, 0),
-      netUsd: Math.max(row.netUsd ?? 0, 0),
+      netShares: clampShares < 0.01 ? 0 : clampShares,
+      netUsd: clampUsd < 0.01 ? 0 : clampUsd,
       buyCost: Math.max(row.buyCost ?? 0, 0),
       buyShares: Math.max(row.buyShares ?? 0, 0),
     });
@@ -290,23 +294,14 @@ async function phaseA(
   let traderTradeUsd: number | null = null;
 
   if (trade.side === 'SELL') {
+    // cache.getPosition() rounds sub-penny amounts (< 0.01 shares) to 0 — these are
+    // unsellable on CLOB (2dp floor → 0) and settle at market resolution.
     const heldShares = cache.getPosition(trade.asset, allocation.id, isPaper).netShares;
-    if (heldShares < 0.000001) {
+    if (heldShares === 0) {
       await createSkippedRecord(trade, 'no shares held to sell', allocation.id, isPaper);
       return null;
     }
     sellShares = Math.floor(heldShares * 100) / 100;
-    if (sellShares < 0.01) {
-      if (!isPaper) {
-        const existsOnChain = await checkApiPositionExists(trade.asset);
-        if (!existsOnChain) {
-          await createSkippedRecord(trade, 'no shares held to sell (API-verified phantom)', allocation.id, isPaper);
-          return null;
-        }
-      }
-      await createSkippedRecord(trade, `dust position (${heldShares.toFixed(6)} shares): awaiting settlement`, allocation.id, isPaper);
-      return null;
-    }
     copyAmountUsd = sellShares * trade.price;
   } else {
     const availableCapital = allocation.currentCapital - cache.getPendingCapital(allocation.id);
