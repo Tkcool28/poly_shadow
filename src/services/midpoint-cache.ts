@@ -45,6 +45,7 @@ export class MidpointCache {
     if (this.ws) return;
     this.shouldReconnect = true;
     this.createConnection();
+    if (this.pruneTimer) clearInterval(this.pruneTimer);
     this.pruneTimer = setInterval(() => this.pruneStaleSubscriptions(), PRUNE_INTERVAL_MS);
   }
 
@@ -77,7 +78,13 @@ export class MidpointCache {
     }
     if (hasNew) {
       this.subscribedTokenIds = [...this.tokenLastRequested.keys()];
-      this.sendSubscription();
+      if (!this.ws) {
+        // WS was closed (idle prune or never started) — full restart
+        log.info('Midpoint cache: re-arming WS connection', { tokens: this.subscribedTokenIds.length });
+        this.connect(); // resets shouldReconnect, reconnectDelay, starts pruneTimer
+      } else {
+        this.sendSubscription();
+      }
     }
   }
 
@@ -250,6 +257,10 @@ export class MidpointCache {
 
   private scheduleReconnect(): void {
     if (!this.shouldReconnect) return;
+    if (this.subscribedTokenIds.length === 0) {
+      log.info('Midpoint cache: skipping reconnect (no subscriptions)');
+      return;
+    }
     const delay = this.reconnectDelayMs;
     this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 30_000);
     log.info(`Midpoint cache reconnecting in ${delay}ms...`);
@@ -271,6 +282,21 @@ export class MidpointCache {
     }
     if (changed) {
       this.subscribedTokenIds = [...this.tokenLastRequested.keys()];
+      if (this.subscribedTokenIds.length === 0) {
+        // All tokens pruned — fully quiesce: close WS + stop all timers.
+        // ensureSubscribed() will call connect() to restart everything.
+        log.info('Midpoint cache: all subscriptions pruned, closing idle WS');
+        this.shouldReconnect = false; // prevent on-close handler from re-arming
+        if (this.ws) {
+          this.ws.removeAllListeners();
+          if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
+            this.ws.close(1000, 'No subscriptions');
+          }
+          this.ws = null;
+        }
+        this.clearTimers(); // stop ping, prune, and any pending reconnect
+        return;
+      }
       this.sendSubscription();
       log.info('Midpoint cache pruned stale subscriptions', { remaining: this.subscribedTokenIds.length });
     }
