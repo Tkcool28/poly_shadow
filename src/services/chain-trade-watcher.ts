@@ -15,6 +15,7 @@ const ORDER_FILLED_TOPIC = '0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af
 const HEARTBEAT_INTERVAL_MS = 45_000;  // keepalive cadence (was 20s; reduced to save dRPC CU)
 const STALE_THRESHOLD_MS = HEARTBEAT_INTERVAL_MS * 3; // 135s without heartbeat response → reconnect
 const INITIAL_RECONNECT_MS = 1000;
+const TAKER_DEBOUNCE_MS = 200; // debounce taker events to let MAKER events arrive first
 
 // ABI types for decoding OrderFilled event data (non-indexed params only)
 // [makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled, fee]
@@ -58,10 +59,15 @@ export class ChainTradeWatcher {
   private getLiveWallets: () => Set<string>; // returns only live-allocation wallets (~7)
   private subscribedWallets: Set<string> = new Set();
   private recentTxHashes: Map<string, number> = new Map(); // dedupKey → timestamp ms
-  // Suppress complementary-side fills: CTF exchange emits OrderFilled for both
-  // sides of a binary market fill (BUY Down + phantom SELL Up from same tx).
-  // Track first-seen side per tx+wallet to suppress the opposite-side phantom.
-  private recentTxSides: Map<string, string> = new Map(); // "txHash:wallet" → first side seen
+  // NegRisk complementary fill handling: phantom opposite-side events arrive before
+  // the real trade (lower logIndex). MAKER events are always real; TAKER events are
+  // debounced to allow a MAKER event to arrive and take priority.
+  private emittedTxSides: Map<string, string> = new Map(); // "txHash:wallet" → emitted side
+  private pendingTakerEmits: Map<string, {
+    side: string;
+    data: ChainTradeData;
+    timer: ReturnType<typeof setTimeout>;
+  }> = new Map();
   private heartbeatCount = 0;
 
   // Per-wallet subscription tracking: id → confirmed
@@ -99,6 +105,12 @@ export class ChainTradeWatcher {
   close(): void {
     this.shouldReconnect = false;
     this.clearAllTimers();
+    // Clear pending taker debounce timers
+    for (const entry of this.pendingTakerEmits.values()) {
+      clearTimeout(entry.timer);
+    }
+    this.pendingTakerEmits.clear();
+    this.emittedTxSides.clear();
     if (this.ws) {
       this.ws.removeAllListeners();
       if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
@@ -230,12 +242,12 @@ export class ChainTradeWatcher {
         if (ts < cutoff) this.recentTxHashes.delete(key);
       }
     }
-    // Evict recentTxSides in sync (same lifecycle — insertion-ordered, cap at 500)
-    if (this.recentTxSides.size > 500) {
+    // Evict emittedTxSides in sync (same lifecycle — insertion-ordered, cap at 500)
+    if (this.emittedTxSides.size > 500) {
       let i = 0;
-      for (const key of this.recentTxSides.keys()) {
+      for (const key of this.emittedTxSides.keys()) {
         if (i++ >= 250) break;
-        this.recentTxSides.delete(key);
+        this.emittedTxSides.delete(key);
       }
     }
 
@@ -322,38 +334,33 @@ export class ChainTradeWatcher {
           return;
         }
 
-        // Suppress opposite-side fills from same tx+wallet (complementary match phantoms).
-        // When a trader BUYs Down, the CTF exchange can emit an OrderFilled for the Up
-        // side as well (complementary token matching). The first-seen side per tx wins.
-        // Synchronous check → zero race condition risk (Node.js single-threaded event loop).
+        // ─── NegRisk complementary fill suppression (MAKER-preference) ───
+        // NegRisk exchange emits phantom OrderFilled events for the complement
+        // side during complementary matching (e.g., limit BUY "No" triggers phantom
+        // SELL "Yes" where wallet appears as TAKER). Phantom events arrive at LOWER
+        // logIndex than the real trade.
+        //
+        // Strategy: MAKER events are always the real trade → emit immediately.
+        // TAKER events are debounced to allow a MAKER event to arrive and override.
         const txWalletKey = `${logEntry.transactionHash}:${matchedWallet}`;
-        const firstSide = this.recentTxSides.get(txWalletKey);
-        if (firstSide !== undefined && firstSide !== side) {
-          log.debug('Suppressed opposite-side fill from same tx (complementary match)', {
-            wallet: matchedWallet.slice(0, 10),
-            suppressedSide: side,
-            existingSide: firstSide,
-            tokenId: tokenId.slice(0, 16),
-            txHash: logEntry.transactionHash?.slice(0, 18),
-          });
+
+        // Already emitted a trade for this tx+wallet?
+        const emittedSide = this.emittedTxSides.get(txWalletKey);
+        if (emittedSide !== undefined) {
+          if (emittedSide !== side) {
+            log.debug('Suppressed late phantom fill (already emitted opposite side)', {
+              wallet: matchedWallet.slice(0, 10),
+              suppressedSide: side,
+              emittedSide,
+              isMaker,
+              txHash: logEntry.transactionHash?.slice(0, 18),
+            });
+          }
+          // Same-side duplicate or opposite-side phantom — skip either way
           return;
         }
-        if (firstSide === undefined) {
-          this.recentTxSides.set(txWalletKey, side);
-        }
 
-        log.debug('OrderFilled decoded', {
-          wallet: matchedWallet.slice(0, 10),
-          side,
-          isMaker,
-          tokenId: tokenId.slice(0, 16),
-          size: size.toFixed(4),
-          price: price.toFixed(4),
-          txHash: logEntry.transactionHash?.slice(0, 18),
-          contract: isNegRisk ? 'NegRisk' : 'Standard',
-        });
-
-        void this.onTradeDetected({
+        const tradeData: ChainTradeData = {
           proxyWallet: matchedWallet,
           tokenId,
           side,
@@ -363,9 +370,51 @@ export class ChainTradeWatcher {
           isNegRisk,
           contract: logEntry.address,
           isMaker,
-        }).catch((err: any) =>
-          log.error('Trade detection handler error', { error: err.message }),
-        );
+        };
+
+        if (isMaker) {
+          // MAKER = always the real trade (limit order filled). Emit immediately.
+          const pending = this.pendingTakerEmits.get(txWalletKey);
+          if (pending) {
+            clearTimeout(pending.timer);
+            this.pendingTakerEmits.delete(txWalletKey);
+            log.debug('Cancelled debounced taker phantom in favor of maker event', {
+              wallet: matchedWallet.slice(0, 10),
+              cancelledSide: pending.side,
+              makerSide: side,
+              txHash: logEntry.transactionHash?.slice(0, 18),
+            });
+          }
+          this.emitTrade(txWalletKey, tradeData);
+        } else {
+          // TAKER: could be a real taker fill or a phantom from complementary matching.
+          // Debounce to give a MAKER event time to arrive and take priority.
+          const pending = this.pendingTakerEmits.get(txWalletKey);
+          if (pending) {
+            if (pending.side === side) {
+              // Same-side multi-fill: accumulate size with VWAP
+              const oldNotional = pending.data.size * pending.data.price;
+              pending.data.size += size;
+              pending.data.price = (oldNotional + size * price) / pending.data.size;
+              log.debug('Accumulated multi-fill into pending taker event', {
+                wallet: matchedWallet.slice(0, 10),
+                side,
+                addedSize: size.toFixed(4),
+                totalSize: pending.data.size.toFixed(4),
+                vwapPrice: pending.data.price.toFixed(4),
+                txHash: logEntry.transactionHash?.slice(0, 18),
+              });
+            }
+            // Different side = phantom-of-phantom, or same side accumulated above
+            return;
+          }
+          const timer = setTimeout(() => {
+            this.pendingTakerEmits.delete(txWalletKey);
+            // No MAKER event arrived within debounce window → this taker event is real
+            this.emitTrade(txWalletKey, tradeData);
+          }, TAKER_DEBOUNCE_MS);
+          this.pendingTakerEmits.set(txWalletKey, { side, data: tradeData, timer });
+        }
       } catch (err: any) {
         log.warn('Failed to decode OrderFilled data, skipping', {
           wallet: matchedWallet.slice(0, 10),
@@ -374,6 +423,26 @@ export class ChainTradeWatcher {
         });
       }
     }
+  }
+
+  /** Emit a decoded trade and mark the tx+wallet as resolved */
+  private emitTrade(txWalletKey: string, data: ChainTradeData): void {
+    this.emittedTxSides.set(txWalletKey, data.side);
+
+    log.debug('OrderFilled decoded', {
+      wallet: data.proxyWallet.slice(0, 10),
+      side: data.side,
+      isMaker: data.isMaker,
+      tokenId: data.tokenId.slice(0, 16),
+      size: data.size.toFixed(4),
+      price: data.price.toFixed(4),
+      txHash: data.transactionHash?.slice(0, 18),
+      contract: data.isNegRisk ? 'NegRisk' : 'Standard',
+    });
+
+    void this.onTradeDetected(data).catch((err: any) =>
+      log.error('Trade detection handler error', { error: err.message }),
+    );
   }
 
   /**
