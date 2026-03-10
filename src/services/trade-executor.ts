@@ -445,38 +445,35 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
 
     // Guard: FAK order submitted but not matched (no fill amounts) — treat as SKIPPED
     if (!filledSize || !filledPrice) {
-      // If CLOB accepted the order (orderId present), the fill may be propagating
-      // asynchronously. Verify via getOrder() before declaring unmatched.
+      // Background ghost-fill verification (non-blocking — saves ~1,100ms on critical path).
+      // If the CLOB accepted the order (orderId present), the fill may be propagating
+      // asynchronously. Schedule a background check that logs detection.
+      // Safety net: reconcileSkippedGhostFills() runs hourly and recovers capital.
+      // Data: 2/1167 FAK trades (0.17%) are actual ghost fills over 7 days.
       if (orderId && client) {
-        await new Promise(r => setTimeout(r, 1000)); // allow matching engine propagation
-        try {
-          const order = await client.getOrder(orderId);
-          if (order?.status === 'MATCHED') {
-            const sizeMatched = parseFloat(order.size_matched || '0');
-            const orderPrice = parseFloat(order.price || '0');
-            // For SELL FAK, order.price is the $0.01 limit — use detectedPrice instead.
-            // For BUY FAK, order.price is the slippage-limited price — close to actual fill.
-            const recoveredPrice = (side === 'SELL') ? detectedPrice : orderPrice;
-            // Sanity: prediction market price must be in (0, 1.0]
-            if (sizeMatched > 0 && recoveredPrice > 0 && recoveredPrice <= 1.0) {
-              log.info('FAK ghost fill recovered via getOrder()', {
-                orderId, sizeMatched, recoveredPrice, orderPrice, side,
-              });
-              return {
-                orderId,
-                status: 'FILLED',
-                filledPrice: recoveredPrice,
-                filledSize: sizeMatched,
-                failReason: null,
-                transactionHashes: txHashes,
-              };
+        const capturedOrderId = orderId;
+        const capturedSide = side;
+        const capturedDetectedPrice = detectedPrice;
+        const bgVerify = async () => {
+          try {
+            if (!client) return;
+            const order = await client.getOrder(capturedOrderId);
+            if (order?.status === 'MATCHED') {
+              const sizeMatched = parseFloat(order.size_matched || '0');
+              const orderPrice = parseFloat(order.price || '0');
+              const recoveredPrice = (capturedSide === 'SELL') ? capturedDetectedPrice : orderPrice;
+              if (sizeMatched > 0 && recoveredPrice > 0 && recoveredPrice <= 1.0) {
+                log.warn('FAK ghost fill detected in background — reconciler will recover', {
+                  orderId: capturedOrderId, sizeMatched, recoveredPrice, orderPrice,
+                  side: capturedSide,
+                });
+              }
             }
+          } catch {
+            // Fail-safe: reconcileSkippedGhostFills() will catch it on next hourly sweep
           }
-        } catch (err: any) {
-          log.warn('FAK ghost fill verification failed (proceeding as SKIPPED)', {
-            orderId, error: err.message?.slice(0, 200),
-          });
-        }
+        };
+        setTimeout(() => { bgVerify().catch(() => {}); }, 1500);
       }
 
       const postOrderBBA = getBBAFromCache(tokenId);

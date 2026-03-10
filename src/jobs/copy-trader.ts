@@ -38,6 +38,7 @@ const CAPITAL_AUDIT_INTERVAL_MS = 3_600_000; // 1 hour
 // ─── Pipeline infrastructure (Change 5) ───
 
 const clobLimiter = pLimit(10);
+const MAX_DRAIN_BATCH_SIZE = 20;
 
 // ─── DrainCache (Change 3) ───
 
@@ -244,6 +245,8 @@ interface PhaseAResult {
   startMs: number;
   signalAgeMs: number;
   clobPromise?: Promise<{ result: ExecuteOrderResult; clobMs: number }>;
+  clobStartMs?: number;
+  drainStartMs: number;
   traderTradeUsd: number | null;
   copyPercent: number;
   maxPerTrade: number;
@@ -259,6 +262,7 @@ async function phaseA(
   allocation: { id: string; isPaper: boolean; currentCapital: number;
     copyTradePercent: number | null; maxPositionUsd: number | null; maxPredictionPositionUsd: number | null },
   cache: DrainCache,
+  drainStartMs: number,
 ): Promise<PhaseAResult | null> {
   const startMs = Date.now();
   const signalAgeMs = startMs - trade.timestamp * 1000;
@@ -469,6 +473,7 @@ async function phaseA(
     sellShares,
     startMs,
     signalAgeMs,
+    drainStartMs,
     traderTradeUsd,
     copyPercent,
     maxPerTrade,
@@ -504,7 +509,12 @@ async function batchSettle(
         : { orderId: null, status: 'FAILED', filledPrice: null, filledSize: null,
             failReason: (settled.reason as Error)?.message?.slice(0, 500), transactionHashes: [] };
 
-      const latencyMs = Date.now() - res.startMs;
+      const queueMs = res.clobStartMs ? res.clobStartMs - res.startMs : null;
+      const latencyMs = res.clobStartMs
+        ? Date.now() - res.clobStartMs   // CLOB-only latency (accurate)
+        : Date.now() - res.startMs;       // fallback for paper/edge cases
+      const e2eMs = Date.now() - res.drainStartMs;
+      const prePhaseMs = res.startMs - res.drainStartMs;
       let slippageBps: number | null = null;
       if (result.filledPrice && res.detectedPrice > 0) {
         slippageBps = Math.round(((result.filledPrice - res.detectedPrice) / res.detectedPrice) * 10000);
@@ -561,7 +571,7 @@ async function batchSettle(
           copyAmountUsd: res.copyAmountUsd.toFixed(2),
           filledPrice: result.filledPrice, filledSize: result.filledSize,
           slippageBps, estimatedFee: result.estimatedFee,
-          latencyMs, clobMs, signalAgeMs: res.signalAgeMs,
+          latencyMs, clobMs, queueMs, e2eMs, prePhaseMs, signalAgeMs: res.signalAgeMs,
           allocationId: allocation.id, copyPercent: res.copyPercent,
           maxPerTrade: res.maxPerTrade, maxPerPrediction: res.maxPerPrediction,
         });
@@ -569,14 +579,15 @@ async function batchSettle(
         log.info(`COPY TRADE SKIPPED [${mode}]`, {
           trader: res.tradeInfo.proxyWallet.slice(0, 10), mode,
           reason: result.failReason, side: res.side,
-          title: res.tradeInfo.title?.slice(0, 50), signalAgeMs: res.signalAgeMs,
+          title: res.tradeInfo.title?.slice(0, 50),
+          latencyMs, clobMs, queueMs, e2eMs, prePhaseMs, signalAgeMs: res.signalAgeMs,
         });
       } else {
         log.warn(`COPY TRADE FAILED [${mode}]`, {
           trader: res.tradeInfo.proxyWallet.slice(0, 10), mode,
           reason: result.failReason, side: res.side,
           title: res.tradeInfo.title?.slice(0, 50),
-          latencyMs, clobMs, signalAgeMs: res.signalAgeMs,
+          latencyMs, clobMs, queueMs, e2eMs, prePhaseMs, signalAgeMs: res.signalAgeMs,
         });
       }
     }
@@ -613,6 +624,7 @@ async function batchSettle(
 async function drainParallel(
   pending: DetectedTradeRow[],
   isShutdown: () => boolean,
+  drainStartMs: number,
 ): Promise<number> {
   // 1. Build drain cache (3 bulk SQL queries + opposite token map)
   const conditionIds = pending.map(t => t.conditionId);
@@ -661,13 +673,13 @@ async function drainParallel(
             copyTradePercent: allocation.copyTradePercent,
             maxPositionUsd: allocation.maxPositionUsd,
             maxPredictionPositionUsd: allocation.maxPredictionPositionUsd,
-          }, drainCache),
+          }, drainCache, drainStartMs),
         );
         if (result) {
           // Fire CLOB immediately (non-blocking, bounded by pLimit(10))
           const executeFn = result.isPaper ? paperExecute : realExecute;
           result.clobPromise = clobLimiter(async () => {
-            const clobStart = Date.now();
+            result.clobStartMs = Date.now();
             const clobResult = await executeFn({
               tokenId: result.tokenId,
               side: result.side,
@@ -675,7 +687,7 @@ async function drainParallel(
               detectedPrice: result.detectedPrice,
               detectionSource: result.detectionSource,
             });
-            return { result: clobResult, clobMs: Date.now() - clobStart };
+            return { result: clobResult, clobMs: Date.now() - result.clobStartMs! };
           });
           reservations.push(result);
         }
@@ -920,6 +932,12 @@ async function main() {
       // SELLs first (exits are time-sensitive), then BUYs
       const pending = [...pendingSells, ...pendingBuys, ...makerBuys];
 
+      if (pending.length > MAX_DRAIN_BATCH_SIZE) {
+        log.info(`Drain batch capped: ${pending.length} pending, processing first ${MAX_DRAIN_BATCH_SIZE}`);
+        pending.length = MAX_DRAIN_BATCH_SIZE;
+        drainScheduled = true;
+      }
+
       if (pending.length === 0) {
         emptyDrainCount++;
         if (emptyDrainCount % 20 === 1) {
@@ -940,7 +958,7 @@ async function main() {
       if (uniqueTokenIds.length > 0) ensureSubscribed(uniqueTokenIds);
 
       if (parallelDrainEnabled) {
-        processedCount = await drainParallel(pending, () => shuttingDown || isShuttingDown());
+        processedCount = await drainParallel(pending, () => shuttingDown || isShuttingDown(), start);
       } else {
         // Sequential fallback: existing processCopyTrade() loop
         for (const trade of pending) {
