@@ -51,6 +51,7 @@ export interface DetectedTradeRow {
   title: string | null;
   transactionHash: string;
   timestamp: number;
+  realTimestamp: number | null;
   compositeScore: number | null;
   detectedAt: Date;
   detectionSource: string | null;
@@ -58,7 +59,7 @@ export interface DetectedTradeRow {
 
 export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   const startMs = Date.now();
-  const signalAgeMs = startMs - trade.timestamp * 1000;
+  const signalAgeMs = startMs - (trade.realTimestamp ?? trade.timestamp) * 1000;
 
   // ─── Filter checks ───
 

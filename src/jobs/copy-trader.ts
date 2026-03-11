@@ -52,6 +52,8 @@ interface DrainCache {
   getPendingCapital(allocationId: string): number;
   getDailySpend(isPaper: boolean): number;
   isMarketClosed(conditionId: string): boolean;
+  getMarketEndDate(conditionId: string): Date | null;
+  getMarketEventSlug(conditionId: string): string | null;
 }
 
 async function buildDrainCache(
@@ -130,11 +132,15 @@ async function buildDrainCache(
   const uniqueConditionIds = [...new Set(conditionIds)];
   const markets = await prisma.market.findMany({
     where: { conditionId: { in: uniqueConditionIds } },
-    select: { conditionId: true, closed: true },
+    select: { conditionId: true, closed: true, endDate: true, eventSlug: true },
   });
   const marketClosedMap = new Map<string, boolean>();
+  const marketEndDateMap = new Map<string, Date | null>();
+  const marketEventSlugMap = new Map<string, string | null>();
   for (const m of markets) {
     marketClosedMap.set(m.conditionId, m.closed);
+    marketEndDateMap.set(m.conditionId, m.endDate);
+    marketEventSlugMap.set(m.conditionId, m.eventSlug ?? null);
   }
 
   // Resolve missing markets from Gamma API
@@ -144,10 +150,12 @@ async function buildDrainCache(
       await resolveMarkets(missing);
       const resolved = await prisma.market.findMany({
         where: { conditionId: { in: missing } },
-        select: { conditionId: true, closed: true },
+        select: { conditionId: true, closed: true, endDate: true, eventSlug: true },
       });
       for (const m of resolved) {
         marketClosedMap.set(m.conditionId, m.closed);
+        marketEndDateMap.set(m.conditionId, m.endDate);
+        marketEventSlugMap.set(m.conditionId, m.eventSlug ?? null);
       }
     } catch (err: any) {
       log.warn(`DrainCache: resolveMarkets failed (fail-open): ${err.message}`);
@@ -228,6 +236,14 @@ async function buildDrainCache(
     isMarketClosed(conditionId) {
       return marketClosedMap.get(conditionId) ?? false; // fail-open
     },
+
+    getMarketEndDate(conditionId) {
+      return marketEndDateMap.get(conditionId) ?? null;
+    },
+
+    getMarketEventSlug(conditionId) {
+      return marketEventSlugMap.get(conditionId) ?? null;
+    },
   };
 }
 
@@ -265,7 +281,7 @@ async function phaseA(
   drainStartMs: number,
 ): Promise<PhaseAResult | null> {
   const startMs = Date.now();
-  const signalAgeMs = startMs - trade.timestamp * 1000;
+  const signalAgeMs = startMs - (trade.realTimestamp ?? trade.timestamp) * 1000;
   const isPaper = allocation.isPaper;
 
   const copyPercent = allocation.copyTradePercent ?? config.COPY_TRADE_PERCENT;
@@ -285,6 +301,21 @@ async function phaseA(
   if (trade.side === 'BUY' && config.MARKET_END_GATEKEEP_ENABLED && cache.isMarketClosed(trade.conditionId)) {
     await createSkippedRecord(trade, 'market already closed', allocation.id, isPaper);
     return null;
+  }
+
+  if (trade.side === 'BUY' && config.MARKET_END_GATEKEEP_ENABLED) {
+    const eventSlug = cache.getMarketEventSlug(trade.conditionId);
+    const isCryptoUpdown = eventSlug?.startsWith('btc-updown')
+      || eventSlug?.startsWith('sol-updown')
+      || eventSlug?.startsWith('eth-updown')
+      || eventSlug?.startsWith('xrp-updown');
+    if (isCryptoUpdown) {
+      const endDate = cache.getMarketEndDate(trade.conditionId);
+      if (endDate && Date.now() > endDate.getTime()) {
+        await createSkippedRecord(trade, `crypto updown market expired (endDate: ${endDate.toISOString()})`, allocation.id, isPaper);
+        return null;
+      }
+    }
   }
 
   if (trade.side === 'BUY' && isInSellCooldown(allocation.id, trade.asset)) {
@@ -894,7 +925,6 @@ async function main() {
           ...baseWhere,
           side: 'SELL',
           proxyWallet: { in: allActiveWallets },
-          detectionSource: { not: 'LIVE_POLL' },
         },
         orderBy: { detectedAt: 'asc' },
       });
@@ -903,9 +933,9 @@ async function main() {
       const buyWhere = {
         ...baseWhere,
         side: 'BUY' as const,
-        detectionSource: config.SKIP_CHAIN_MAKER_FILLS
-          ? { notIn: ['LIVE_POLL', 'CHAIN_MAKER'] }
-          : { not: 'LIVE_POLL' as const },
+        ...(config.SKIP_CHAIN_MAKER_FILLS
+          ? { detectionSource: { notIn: ['CHAIN_MAKER'] } }
+          : {}),
       };
       const pendingBuys = await prisma.detectedTrade.findMany({
         where: { ...buyWhere, proxyWallet: { in: buyEligibleWallets } },

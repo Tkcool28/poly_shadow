@@ -39,7 +39,8 @@ const envSchema = z.object({
     .transform((v) => v === 'true'),
   WS_RECONNECT_MAX_MS: z.coerce.number().default(30000),
   WS_FALLBACK_POLL_MS: z.coerce.number().default(300000), // 5 min
-  LIVE_TRADERS_POLL_MS: z.coerce.number().default(10000), // 10s fast-poll backup for live-allocation traders
+  LIVE_TRADERS_POLL_MS: z.coerce.number().default(500), // rapid-poll interval for live-allocation traders (primary signal source; 150ms on AWS, 500ms on Finland)
+  RAPID_POLL_LIMIT: z.coerce.number().default(20), // API limit per wallet per rapid-poll cycle
   POLYGON_WS_RPC_URL: z.string().default('wss://polygon-bor-rpc.publicnode.com'),
   POLYGON_HTTP_RPC_URL: z.string().default('https://polygon-bor-rpc.publicnode.com'),
   CHAIN_VERIFY_INTERVAL_MS: z.coerce.number().default(300000), // 5 min periodic eth_getLogs verification

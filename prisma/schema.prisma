@@ -346,10 +346,11 @@ model DetectedTrade {
   eventSlug       String?
   transactionHash String
   timestamp       Int
+  realTimestamp    Int?    // Real CLOB matching time; NULL = pending backfill for CHAIN detections
   compositeScore  Float?
 
   detectedAt      DateTime @default(now())
-  detectionSource String?  // "WS", "CHAIN", "LIVE_POLL", "POLL"
+  detectionSource String?  // "RAPID_POLL", "CHAIN", "CHAIN_MAKER", "POLL", "WS", "PRE_RESOLUTION"
 
   copyTrade CopyTrade?
 

@@ -1,5 +1,6 @@
 import { prisma } from '../lib/prisma';
 import { logger } from '../lib/logger';
+import { config } from '../config/env';
 import { getTrades } from '../api/data-api';
 import { ClobClient } from '@polymarket/clob-client';
 import type { RtdsTradePayload } from './ws-trade-stream';
@@ -229,6 +230,26 @@ export async function createDetectedTradeFromChain(
       txHash: data.transactionHash.slice(0, 18),
     });
 
+    // Fire-and-forget: backfill realTimestamp from Data API
+    void (async () => {
+      try {
+        const trades = await getTrades({ user: normalizedWallet, limit: 20 });
+        const match = trades.find(t => t.transactionHash === data.transactionHash);
+        if (match) {
+          await prisma.detectedTrade.updateMany({
+            where: {
+              transactionHash: data.transactionHash,
+              proxyWallet: normalizedWallet,
+              asset: data.tokenId,
+            },
+            data: { realTimestamp: match.timestamp },
+          });
+        }
+      } catch (e) {
+        logger.debug('realTimestamp backfill failed', { wallet: normalizedWallet.slice(0, 10), err: (e as Error).message });
+      }
+    })();
+
     return true;
   } catch (err: any) {
     if (err.code === 'P2002') return false; // dedup: @@unique([transactionHash, proxyWallet, asset])
@@ -265,6 +286,7 @@ export async function handleRealtimeTrade(payload: RtdsTradePayload): Promise<bo
         eventSlug: payload.eventSlug ?? null,
         transactionHash: payload.transactionHash,
         timestamp: payload.timestamp,
+        realTimestamp: payload.timestamp,
         compositeScore,
         detectionSource: 'WS',
       },
@@ -307,36 +329,53 @@ export async function handleRealtimeTrade(payload: RtdsTradePayload): Promise<bo
   }
 }
 
-// ─── Live-allocation fast-poll gap filler ───
-// Detects trades for live-allocation wallets at 10s intervals.
-// Marked as LIVE_POLL — NOT used as copy-trade signal, only for gap monitoring.
+// ─── Rapid-poll primary signal source ───
+// Polls all live-allocation wallets IN PARALLEL at high frequency.
+// Source: RAPID_POLL — included in copy signal drain queries.
 
-export async function detectLiveTrades(): Promise<number> {
+export async function detectRapidPollTrades(): Promise<number> {
   if (liveAllocationWallets.size === 0) return 0;
+  const cycleStart = Date.now();
 
-  let total = 0;
-  for (const wallet of liveAllocationWallets) {
-    try {
+  // Batch-fetch lastTradeSync for all live wallets (1 query instead of N)
+  const walletList = [...liveAllocationWallets];
+  const traders = await prisma.trader.findMany({
+    where: { proxyWallet: { in: walletList } },
+    select: { proxyWallet: true, lastTradeSync: true },
+  });
+  const syncMap = new Map(traders.map(t => [t.proxyWallet, t.lastTradeSync]));
+
+  // Fire all wallet checks in parallel with per-wallet timeout
+  const results = await Promise.allSettled(
+    walletList.map(async (wallet) => {
+      if (!syncMap.has(wallet)) return 0; // wallet not in Trader table
+      const lastSync = syncMap.get(wallet) ?? null;
       const score = scoreCache.get(wallet) ?? null;
       const name = userNameCache.get(wallet) ?? null;
-      const trader = await prisma.trader.findUnique({
-        where: { proxyWallet: wallet },
-        select: { lastTradeSync: true },
-      });
-      if (!trader) continue;
 
-      const detected = await checkTraderForNewTrades(
-        wallet,
-        name,
-        trader.lastTradeSync,
-        score,
-        ' (LIVE_POLL)',
-        'LIVE_POLL',
-      );
-      total += detected;
-    } catch (err: any) {
-      logger.warn(`Live poll failed for ${wallet.slice(0, 10)}: ${err.message}`);
+      let timer: ReturnType<typeof setTimeout>;
+      return Promise.race([
+        checkTraderForNewTrades(wallet, name, lastSync, score, ' (RAPID_POLL)', 'RAPID_POLL'),
+        new Promise<number>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('rapid poll timeout')), 5000);
+        }),
+      ]).finally(() => clearTimeout(timer));
+    }),
+  );
+
+  let total = 0;
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    if (r.status === 'fulfilled') {
+      total += r.value;
+    } else {
+      logger.warn(`Rapid poll failed for ${walletList[i].slice(0, 10)}: ${r.reason?.message}`);
     }
+  }
+
+  const cycleMs = Date.now() - cycleStart;
+  if (total > 0 || cycleMs > 2000) {
+    logger.info('Rapid poll cycle', { cycleMs, wallets: walletList.length, detected: total });
   }
 
   return total;
@@ -394,10 +433,11 @@ async function checkTraderForNewTrades(
 ): Promise<number> {
   const normalizedWallet = proxyWallet.toLowerCase();
 
-  // Fetch recent trades (limit 100 should be enough for a 2-min window)
+  // Fetch recent trades
+  const limit = source === 'RAPID_POLL' ? config.RAPID_POLL_LIMIT : 100;
   const recentTrades = await getTrades({
     user: proxyWallet,
-    limit: 100,
+    limit,
   });
 
   if (recentTrades.length === 0) return 0;
@@ -438,6 +478,7 @@ async function checkTraderForNewTrades(
           eventSlug: trade.eventSlug ?? null,
           transactionHash: trade.transactionHash,
           timestamp: trade.timestamp,
+          realTimestamp: trade.timestamp,
           compositeScore,
           detectionSource: source,
         },
