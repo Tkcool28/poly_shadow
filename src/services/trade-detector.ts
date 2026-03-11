@@ -374,7 +374,7 @@ export async function detectRapidPollTrades(): Promise<number> {
   }
 
   const cycleMs = Date.now() - cycleStart;
-  if (total > 0 || cycleMs > 2000) {
+  if (total > 0 || cycleMs > 500) {
     logger.info('Rapid poll cycle', { cycleMs, wallets: walletList.length, detected: total });
   }
 

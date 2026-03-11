@@ -7,7 +7,7 @@ const dataApiGeneral = new Bottleneck({
   reservoir: 1000,
   reservoirRefreshInterval: 10000,
   reservoirRefreshAmount: 1000,
-  maxConcurrent: 10,
+  maxConcurrent: 20, // accommodate parallel rapid-poll + other concurrent requests
 });
 
 const dataApiPositions = new Bottleneck({
@@ -22,7 +22,7 @@ const dataApiTrades = new Bottleneck({
   reservoir: 200,
   reservoirRefreshInterval: 10000,
   reservoirRefreshAmount: 200,
-  maxConcurrent: 5,
+  maxConcurrent: 15, // 9 rapid-poll wallets + headroom for bulk POLL
 });
 dataApiTrades.chain(dataApiGeneral);
 
