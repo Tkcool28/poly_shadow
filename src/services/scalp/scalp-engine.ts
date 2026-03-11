@@ -105,6 +105,8 @@ export class ScalpEngine {
 
   /**
    * Handle a bot detection signal (fast bot bought on trade stream).
+   * INVERSE MODE: bot buys token A → we buy the OPPOSITE token B.
+   * Bots are pump-and-dump; fading them is profitable ~90% of the time.
    */
   async onBotSignal(signal: BotSignal): Promise<void> {
     const market = getMarketByTokenId(signal.tokenId);
@@ -112,41 +114,62 @@ export class ScalpEngine {
 
     if (market.marketType !== 'series') return;
 
-    // Find which outcome this token is
-    const tokenInfo = resolveTokenOutcome(market, signal.tokenId);
-    if (!tokenInfo) return;
+    // Find which outcome the bot bought
+    const botTokenInfo = resolveTokenOutcome(market, signal.tokenId);
+    if (!botTokenInfo) return;
 
-    // Check processing lock
-    const existingLock = processingLock.get(signal.tokenId);
-    if (existingLock && Date.now() - existingLock.timestamp < LOCK_EXPIRY_MS) {
-      log.debug('Lock exists for bot signal, skipping', { slug: market.slug });
+    // Resolve the OPPOSITE token (the one the bot did NOT buy)
+    const oppositeToken = resolveOppositeToken(market, signal.tokenId);
+    if (!oppositeToken) {
+      log.warn('Cannot resolve opposite token for inverse', {
+        slug: market.slug,
+        botOutcome: botTokenInfo.outcomeLabel,
+      });
       return;
     }
 
-    // For bot signals, edge estimation is simpler:
-    // assume the bot knows the result and fair value is ~15-25% higher
-    const currentAsk = signal.avgPrice;
-    const estimatedFairValue = Math.min(currentAsk + 0.15, 0.95); // conservative: +15¢
-    const estimatedEdge = (estimatedFairValue - currentAsk) * 100;
+    // Check processing lock on the opposite token (what we're actually buying)
+    const existingLock = processingLock.get(oppositeToken.tokenId);
+    if (existingLock && Date.now() - existingLock.timestamp < LOCK_EXPIRY_MS) {
+      log.debug('Lock exists for inverse bot signal, skipping', { slug: market.slug });
+      return;
+    }
+
+    // Get the opposite token's current ask price from orderbook
+    const oppositePrice = await getCurrentPrice(oppositeToken.tokenId);
+    if (oppositePrice === null || oppositePrice <= 0 || oppositePrice >= 1) {
+      log.debug('Cannot get opposite token price, skipping', {
+        slug: market.slug,
+        oppositeOutcome: oppositeToken.outcomeLabel,
+      });
+      return;
+    }
+
+    // Edge estimation for inverse: bot pumped side A, so side B is cheap.
+    // Fair value of opposite ≈ current price + 15¢ (conservative)
+    const estimatedFairValue = Math.min(oppositePrice + 0.15, 0.95);
+    const estimatedEdge = (estimatedFairValue - oppositePrice) * 100;
 
     await this.evaluateAndEnter({
-      matchId: `bot-${signal.tokenId.slice(0, 16)}-${Date.now()}`,
+      matchId: `bot-inv-${oppositeToken.tokenId.slice(0, 16)}-${Date.now()}`,
       game: market.game as any,
       slug: market.slug,
       conditionId: market.conditionId,
-      tokenId: signal.tokenId,
-      outcomeLabel: tokenInfo.outcomeLabel,
+      tokenId: oppositeToken.tokenId,
+      outcomeLabel: oppositeToken.outcomeLabel,
       eventType: 'bot_signal' as any,
       eventSequence: 0,
       eventDetail: JSON.stringify({
+        inverse: true,
+        botBoughtOutcome: botTokenInfo.outcomeLabel,
         botTotalUsd: signal.totalUsd,
         botTradeCount: signal.tradeCount,
         botAvgPrice: signal.avgPrice,
       }),
       signalSource: 'bot',
-      signalConfidence: 'MEDIUM',
+      signalConfidence: signal.confidence === 'HIGH' ? 'HIGH' : 'MEDIUM',
       estimatedFairValue,
-      currentAsk,
+      currentAsk: oppositePrice,
       estimatedEdge,
       timestamp: signal.timestamp,
     });
@@ -393,6 +416,21 @@ function resolveTokenOutcome(
     if (idx >= 0 && idx < outcomes.length) {
       return { outcomeLabel: outcomes[idx].trim(), outcomeIndex: idx };
     }
+  } catch {}
+  return null;
+}
+
+function resolveOppositeToken(
+  market: ScalpMarketWatch,
+  tokenId: string,
+): { tokenId: string; outcomeLabel: string } | null {
+  try {
+    const outcomes: string[] = JSON.parse(market.outcomes);
+    const tokenIds: string[] = JSON.parse(market.clobTokenIds);
+    const idx = tokenIds.indexOf(tokenId);
+    if (idx < 0 || outcomes.length !== 2 || tokenIds.length !== 2) return null;
+    const oppositeIdx = idx === 0 ? 1 : 0;
+    return { tokenId: tokenIds[oppositeIdx], outcomeLabel: outcomes[oppositeIdx].trim() };
   } catch {}
   return null;
 }
