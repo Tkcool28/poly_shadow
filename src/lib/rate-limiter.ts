@@ -1,7 +1,8 @@
 import Bottleneck from 'bottleneck';
 
-// Rate limiters matching Polymarket's documented 10-second sliding windows
-// Each endpoint group has its own limiter chained to the general API limiter
+// Rate limiters for Polymarket API endpoints
+// Bottleneck uses fixed-window reservoir refresh; minTime provides burst protection against Cloudflare's sliding window
+// Two processes share the Cloudflare budget (trade-monitor + history-backfiller), so per-process reservoir is halved
 
 const dataApiGeneral = new Bottleneck({
   reservoir: 1000,
@@ -19,10 +20,11 @@ const dataApiPositions = new Bottleneck({
 dataApiPositions.chain(dataApiGeneral);
 
 const dataApiTrades = new Bottleneck({
-  reservoir: 200,
+  reservoir: 100,                    // halved for 2-process split (trade-monitor + backfiller)
   reservoirRefreshInterval: 10000,
-  reservoirRefreshAmount: 200,
-  maxConcurrent: 15, // 9 rapid-poll wallets + headroom for bulk POLL
+  reservoirRefreshAmount: 100,
+  maxConcurrent: 15,                 // 7 rapid-poll wallets + headroom for bulk POLL
+  minTime: 75,                       // 75ms between request starts = ~13.3 req/s max per process
 });
 dataApiTrades.chain(dataApiGeneral);
 

@@ -39,61 +39,53 @@ async function requestWithRetry<T>(
 ): Promise<T> {
   const limiter = getRateLimiter(path);
   const start = Date.now();
+  let lastError: Error | undefined;
 
-  return limiter.schedule(async () => {
-    let lastError: Error | undefined;
+  // Retry loop is OUTSIDE limiter.schedule() so the concurrency slot is released
+  // during backoff sleep, preventing slot starvation on 429 bursts
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const response = await limiter.schedule(() =>
+        instance.get<T>(path, { params })
+      );
+      const duration = Date.now() - start;
+      logger.debug(`API ${instance.defaults.baseURL}${path}`, {
+        status: response.status,
+        duration,
+        attempt,
+      });
+      if (proxyRotator.isEnabled) {
+        proxyRotator.reportSuccess(proxyRotator.getCurrentProxyUrl());
+      }
+      return response.data;
+    } catch (error: any) {
+      lastError = error;
+      const status = error.response?.status;
+      const duration = Date.now() - start;
 
-    for (let attempt = 1; attempt <= retries; attempt++) {
-      try {
-        const response = await instance.get<T>(path, { params });
-        const duration = Date.now() - start;
+      if (proxyRotator.isEnabled) {
+        proxyRotator.reportError(proxyRotator.getCurrentProxyUrl());
+      }
 
-        logger.debug(`API ${instance.defaults.baseURL}${path}`, {
-          status: response.status,
+      // Only retry on 429 (rate limit) or 5xx (server error)
+      if (status && status !== 429 && status < 500) {
+        logger.warn(`API ${path} failed with ${status}, not retrying`, { status, duration, attempt });
+        throw error;
+      }
+
+      if (attempt < retries) {
+        const delay = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
+        logger.warn(`API ${path} failed (attempt ${attempt}/${retries}), retrying in ${delay}ms`, {
+          status: status ?? 'network_error',
           duration,
-          attempt,
         });
-
-        if (proxyRotator.isEnabled) {
-          proxyRotator.reportSuccess(proxyRotator.getCurrentProxyUrl());
-        }
-
-        return response.data;
-      } catch (error: any) {
-        lastError = error;
-        const status = error.response?.status;
-        const duration = Date.now() - start;
-
-        if (proxyRotator.isEnabled) {
-          proxyRotator.reportError(proxyRotator.getCurrentProxyUrl());
-        }
-
-        // Only retry on 429 (rate limit) or 5xx (server error)
-        if (status && status !== 429 && status < 500) {
-          logger.warn(`API ${path} failed with ${status}, not retrying`, {
-            status,
-            duration,
-            attempt,
-          });
-          throw error;
-        }
-
-        if (attempt < retries) {
-          const delay = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
-          logger.warn(`API ${path} failed (attempt ${attempt}/${retries}), retrying in ${delay}ms`, {
-            status: status ?? 'network_error',
-            duration,
-          });
-          await new Promise((resolve) => setTimeout(resolve, delay));
-        }
+        await new Promise((resolve) => setTimeout(resolve, delay));
       }
     }
+  }
 
-    logger.error(`API ${path} failed after ${retries} attempts`, {
-      error: lastError?.message,
-    });
-    throw lastError;
-  });
+  logger.error(`API ${path} failed after ${retries} attempts`, { error: lastError?.message });
+  throw lastError;
 }
 
 export const dataApi = {

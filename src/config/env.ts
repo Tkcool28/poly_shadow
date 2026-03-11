@@ -8,7 +8,7 @@ const envSchema = z.object({
   BACKFILL_REFRESH_AFTER_MS: z.coerce.number().default(604800000),  // 7 days
   BACKFILL_REFRESH_BATCH_SIZE: z.coerce.number().default(3),         // stale traders per idle cycle
   SCORE_RECALC_INTERVAL_MS: z.coerce.number().default(21600000),
-  TRADE_MONITOR_INTERVAL_MS: z.coerce.number().default(120000),
+  TRADE_MONITOR_INTERVAL_MS: z.coerce.number().default(900000),  // 15 min safety-net poll for all monitored traders
   PROXY_ENABLED: z
     .string()
     .default('false')
