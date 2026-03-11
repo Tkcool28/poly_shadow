@@ -4,8 +4,6 @@ import { createJobLogger } from '../lib/logger';
 import { config } from '../config/env';
 import { getStats as getRaceStats, resetStats as resetRaceStats } from './detection-race-tracker';
 
-const log = createJobLogger('chain-trade-watcher');
-
 // Both contracts emit OrderFilled — BTC/NegRisk markets use the second address
 const CTF_EXCHANGE_ADDRESSES = [
   '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E', // standard CTFExchange
@@ -13,8 +11,6 @@ const CTF_EXCHANGE_ADDRESSES = [
 ];
 // keccak256('OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)')
 const ORDER_FILLED_TOPIC = '0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6';
-const HEARTBEAT_INTERVAL_MS = 45_000;  // keepalive cadence (was 20s; reduced to save dRPC CU)
-const STALE_THRESHOLD_MS = HEARTBEAT_INTERVAL_MS * 3; // 135s without heartbeat response → reconnect
 const INITIAL_RECONNECT_MS = 1000;
 const TAKER_DEBOUNCE_MS = 200; // debounce taker events to let MAKER events arrive first
 
@@ -51,6 +47,7 @@ export type ChainTradeCallback = (data: ChainTradeData) => Promise<void>;
 export type ChainWatcherState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
 
 export class ChainTradeWatcher {
+  private log: ReturnType<typeof createJobLogger>;
   private ws: WebSocket | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -58,6 +55,10 @@ export class ChainTradeWatcher {
   private reconnectDelayMs = INITIAL_RECONNECT_MS;
   private shouldReconnect = true;
   private lastHeartbeatAt: Date | null = null;
+  private lastPongAt: Date | null = null;
+  private pongEverReceived = false;
+  private isStaleDisconnect = false;
+  private lastPreemptiveBackfillAt = 0;
   private onTradeDetected: ChainTradeCallback;
   private getLiveWallets: () => Set<string>; // returns only live-allocation wallets (~7)
   private subscribedWallets: Set<string> = new Set();
@@ -93,21 +94,24 @@ export class ChainTradeWatcher {
   private blockTimestampCache: Map<number, number> = new Map();
   private blockTimestampPending: Set<number> = new Set();
 
+  readonly label: string;
   state: ChainWatcherState = 'disconnected';
   lastEventAt: Date | null = null;
   eventsReceived = 0;
   triggeredDetections = 0;
 
-  constructor(onTradeDetected: ChainTradeCallback, getLiveWallets: () => Set<string>) {
+  constructor(onTradeDetected: ChainTradeCallback, getLiveWallets: () => Set<string>, label = 'primary') {
     this.onTradeDetected = onTradeDetected;
     this.getLiveWallets = getLiveWallets;
+    this.label = label;
+    this.log = createJobLogger(`chain-watcher-${label}`);
   }
 
   connect(): void {
     if (this.ws) return;
     this.shouldReconnect = true;
     this.state = 'connecting';
-    log.info('Connecting to Polygon WS RPC...', { url: config.POLYGON_WS_RPC_URL });
+    this.log.info('Connecting to Polygon WS RPC...', { url: config.POLYGON_WS_RPC_URL });
     this.createConnection();
   }
 
@@ -128,11 +132,12 @@ export class ChainTradeWatcher {
       this.ws = null;
     }
     this.state = 'disconnected';
-    log.info('Connection closed');
+    this.log.info('Connection closed');
   }
 
   private createConnection(): void {
     const disconnectedAtBlock = this.lastProcessedBlock;
+    this.pongEverReceived = false;
     const ws = new WebSocket(config.POLYGON_WS_RPC_URL);
     this.ws = ws;
 
@@ -140,7 +145,9 @@ export class ChainTradeWatcher {
       this.state = 'connected';
       this.reconnectDelayMs = INITIAL_RECONNECT_MS;
       this.lastHeartbeatAt = new Date();
-      log.info('Connected, subscribing to CTF Exchange OrderFilled events');
+      this.lastPongAt = new Date();
+      this.lastPreemptiveBackfillAt = 0;
+      this.log.info('Connected, subscribing to CTF Exchange OrderFilled events');
 
       this.subscribe(ws);
       this.startHeartbeat(ws);
@@ -154,7 +161,7 @@ export class ChainTradeWatcher {
       // Backfill events missed during disconnection
       if (disconnectedAtBlock) {
         void this.backfillFromBlock(disconnectedAtBlock).catch((err: any) =>
-          log.warn('Backfill on reconnect failed', { error: err.message }),
+          this.log.warn('Backfill on reconnect failed', { error: err.message }),
         );
       }
     });
@@ -174,16 +181,16 @@ export class ChainTradeWatcher {
           this.pendingSubIds.delete(msg.id);
           if (msg.result) {
             this.confirmedSubIds.add(msg.id);
-            log.debug('Subscription confirmed', { id: msg.id, subId: msg.result });
+            this.log.debug('Subscription confirmed', { id: msg.id, subId: msg.result });
             if (this.confirmedSubIds.size === this.expectedSubCount) {
-              log.info('All per-wallet subscriptions confirmed', {
+              this.log.info('All per-wallet subscriptions confirmed', {
                 count: this.confirmedSubIds.size,
               });
             }
           } else if (msg.error) {
             this.failedSubIds.add(msg.id);
             const info = this.subIdToWallet.get(msg.id);
-            log.error('Per-wallet subscription failed', {
+            this.log.error('Per-wallet subscription failed', {
               id: msg.id,
               wallet: info?.wallet.slice(0, 10),
               role: info?.role,
@@ -204,18 +211,22 @@ export class ChainTradeWatcher {
       }
     });
 
-    ws.on('pong', () => { this.lastHeartbeatAt = new Date(); });
+    ws.on('pong', () => {
+      this.lastHeartbeatAt = new Date();
+      this.lastPongAt = new Date();
+      this.pongEverReceived = true;
+    });
     ws.on('ping', () => { this.lastHeartbeatAt = new Date(); });
 
     ws.on('close', (code: number, reason: Buffer) => {
       this.clearTimers();
       this.ws = null;
-      log.warn('Connection closed', { code, reason: reason.toString() });
+      this.log.warn('Connection closed', { code, reason: reason.toString() });
       this.scheduleReconnect();
     });
 
     ws.on('error', (err: Error) => {
-      log.error('Connection error', { error: err.message });
+      this.log.error('Connection error', { error: err.message });
       // 'close' event fires after 'error' — handles reconnection
     });
   }
@@ -299,7 +310,7 @@ export class ChainTradeWatcher {
 
         // Guard: both non-zero means token-to-token swap — not a standard CTF fill
         if (!makerIsUsdc && !takerIsUsdc) {
-          log.warn('Unexpected token-to-token fill (no USDC side), skipping', {
+          this.log.warn('Unexpected token-to-token fill (no USDC side), skipping', {
             wallet: matchedWallet.slice(0, 10),
             makerAssetId: makerAssetId.toString().slice(0, 16),
             takerAssetId: takerAssetId.toString().slice(0, 16),
@@ -336,7 +347,7 @@ export class ChainTradeWatcher {
 
         // Guard: zero-size fills (FOK unmatched orders emit OrderFilled with 0 amounts)
         if (size <= 0 || price <= 0) {
-          log.debug('Skipping zero-size/price OrderFilled (likely FOK non-fill)', {
+          this.log.debug('Skipping zero-size/price OrderFilled (likely FOK non-fill)', {
             wallet: matchedWallet.slice(0, 10),
             size: size.toFixed(6),
             price: price.toFixed(6),
@@ -359,7 +370,7 @@ export class ChainTradeWatcher {
         const emittedSide = this.emittedTxSides.get(txWalletKey);
         if (emittedSide !== undefined) {
           if (emittedSide !== side) {
-            log.debug('Suppressed late phantom fill (already emitted opposite side)', {
+            this.log.debug('Suppressed late phantom fill (already emitted opposite side)', {
               wallet: matchedWallet.slice(0, 10),
               suppressedSide: side,
               emittedSide,
@@ -391,7 +402,7 @@ export class ChainTradeWatcher {
           if (pending) {
             clearTimeout(pending.timer);
             this.pendingTakerEmits.delete(txWalletKey);
-            log.debug('Cancelled debounced taker phantom in favor of maker event', {
+            this.log.debug('Cancelled debounced taker phantom in favor of maker event', {
               wallet: matchedWallet.slice(0, 10),
               cancelledSide: pending.side,
               makerSide: side,
@@ -409,7 +420,7 @@ export class ChainTradeWatcher {
               const oldNotional = pending.data.size * pending.data.price;
               pending.data.size += size;
               pending.data.price = (oldNotional + size * price) / pending.data.size;
-              log.debug('Accumulated multi-fill into pending taker event', {
+              this.log.debug('Accumulated multi-fill into pending taker event', {
                 wallet: matchedWallet.slice(0, 10),
                 side,
                 addedSize: size.toFixed(4),
@@ -429,7 +440,7 @@ export class ChainTradeWatcher {
           this.pendingTakerEmits.set(txWalletKey, { side, data: tradeData, timer });
         }
       } catch (err: any) {
-        log.warn('Failed to decode OrderFilled data, skipping', {
+        this.log.warn('Failed to decode OrderFilled data, skipping', {
           wallet: matchedWallet.slice(0, 10),
           error: err.message,
           txHash: logEntry.transactionHash?.slice(0, 18),
@@ -443,11 +454,11 @@ export class ChainTradeWatcher {
     // Attach block timestamp from cache (may have warmed during taker debounce)
     data.blockTimestamp = this.blockTimestampCache.get(data.blockNumber) ?? null;
     if (!data.blockTimestamp) {
-      log.debug('Block timestamp cache miss', { blockNumber: data.blockNumber, isMaker: data.isMaker });
+      this.log.debug('Block timestamp cache miss', { blockNumber: data.blockNumber, isMaker: data.isMaker });
     }
     this.emittedTxSides.set(txWalletKey, data.side);
 
-    log.debug('OrderFilled decoded', {
+    this.log.debug('OrderFilled decoded', {
       wallet: data.proxyWallet.slice(0, 10),
       side: data.side,
       isMaker: data.isMaker,
@@ -459,7 +470,7 @@ export class ChainTradeWatcher {
     });
 
     void this.onTradeDetected(data).catch((err: any) =>
-      log.error('Trade detection handler error', { error: err.message }),
+      this.log.error('Trade detection handler error', { error: err.message }),
     );
   }
 
@@ -479,7 +490,7 @@ export class ChainTradeWatcher {
     this.degradedModeLogged = false;
 
     if (wallets.size === 0) {
-      log.warn('No live wallets to watch — skipping subscription');
+      this.log.warn('No live wallets to watch — skipping subscription');
       this.expectedSubCount = 0;
       return;
     }
@@ -515,7 +526,7 @@ export class ChainTradeWatcher {
 
     this.expectedSubCount = wallets.size * 2;
     this.subscriptionSentAt = Date.now();
-    log.info('Subscribing per-wallet to OrderFilled events', {
+    this.log.info('Subscribing per-wallet to OrderFilled events', {
       walletCount: wallets.size,
       subscriptions: this.expectedSubCount,
       wallets: [...wallets].map(w => w.slice(0, 10)),
@@ -597,14 +608,14 @@ export class ChainTradeWatcher {
 
     if (recovered > 0) {
       this.backfillRecovered += recovered;
-      log.info('Backfill recovered missed events', {
+      this.log.info('Backfill recovered missed events', {
         fromBlock,
         logsScanned: allLogs.length,
         recovered,
         totalRecovered: this.backfillRecovered,
       });
     } else {
-      log.debug('Backfill scan clean', { fromBlock, logsScanned: allLogs.length });
+      this.log.debug('Backfill scan clean', { fromBlock, logsScanned: allLogs.length });
     }
   }
 
@@ -619,12 +630,12 @@ export class ChainTradeWatcher {
       if (this.state !== 'connected' || !this.lastProcessedBlock) return;
 
       try {
-        // Verify the last ~150 blocks (≈5 min at 2s/block)
-        const fromBlock = this.lastVerifyBlock ?? (this.lastProcessedBlock - 150);
+        // Verify the last ~45 blocks (≈90s at 2s/block, provides overlap with 60s interval)
+        const fromBlock = this.lastVerifyBlock ?? (this.lastProcessedBlock - 45);
         await this.backfillFromBlock(fromBlock);
         this.lastVerifyBlock = this.lastProcessedBlock;
       } catch (err: any) {
-        log.warn('Periodic verification failed', { error: err.message });
+        this.log.warn('Periodic verification failed', { error: err.message });
       }
     }, config.CHAIN_VERIFY_INTERVAL_MS);
   }
@@ -687,25 +698,53 @@ export class ChainTradeWatcher {
       const blockNum = parseInt(json.result, 16);
       if (!isNaN(blockNum) && this.lastProcessedBlock === null) {
         this.lastProcessedBlock = blockNum;
-        log.debug('Seeded lastProcessedBlock from eth_blockNumber', { block: blockNum });
+        this.log.debug('Seeded lastProcessedBlock from eth_blockNumber', { block: blockNum });
       }
     }
   }
 
   // ─── Heartbeat & connection management ───
 
+  private canFirePreemptiveBackfill(): boolean {
+    return Date.now() - this.lastPreemptiveBackfillAt > config.CHAIN_STALE_MS;
+  }
+
   private startHeartbeat(ws: WebSocket): void {
     this.clearHeartbeat();
     this.heartbeatTimer = setInterval(() => {
       if (ws.readyState !== WebSocket.OPEN) return;
 
-      // Stale detection: force reconnect if no heartbeat response for STALE_THRESHOLD_MS
-      if (this.lastHeartbeatAt &&
-          Date.now() - this.lastHeartbeatAt.getTime() > STALE_THRESHOLD_MS) {
+      // ─── Dual-layer stale detection ───
+      const now = Date.now();
+      const heartbeatAge = this.lastHeartbeatAt ? now - this.lastHeartbeatAt.getTime() : 0;
+      const pongAge = this.lastPongAt ? now - this.lastPongAt.getTime() : 0;
+      // Use pong age only if server responds to protocol pings;
+      // otherwise rely solely on JSON-RPC heartbeat age
+      const effectiveAge = this.pongEverReceived
+        ? Math.min(heartbeatAge, pongAge)   // stale only if NEITHER layer responds
+        : heartbeatAge;
+
+      if (effectiveAge > config.CHAIN_STALE_MS) {
         this.staleDisconnectCount++;
-        log.warn(`Connection stale (no heartbeat response in ${STALE_THRESHOLD_MS / 1000}s), forcing reconnect`);
+        this.log.warn('Connection stale, forcing reconnect', {
+          effectiveAgeMs: effectiveAge,
+          heartbeatAgeMs: heartbeatAge,
+          pongAgeMs: pongAge,
+          pongSupported: this.pongEverReceived,
+        });
+        this.isStaleDisconnect = true;
         ws.terminate(); // → 'close' event → scheduleReconnect
         return;
+      }
+
+      // Pre-emptive backfill: if 1.5× heartbeat without response, fire eth_getLogs as insurance
+      const warningThresholdMs = config.CHAIN_HEARTBEAT_MS * 1.5;
+      if (effectiveAge > warningThresholdMs && this.canFirePreemptiveBackfill()) {
+        this.lastPreemptiveBackfillAt = now;
+        this.log.warn('Heartbeat delayed, firing pre-emptive backfill', { effectiveAgeMs: effectiveAge });
+        if (this.lastProcessedBlock) {
+          void this.backfillFromBlock(this.lastProcessedBlock).catch(() => {});
+        }
       }
 
       // Check subscription health
@@ -717,7 +756,7 @@ export class ChainTradeWatcher {
           // Some subs haven't responded — check for timeout (dead connection)
           const elapsed = Date.now() - this.subscriptionSentAt;
           if (elapsed > 30_000) {
-            log.warn('Subscriptions timed out (no response), reconnecting', {
+            this.log.warn('Subscriptions timed out (no response), reconnecting', {
               confirmed: this.confirmedSubIds.size,
               failed: this.failedSubIds.size,
               stillPending,
@@ -733,7 +772,7 @@ export class ChainTradeWatcher {
           const failedWallets = [...this.failedSubIds]
             .map(id => this.subIdToWallet.get(id)?.wallet?.slice(0, 10))
             .filter(Boolean);
-          log.warn('Operating with degraded WSS coverage', {
+          this.log.warn('Operating with degraded WSS coverage', {
             confirmed: this.confirmedSubIds.size,
             failed: this.failedSubIds.size,
             failedWallets,
@@ -742,15 +781,16 @@ export class ChainTradeWatcher {
         }
       }
 
-      // Periodic status log (every 5th heartbeat ≈ every ~225s)
+      // Periodic status log (every 5th heartbeat ≈ every ~50s at default 10s interval)
       this.heartbeatCount++;
       if (this.heartbeatCount % 5 === 1) {
         const failedWallets = this.failedSubIds.size > 0
           ? [...this.failedSubIds].map(id => this.subIdToWallet.get(id)?.wallet?.slice(0, 10)).filter(Boolean)
           : undefined;
 
-        const raceStats = getRaceStats();
-        log.info('Chain watcher heartbeat', {
+        // Only instance 'A' reports shared singleton race stats (avoids double-reset)
+        const raceStats = this.label === 'A' ? getRaceStats() : undefined;
+        this.log.info('Chain watcher heartbeat', {
           eventsReceived: this.eventsReceived,
           triggeredDetections: this.triggeredDetections,
           backfillRecovered: this.backfillRecovered,
@@ -762,15 +802,16 @@ export class ChainTradeWatcher {
           failedWallets,
           reconnectCount: this.reconnectCount,
           staleDisconnectCount: this.staleDisconnectCount,
+          pongSupported: this.pongEverReceived,
           raceStats,
         });
-        resetRaceStats();
+        if (this.label === 'A') resetRaceStats();
       }
 
       // Detect wallet set changes → reconnect with updated topic filters
       const currentWallets = this.getLiveWallets();
       if (!setsEqual(currentWallets, this.subscribedWallets)) {
-        log.info('Live wallet set changed, reconnecting with new filters', {
+        this.log.info('Live wallet set changed, reconnecting with new filters', {
           oldCount: this.subscribedWallets.size,
           newCount: currentWallets.size,
         });
@@ -778,9 +819,10 @@ export class ChainTradeWatcher {
         return;
       }
 
-      // Keepalive: Polygon WS RPC uses JSON-RPC responses, not WebSocket protocol pings
-      ws.send(JSON.stringify({ jsonrpc: '2.0', id: 999, method: 'eth_chainId', params: [] }));
-    }, HEARTBEAT_INTERVAL_MS);
+      // Dual-layer keepalive
+      try { ws.ping(); } catch {} // transport-level (detects half-open TCP)
+      ws.send(JSON.stringify({ jsonrpc: '2.0', id: 999, method: 'eth_chainId', params: [] })); // application-level
+    }, config.CHAIN_HEARTBEAT_MS);
   }
 
   private clearHeartbeat(): void {
@@ -801,9 +843,19 @@ export class ChainTradeWatcher {
     if (!this.shouldReconnect) return;
     this.reconnectCount++;
     this.state = 'reconnecting';
-    const delay = this.reconnectDelayMs;
-    this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, config.WS_RECONNECT_MAX_MS);
-    log.info(`Reconnecting in ${delay}ms...`);
+
+    // Stale disconnects: reconnect immediately (next tick) — no backoff needed
+    let delay: number;
+    if (this.isStaleDisconnect) {
+      delay = 0;
+      this.isStaleDisconnect = false;
+      this.reconnectDelayMs = INITIAL_RECONNECT_MS;
+    } else {
+      delay = this.reconnectDelayMs;
+      this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, config.WS_RECONNECT_MAX_MS);
+    }
+
+    this.log.info(`Reconnecting in ${delay}ms...`);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.createConnection();

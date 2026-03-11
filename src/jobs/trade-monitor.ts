@@ -13,7 +13,7 @@ const log = createJobLogger(JOB_NAME);
 
 let wsStream: RtdsTradeStream | null = null;
 let wsDetectedCount = 0;
-let chainWatcher: ChainTradeWatcher | null = null;
+let chainWatchers: ChainTradeWatcher[] = [];
 let chainDetectedCount = 0;
 
 async function runPollingCycle(): Promise<number> {
@@ -45,7 +45,7 @@ async function main() {
     stopCacheRefresh();
     stopRaceTrackerSweep();
     if (wsStream) wsStream.close();
-    if (chainWatcher) chainWatcher.close();
+    for (const w of chainWatchers) w.close();
     await prisma.$disconnect();
     process.exit(0);
   };
@@ -60,27 +60,36 @@ async function main() {
   // Layer 1: Blockchain event-driven detection for live-allocation wallets
   // Decodes OrderFilled events on-chain and creates DetectedTrade records directly (~2s latency)
   if (config.CHAIN_WATCHER_ENABLED) {
-    chainWatcher = new ChainTradeWatcher(
-      async (data) => {
-        try {
-          const inserted = await createDetectedTradeFromChain(data);
-          if (inserted) {
-            chainDetectedCount++;
-            log.info('Chain trade recorded', {
-              wallet: data.proxyWallet.slice(0, 10),
-              side: data.side,
-              tokenId: data.tokenId.slice(0, 16),
-              price: data.price.toFixed(4),
-              txHash: data.transactionHash.slice(0, 18),
-            });
-          }
-        } catch (err: any) {
-          log.error(`Chain trade handler error: ${err.message}`, { stack: err.stack });
+    const chainCallback = async (data: Parameters<typeof createDetectedTradeFromChain>[0]) => {
+      try {
+        const inserted = await createDetectedTradeFromChain(data);
+        if (inserted) {
+          chainDetectedCount++;
+          log.info('Chain trade recorded', {
+            wallet: data.proxyWallet.slice(0, 10),
+            side: data.side,
+            tokenId: data.tokenId.slice(0, 16),
+            price: data.price.toFixed(4),
+            txHash: data.transactionHash.slice(0, 18),
+          });
         }
-      },
-      getLiveAllocationWallets,
-    );
-    chainWatcher.connect();
+      } catch (err: any) {
+        log.error(`Chain trade handler error: ${err.message}`, { stack: err.stack });
+      }
+    };
+
+    // Primary WSS connection (always)
+    const primary = new ChainTradeWatcher(chainCallback, getLiveAllocationWallets, 'A');
+    primary.connect();
+    chainWatchers.push(primary);
+
+    // Backup WSS connection (dual-WSS for zero-gap coverage)
+    if (config.CHAIN_DUAL_WSS) {
+      const backup = new ChainTradeWatcher(chainCallback, getLiveAllocationWallets, 'B');
+      backup.connect();
+      chainWatchers.push(backup);
+      log.info('Dual-WSS enabled: 2 independent chain watcher connections');
+    }
   }
 
   // Rapid-poll primary signal source (RAPID_POLL, included in copy signals)
@@ -185,12 +194,12 @@ async function startWithPolling(intervalMs: number): Promise<void> {
       });
     }
 
-    if (config.CHAIN_WATCHER_ENABLED && chainWatcher) {
-      log.debug('Chain watcher status', {
-        state: chainWatcher.state,
-        eventsReceived: chainWatcher.eventsReceived,
-        triggeredDetections: chainWatcher.triggeredDetections,
-        lastEventAt: chainWatcher.lastEventAt?.toISOString(),
+    for (const w of chainWatchers) {
+      log.debug(`Chain watcher [${w.label}] status`, {
+        state: w.state,
+        eventsReceived: w.eventsReceived,
+        triggeredDetections: w.triggeredDetections,
+        lastEventAt: w.lastEventAt?.toISOString(),
       });
     }
 
