@@ -2,6 +2,7 @@ import WebSocket from 'ws';
 import { ethers } from 'ethers';
 import { createJobLogger } from '../lib/logger';
 import { config } from '../config/env';
+import { getStats as getRaceStats, resetStats as resetRaceStats } from './detection-race-tracker';
 
 const log = createJobLogger('chain-trade-watcher');
 
@@ -85,6 +86,8 @@ export class ChainTradeWatcher {
   private lastProcessedBlock: number | null = null;
   private lastVerifyBlock: number | null = null;
   private backfillRecovered = 0;
+  reconnectCount = 0;
+  staleDisconnectCount = 0;
 
   // Block timestamp cache: blockNumber → Unix epoch seconds
   private blockTimestampCache: Map<number, number> = new Map();
@@ -699,6 +702,7 @@ export class ChainTradeWatcher {
       // Stale detection: force reconnect if no heartbeat response for STALE_THRESHOLD_MS
       if (this.lastHeartbeatAt &&
           Date.now() - this.lastHeartbeatAt.getTime() > STALE_THRESHOLD_MS) {
+        this.staleDisconnectCount++;
         log.warn(`Connection stale (no heartbeat response in ${STALE_THRESHOLD_MS / 1000}s), forcing reconnect`);
         ws.terminate(); // → 'close' event → scheduleReconnect
         return;
@@ -745,6 +749,7 @@ export class ChainTradeWatcher {
           ? [...this.failedSubIds].map(id => this.subIdToWallet.get(id)?.wallet?.slice(0, 10)).filter(Boolean)
           : undefined;
 
+        const raceStats = getRaceStats();
         log.info('Chain watcher heartbeat', {
           eventsReceived: this.eventsReceived,
           triggeredDetections: this.triggeredDetections,
@@ -755,7 +760,11 @@ export class ChainTradeWatcher {
           lastBlock: this.lastProcessedBlock,
           lastEventAt: this.lastEventAt?.toISOString() ?? 'never',
           failedWallets,
+          reconnectCount: this.reconnectCount,
+          staleDisconnectCount: this.staleDisconnectCount,
+          raceStats,
         });
+        resetRaceStats();
       }
 
       // Detect wallet set changes → reconnect with updated topic filters
@@ -790,6 +799,7 @@ export class ChainTradeWatcher {
 
   private scheduleReconnect(): void {
     if (!this.shouldReconnect) return;
+    this.reconnectCount++;
     this.state = 'reconnecting';
     const delay = this.reconnectDelayMs;
     this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, config.WS_RECONNECT_MAX_MS);

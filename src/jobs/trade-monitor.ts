@@ -4,6 +4,7 @@ import { createJobLogger } from '../lib/logger';
 import { prisma } from '../lib/prisma';
 import { config } from '../config/env';
 import { detectNewTrades, detectRapidPollTrades, handleRealtimeTrade, startCacheRefresh, stopCacheRefresh, getLiveAllocationWallets, createDetectedTradeFromChain } from '../services/trade-detector';
+import { stopSweep as stopRaceTrackerSweep } from '../services/detection-race-tracker';
 import { RtdsTradeStream } from '../services/ws-trade-stream';
 import { ChainTradeWatcher } from '../services/chain-trade-watcher';
 
@@ -42,6 +43,7 @@ async function main() {
     cleanedUp = true;
     log.info(`Received ${signal}, cleaning up...`);
     stopCacheRefresh();
+    stopRaceTrackerSweep();
     if (wsStream) wsStream.close();
     if (chainWatcher) chainWatcher.close();
     await prisma.$disconnect();

@@ -5,6 +5,7 @@ import { getTrades } from '../api/data-api';
 import { ClobClient } from '@polymarket/clob-client';
 import type { RtdsTradePayload } from './ws-trade-stream';
 import type { ChainTradeData } from './chain-trade-watcher';
+import { recordDetection } from './detection-race-tracker';
 
 // ─── Trade table sync helper ───
 
@@ -218,6 +219,8 @@ export async function createDetectedTradeFromChain(
       },
     });
 
+    recordDetection(data.transactionHash, normalizedWallet, data.tokenId, data.isMaker ? 'CHAIN_MAKER' : 'CHAIN');
+
     // Dual-write to Trade table (fire-and-forget)
     void upsertToTradeTable({
       proxyWallet: normalizedWallet,
@@ -272,7 +275,10 @@ export async function createDetectedTradeFromChain(
 
     return true;
   } catch (err: any) {
-    if (err.code === 'P2002') return false; // dedup: @@unique([transactionHash, proxyWallet, asset])
+    if (err.code === 'P2002') {
+      recordDetection(data.transactionHash, normalizedWallet, data.tokenId, data.isMaker ? 'CHAIN_MAKER' : 'CHAIN');
+      return false; // dedup: @@unique([transactionHash, proxyWallet, asset])
+    }
     throw err;
   }
 }
@@ -505,6 +511,10 @@ async function checkTraderForNewTrades(
       });
       insertedCount++;
 
+      if (source === 'RAPID_POLL') {
+        recordDetection(trade.transactionHash, normalizedWallet, trade.asset, source);
+      }
+
       // Dual-write to Trade table for scoring freshness (fire-and-forget)
       void upsertToTradeTable({
         proxyWallet: normalizedWallet,
@@ -534,7 +544,12 @@ async function checkTraderForNewTrades(
       });
     } catch (err: any) {
       // Skip duplicate constraint violations
-      if (err.code === 'P2002') continue;
+      if (err.code === 'P2002') {
+        if (source === 'RAPID_POLL') {
+          recordDetection(trade.transactionHash, normalizedWallet, trade.asset, source);
+        }
+        continue;
+      }
       throw err;
     }
   }
