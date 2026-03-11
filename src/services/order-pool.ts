@@ -329,11 +329,14 @@ async function fireBucket(bucket: PoolBucket): Promise<void> {
     };
   } else {
     try {
+      // Approximate signal age from oldest pool entry (addedAt ≈ detection time)
+      const oldestEntryAgeMs = Date.now() - entries[0].addedAt;
       result = await executeFn({
         tokenId,
         side: side as 'BUY' | 'SELL',
         amount: executorAmount,
         detectedPrice: latestPrice,
+        signalAgeMs: oldestEntryAgeMs,
       });
     } catch (err: any) {
       result = {

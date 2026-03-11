@@ -192,42 +192,66 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     }
   }
 
-  // ─── Hedge guard (ratio-based): trade is a hedge if price < HEDGE_PRICE_RATIO * opposite avg buy price ───
+  // ─── Hedge guard (ratio-based): block cheap BUY unless sufficient opposite position exists ───
   let hedgeMaxUsd = Infinity;
   // Pre-filter: since avgBuyPrice ≤ 1.0 on Polymarket, ratio * avgBuyPrice ≤ ratio.
   // Any trade priced at or above the ratio itself cannot be a hedge.
   if (trade.side === 'BUY' && config.HEDGE_PRICE_RATIO > 0 && trade.price < config.HEDGE_PRICE_RATIO) {
     const oppositePos = await getOppositePosition(trade.conditionId, trade.asset, allocation.id, isPaper);
-    if (oppositePos.avgBuyPrice > 0 && trade.price < config.HEDGE_PRICE_RATIO * oppositePos.avgBuyPrice
-        && oppositePos.netUsd >= 0.01) { // skip if opposite position fully exited
-      if (oppositePos.netUsd < config.HEDGE_MIN_OPPOSITE_USD) {
-        log.info('Hedge guard: blocked hedge without sufficient opposite position', {
-          trader: trade.proxyWallet.slice(0, 10),
-          price: trade.price, avgBuyPrice: oppositePos.avgBuyPrice.toFixed(3),
-          threshold: (config.HEDGE_PRICE_RATIO * oppositePos.avgBuyPrice).toFixed(3),
-          oppositeUsd: oppositePos.netUsd.toFixed(2),
-          minRequired: config.HEDGE_MIN_OPPOSITE_USD,
-          outcome: trade.outcome, title: trade.title?.slice(0, 50),
-        });
-        await createSkippedRecord(
-          trade,
-          `hedge guard: trade @${trade.price.toFixed(2)} < ${config.HEDGE_PRICE_RATIO} * opposite avg ${oppositePos.avgBuyPrice.toFixed(3)}, ` +
-          `opposite position $${oppositePos.netUsd.toFixed(2)} < $${config.HEDGE_MIN_OPPOSITE_USD} minimum`,
-          allocation.id,
-          isPaper,
-        );
-        return;
-      }
-      hedgeMaxUsd = oppositePos.netUsd * config.HEDGE_MAX_RATIO;
-      if (copyAmountUsd > hedgeMaxUsd) {
-        copyAmountUsd = hedgeMaxUsd;
-        log.info('Hedge guard: trimmed copy amount to max hedge ratio', {
-          trader: trade.proxyWallet.slice(0, 10),
-          price: trade.price, avgBuyPrice: oppositePos.avgBuyPrice.toFixed(3),
-          oppositeUsd: oppositePos.netUsd.toFixed(2),
-          maxHedgeUsd: hedgeMaxUsd.toFixed(2), hedgeMaxRatio: config.HEDGE_MAX_RATIO,
-        });
-      }
+    // Block by default: cheap BUY without sufficient opposite position is a naked hedge.
+    // Only allow if we hold enough of the opposite side to justify hedging.
+    const hasOpposite = oppositePos.avgBuyPrice > 0 && oppositePos.netUsd >= 0.01;
+    const isWithinRatio = hasOpposite && trade.price < config.HEDGE_PRICE_RATIO * oppositePos.avgBuyPrice;
+
+    if (!hasOpposite || !isWithinRatio) {
+      // No opposite position at all, or price isn't within hedge ratio → block
+      log.info('Hedge guard: blocked cheap BUY without opposite position', {
+        trader: trade.proxyWallet.slice(0, 10),
+        price: trade.price,
+        hasOpposite,
+        oppositeAvgBuy: oppositePos.avgBuyPrice.toFixed(3),
+        oppositeUsd: oppositePos.netUsd.toFixed(2),
+        outcome: trade.outcome, title: trade.title?.slice(0, 50),
+      });
+      await createSkippedRecord(
+        trade,
+        hasOpposite
+          ? `hedge guard: trade @${trade.price.toFixed(2)} not within ratio of opposite avg ${oppositePos.avgBuyPrice.toFixed(3)}`
+          : `hedge guard: cheap BUY @${trade.price.toFixed(2)} with no opposite position (need $${config.HEDGE_MIN_OPPOSITE_USD}+)`,
+        allocation.id,
+        isPaper,
+      );
+      return;
+    }
+
+    if (oppositePos.netUsd < config.HEDGE_MIN_OPPOSITE_USD) {
+      log.info('Hedge guard: blocked hedge — opposite position too small', {
+        trader: trade.proxyWallet.slice(0, 10),
+        price: trade.price, avgBuyPrice: oppositePos.avgBuyPrice.toFixed(3),
+        threshold: (config.HEDGE_PRICE_RATIO * oppositePos.avgBuyPrice).toFixed(3),
+        oppositeUsd: oppositePos.netUsd.toFixed(2),
+        minRequired: config.HEDGE_MIN_OPPOSITE_USD,
+        outcome: trade.outcome, title: trade.title?.slice(0, 50),
+      });
+      await createSkippedRecord(
+        trade,
+        `hedge guard: trade @${trade.price.toFixed(2)} < ${config.HEDGE_PRICE_RATIO} * opposite avg ${oppositePos.avgBuyPrice.toFixed(3)}, ` +
+        `opposite position $${oppositePos.netUsd.toFixed(2)} < $${config.HEDGE_MIN_OPPOSITE_USD} minimum`,
+        allocation.id,
+        isPaper,
+      );
+      return;
+    }
+
+    hedgeMaxUsd = oppositePos.netUsd * config.HEDGE_MAX_RATIO;
+    if (copyAmountUsd > hedgeMaxUsd) {
+      copyAmountUsd = hedgeMaxUsd;
+      log.info('Hedge guard: trimmed copy amount to max hedge ratio', {
+        trader: trade.proxyWallet.slice(0, 10),
+        price: trade.price, avgBuyPrice: oppositePos.avgBuyPrice.toFixed(3),
+        oppositeUsd: oppositePos.netUsd.toFixed(2),
+        maxHedgeUsd: hedgeMaxUsd.toFixed(2), hedgeMaxRatio: config.HEDGE_MAX_RATIO,
+      });
     }
   }
 
@@ -346,6 +370,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       amount: executorAmount,
       detectedPrice: trade.price,
       detectionSource: trade.detectionSource ?? undefined,
+      signalAgeMs,
     });
   } catch (err: any) {
     result = {

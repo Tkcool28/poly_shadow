@@ -181,7 +181,21 @@ export async function createDetectedTradeFromChain(
   const { conditionId, outcome } = await resolveTokenMetadata(data.tokenId);
   const compositeScore = scoreCache.get(normalizedWallet) ?? null;
   const userName = userNameCache.get(normalizedWallet) ?? null;
-  const timestamp = Math.floor(Date.now() / 1000);
+  const now = Math.floor(Date.now() / 1000);
+  const blockTs = data.blockTimestamp;
+  const timestamp = blockTs ?? now;
+  const realTimestamp = blockTs ?? null;
+
+  // Staleness warning (only when block time is known)
+  if (blockTs && (now - blockTs) > 30) {
+    logger.warn('Stale chain event: WS delivered late', {
+      wallet: normalizedWallet.slice(0, 10),
+      side: data.side,
+      driftSeconds: now - blockTs,
+      blockNumber: data.blockNumber,
+      txHash: data.transactionHash.slice(0, 18),
+    });
+  }
 
   try {
     await prisma.detectedTrade.create({
@@ -198,6 +212,7 @@ export async function createDetectedTradeFromChain(
         eventSlug: null,
         transactionHash: data.transactionHash,
         timestamp,
+        realTimestamp,
         compositeScore,
         detectionSource: data.isMaker ? 'CHAIN_MAKER' : 'CHAIN',
       },
@@ -228,27 +243,32 @@ export async function createDetectedTradeFromChain(
       price: data.price.toFixed(4),
       compositeScore,
       txHash: data.transactionHash.slice(0, 18),
+      blockNumber: data.blockNumber,
+      blockTimestamp: blockTs,
+      signalAgeS: blockTs ? now - blockTs : null,
     });
 
-    // Fire-and-forget: backfill realTimestamp from Data API
-    void (async () => {
-      try {
-        const trades = await getTrades({ user: normalizedWallet, limit: 20 });
-        const match = trades.find(t => t.transactionHash === data.transactionHash);
-        if (match) {
-          await prisma.detectedTrade.updateMany({
-            where: {
-              transactionHash: data.transactionHash,
-              proxyWallet: normalizedWallet,
-              asset: data.tokenId,
-            },
-            data: { realTimestamp: match.timestamp },
-          });
+    // Fire-and-forget: backfill realTimestamp from Data API (only on cache miss)
+    if (!realTimestamp) {
+      void (async () => {
+        try {
+          const trades = await getTrades({ user: normalizedWallet, limit: 20 });
+          const match = trades.find(t => t.transactionHash === data.transactionHash);
+          if (match) {
+            await prisma.detectedTrade.updateMany({
+              where: {
+                transactionHash: data.transactionHash,
+                proxyWallet: normalizedWallet,
+                asset: data.tokenId,
+              },
+              data: { realTimestamp: match.timestamp },
+            });
+          }
+        } catch (e) {
+          logger.debug('realTimestamp backfill failed', { wallet: normalizedWallet.slice(0, 10), err: (e as Error).message });
         }
-      } catch (e) {
-        logger.debug('realTimestamp backfill failed', { wallet: normalizedWallet.slice(0, 10), err: (e as Error).message });
-      }
-    })();
+      })();
+    }
 
     return true;
   } catch (err: any) {

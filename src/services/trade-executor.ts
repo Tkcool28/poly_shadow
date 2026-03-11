@@ -14,6 +14,7 @@ export interface ExecuteOrderParams {
   amount: number; // BUY: USD amount, SELL: shares
   detectedPrice: number; // price from detected trade (for slippage calc)
   detectionSource?: string; // 'CHAIN', 'POLL', 'WS' — used to skip stale-signal API for fresh signals
+  signalAgeMs?: number; // ms since block timestamp (or detection time on cache miss)
   _isRetry?: boolean; // internal: prevent infinite retry recursion
 }
 
@@ -209,10 +210,13 @@ function fireAsyncBookSnapshot(tokenId: string, orderId: string | null, side: st
 
 export const CLOB_MIN_ORDER_USD = 1.0; // Polymarket hard minimum per live order
 
+const STALE_SIGNAL_THRESHOLD_MS = 30_000;   // 30s — signals older than this get price-checked
+const STALE_PRICE_DROP_FRACTION = 0.10;     // 10% — skip if mid dropped more than this from signal
+
 export async function executeMarketOrder(params: ExecuteOrderParams): Promise<ExecuteOrderResult> {
   if (!client) throw new Error('CLOB client not initialized');
 
-  const { tokenId, side, amount, detectedPrice, detectionSource } = params;
+  const { tokenId, side, amount, detectedPrice, detectionSource, signalAgeMs } = params;
 
   // Guard: BUY USD amount must meet Polymarket's $1 minimum order size
   if (side === 'BUY' && amount < CLOB_MIN_ORDER_USD) {
@@ -267,16 +271,46 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
       let currentMid = getMidFromCache(tokenId);
       let midSource: 'cache' | 'api' | 'chain-skip' = 'cache';
 
-      // Tier 2: API fallback if cache miss or stale
+      // Tier 2: API fallback if cache miss
       if (currentMid === null) {
-        if (detectionSource === 'CHAIN' || detectionSource === 'CHAIN_MAKER') {
-          // CHAIN signals are <2s old — skip 50-100ms API roundtrip (fail-open)
+        const isChain = detectionSource === 'CHAIN' || detectionSource === 'CHAIN_MAKER';
+        const isStale = signalAgeMs != null && signalAgeMs >= STALE_SIGNAL_THRESHOLD_MS;
+        if (isChain && !isStale) {
+          // Fresh CHAIN signals (<30s): skip 50-100ms API roundtrip (fail-open)
           midSource = 'chain-skip';
         } else {
+          // Non-CHAIN or stale CHAIN: worth the API call to check price
           midSource = 'api';
           const midpointResp = await client.getMidpoint(tokenId);
           currentMid = parseFloat(midpointResp?.mid ?? '1');
         }
+      }
+
+      // Stale signal + adverse price movement guard (BUY only)
+      // If signal is >=30s old and current price dropped >10% from signal → skip
+      // If price is same or higher → let FAK try (handles its own fill/no-fill)
+      if (currentMid !== null && signalAgeMs != null && signalAgeMs >= STALE_SIGNAL_THRESHOLD_MS) {
+        const dropFromSignal = (detectedPrice - currentMid) / detectedPrice;
+        if (dropFromSignal > STALE_PRICE_DROP_FRACTION) {
+          log.warn('Stale signal: price dropped >10% since signal — skipping', {
+            detectedPrice,
+            currentMid,
+            midSource,
+            signalAgeSec: (signalAgeMs / 1000).toFixed(1),
+            dropPct: (dropFromSignal * 100).toFixed(1),
+          });
+          return {
+            orderId: null,
+            status: 'SKIPPED',
+            filledPrice: null,
+            filledSize: null,
+            failReason: `stale signal: mid ${currentMid.toFixed(4)} is ${(dropFromSignal * 100).toFixed(0)}% below signal ${detectedPrice.toFixed(4)} after ${(signalAgeMs / 1000).toFixed(0)}s`,
+            transactionHashes: [],
+          };
+        }
+        log.debug('Stale signal but price held — proceeding with FAK', {
+          detectedPrice, currentMid, signalAgeSec: (signalAgeMs / 1000).toFixed(1),
+        });
       }
 
       if (currentMid !== null && (currentMid <= 0.01 || currentMid < detectedPrice * 0.30)) {

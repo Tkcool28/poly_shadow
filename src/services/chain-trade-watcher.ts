@@ -42,6 +42,8 @@ export interface ChainTradeData {
   isNegRisk: boolean;
   contract: string;      // exchange contract address
   isMaker: boolean;      // true if tracked wallet was the maker (resting limit order filled by someone else)
+  blockNumber: number;            // block number from logEntry (parsed from hex)
+  blockTimestamp: number | null;   // Unix epoch seconds from block cache; null = cache miss
 }
 
 export type ChainTradeCallback = (data: ChainTradeData) => Promise<void>;
@@ -83,6 +85,10 @@ export class ChainTradeWatcher {
   private lastProcessedBlock: number | null = null;
   private lastVerifyBlock: number | null = null;
   private backfillRecovered = 0;
+
+  // Block timestamp cache: blockNumber → Unix epoch seconds
+  private blockTimestampCache: Map<number, number> = new Map();
+  private blockTimestampPending: Set<number> = new Set();
 
   state: ChainWatcherState = 'disconnected';
   lastEventAt: Date | null = null;
@@ -229,6 +235,8 @@ export class ChainTradeWatcher {
     if (!isNaN(blockNum) && (this.lastProcessedBlock === null || blockNum > this.lastProcessedBlock)) {
       this.lastProcessedBlock = blockNum;
     }
+    // Warm block timestamp cache (fire-and-forget, non-blocking)
+    if (!isNaN(blockNum)) this.fetchAndCacheBlockTimestamp(blockNum);
 
     // Dedup: both maker/taker subs + backfill can deliver the same event
     const dedupKey = `${logEntry.transactionHash}:${logEntry.logIndex}`;
@@ -370,6 +378,8 @@ export class ChainTradeWatcher {
           isNegRisk,
           contract: logEntry.address,
           isMaker,
+          blockNumber: blockNum,
+          blockTimestamp: null, // populated at emit time from cache
         };
 
         if (isMaker) {
@@ -427,6 +437,11 @@ export class ChainTradeWatcher {
 
   /** Emit a decoded trade and mark the tx+wallet as resolved */
   private emitTrade(txWalletKey: string, data: ChainTradeData): void {
+    // Attach block timestamp from cache (may have warmed during taker debounce)
+    data.blockTimestamp = this.blockTimestampCache.get(data.blockNumber) ?? null;
+    if (!data.blockTimestamp) {
+      log.debug('Block timestamp cache miss', { blockNumber: data.blockNumber, isMaker: data.isMaker });
+    }
     this.emittedTxSides.set(txWalletKey, data.side);
 
     log.debug('OrderFilled decoded', {
@@ -502,6 +517,41 @@ export class ChainTradeWatcher {
       subscriptions: this.expectedSubCount,
       wallets: [...wallets].map(w => w.slice(0, 10)),
     });
+  }
+
+  // ─── Block timestamp cache ───
+
+  /** Fire-and-forget: fetch block timestamp via HTTP RPC and cache it */
+  private fetchAndCacheBlockTimestamp(blockNum: number): void {
+    if (this.blockTimestampCache.has(blockNum) || this.blockTimestampPending.has(blockNum)) return;
+    this.blockTimestampPending.add(blockNum);
+    void (async () => {
+      try {
+        const res = await fetch(config.POLYGON_HTTP_RPC_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0', id: 1,
+            method: 'eth_getBlockByNumber',
+            params: ['0x' + blockNum.toString(16), false],
+          }),
+          signal: AbortSignal.timeout(3000),
+        });
+        if (!res.ok) return;
+        const json = await res.json() as { result?: { timestamp?: string } };
+        const ts = parseInt(json.result?.timestamp ?? '', 16);
+        if (!isNaN(ts)) {
+          this.blockTimestampCache.set(blockNum, ts);
+          if (this.blockTimestampCache.size > 200) {
+            const cutoff = blockNum - 200;
+            for (const k of this.blockTimestampCache.keys()) {
+              if (k < cutoff) this.blockTimestampCache.delete(k);
+            }
+          }
+        }
+      } catch { /* degrade gracefully */ }
+      finally { this.blockTimestampPending.delete(blockNum); }
+    })();
   }
 
   // ─── eth_getLogs backfill & periodic verification ───
