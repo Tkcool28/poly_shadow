@@ -376,43 +376,69 @@ async function phaseA(
     if (copyAmountUsd > remaining) copyAmountUsd = remaining;
   }
 
-  // Hedge guard (ratio-based): trade is a hedge if price < HEDGE_PRICE_RATIO * opposite avg buy price
+  // Hedge guard: block cheap naked BUY + cap hedge trades
   let hedgeMaxUsd = Infinity;
   // Pre-filter: since avgBuyPrice ≤ 1.0 on Polymarket, ratio * avgBuyPrice ≤ ratio.
   // Any trade priced at or above the ratio itself cannot be a hedge.
   if (trade.side === 'BUY' && config.HEDGE_PRICE_RATIO > 0 && trade.price < config.HEDGE_PRICE_RATIO) {
     const oppositeTokenId = cache.getOppositeTokenId(trade.conditionId, trade.asset);
+    let hasOpposite = false;
+    let avgBuyPrice = 0;
+    let oppositeNetUsd = 0;
+
     if (oppositeTokenId) {
       const oppositePos = cache.getPosition(oppositeTokenId, allocation.id, isPaper);
-      const avgBuyPrice = oppositePos.buyShares > 0 ? oppositePos.buyCost / oppositePos.buyShares : 0;
-      if (avgBuyPrice > 0 && trade.price < config.HEDGE_PRICE_RATIO * avgBuyPrice
-          && oppositePos.netUsd >= 0.01) { // skip if opposite position fully exited
-        if (oppositePos.netUsd < config.HEDGE_MIN_OPPOSITE_USD) {
-          log.info('Hedge guard: blocked hedge without sufficient opposite position', {
+      avgBuyPrice = oppositePos.buyShares > 0 ? oppositePos.buyCost / oppositePos.buyShares : 0;
+      oppositeNetUsd = oppositePos.netUsd;
+      hasOpposite = avgBuyPrice > 0 && oppositeNetUsd >= 0.01;
+    }
+
+    if (!hasOpposite) {
+      // No opposite position — block only if price is very cheap (backup/hedge pattern)
+      if (config.HEDGE_NAKED_MAX_PRICE > 0 && trade.price <= config.HEDGE_NAKED_MAX_PRICE) {
+        log.info('Hedge guard: blocked cheap naked BUY — no opposite position', {
+          trader: trade.proxyWallet.slice(0, 10),
+          price: trade.price,
+          nakedMaxPrice: config.HEDGE_NAKED_MAX_PRICE,
+          outcome: trade.outcome, title: trade.title?.slice(0, 50),
+        });
+        await createSkippedRecord(trade,
+          `hedge guard: naked BUY @${trade.price.toFixed(2)} ≤ ${config.HEDGE_NAKED_MAX_PRICE} with no opposite position`,
+          allocation.id, isPaper);
+        return null;
+      }
+      // Price above naked ceiling (e.g. 15¢) → allow through, could be legitimate cheap market
+    } else {
+      // Opposite exists — check if this trade qualifies as a hedge (price below ratio threshold)
+      const isHedge = trade.price < config.HEDGE_PRICE_RATIO * avgBuyPrice;
+      if (isHedge) {
+        if (oppositeNetUsd < config.HEDGE_MIN_OPPOSITE_USD) {
+          log.info('Hedge guard: blocked hedge — opposite position too small', {
             trader: trade.proxyWallet.slice(0, 10),
             price: trade.price, avgBuyPrice: avgBuyPrice.toFixed(3),
             threshold: (config.HEDGE_PRICE_RATIO * avgBuyPrice).toFixed(3),
-            oppositeUsd: oppositePos.netUsd.toFixed(2),
+            oppositeUsd: oppositeNetUsd.toFixed(2),
             minRequired: config.HEDGE_MIN_OPPOSITE_USD,
             outcome: trade.outcome, title: trade.title?.slice(0, 50),
           });
           await createSkippedRecord(trade,
             `hedge guard: trade @${trade.price.toFixed(2)} < ${config.HEDGE_PRICE_RATIO} * opposite avg ${avgBuyPrice.toFixed(3)}, ` +
-            `opposite position $${oppositePos.netUsd.toFixed(2)} < $${config.HEDGE_MIN_OPPOSITE_USD} minimum`,
+            `opposite position $${oppositeNetUsd.toFixed(2)} < $${config.HEDGE_MIN_OPPOSITE_USD} minimum`,
             allocation.id, isPaper);
           return null;
         }
-        hedgeMaxUsd = oppositePos.netUsd * config.HEDGE_MAX_RATIO;
+        hedgeMaxUsd = oppositeNetUsd * config.HEDGE_MAX_RATIO;
         if (copyAmountUsd > hedgeMaxUsd) {
           copyAmountUsd = hedgeMaxUsd;
           log.info('Hedge guard: trimmed copy amount to max hedge ratio', {
             trader: trade.proxyWallet.slice(0, 10),
             price: trade.price, avgBuyPrice: avgBuyPrice.toFixed(3),
-            oppositeUsd: oppositePos.netUsd.toFixed(2),
+            oppositeUsd: oppositeNetUsd.toFixed(2),
             maxHedgeUsd: hedgeMaxUsd.toFixed(2), hedgeMaxRatio: config.HEDGE_MAX_RATIO,
           });
         }
       }
+      // else: hasOpposite but NOT a hedge (price above ratio threshold) → proceed normally
     }
   }
 

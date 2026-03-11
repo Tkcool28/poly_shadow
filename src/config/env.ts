@@ -81,6 +81,7 @@ const envSchema = z.object({
   HEDGE_PRICE_RATIO: z.coerce.number().min(0).max(0.50).default(0.25),  // trade.price < ratio * opposite avgBuyPrice = hedge (0 = disabled)
   HEDGE_MIN_OPPOSITE_USD: z.coerce.number().min(0).max(1000).default(5),     // need ≥$5 on opposite side
   HEDGE_MAX_RATIO: z.coerce.number().min(0).max(1.0).default(0.20),         // max 20% of opposite (5:1)
+  HEDGE_NAKED_MAX_PRICE: z.coerce.number().min(0).max(0.50).default(0.10), // block naked BUY (no opposite) if price ≤ this (0 = disabled)
 
   // Fallback poll interval for copy-trader when pg LISTEN is active
   COPY_TRADE_FALLBACK_POLL_MS: z.coerce.number().min(1000).default(7000), // 7s safety net
