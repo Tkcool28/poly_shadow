@@ -7,7 +7,7 @@ import type { ExecuteOrderResult } from './trade-executor';
 import { addToPool } from './order-pool';
 import { resolveMarkets } from './market-resolver';
 import { computeSellCostBasis } from '../lib/cost-basis';
-import { scheduleDelayedOrderPoll } from './delayed-order-poller';
+import { scheduleDelayedOrderPoll, scheduleGtcFallbackPoll } from './delayed-order-poller';
 
 const log = createJobLogger('copy-trade-worker');
 
@@ -421,26 +421,42 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     if (trade.side === 'SELL') slippageBps = -slippageBps;
   }
 
-  // ─── DELAYED: sports market 3s matching delay — keep PENDING, poll in background ───
+  // ─── DELAYED: sports market 3s delay or GTC fallback — keep PENDING, poll in background ───
   if (result.status === 'DELAYED' && result.orderId) {
+    const reason = result.delayedReason ?? 'sports';
     await prisma.copyTrade.update({
       where: { id: copyTrade.id },
       data: {
         orderId: result.orderId,
-        failReason: 'delayed matching: background poll scheduled',
+        failReason: `delayed matching (${reason}): background poll scheduled`,
         latencyMs,
       },
     });
-    scheduleDelayedOrderPoll({
-      copyTradeId: copyTrade.id,
-      orderId: result.orderId,
-      allocationId: allocation.id,
-      side: trade.side as 'BUY' | 'SELL',
-      tokenId: trade.asset,
-      isPaper,
-      detectedPrice: trade.price,
-    });
-    log.info('COPY TRADE DELAYED — background poll scheduled', {
+
+    if (result.delayedReason === 'gtc_fallback') {
+      scheduleGtcFallbackPoll({
+        copyTradeId: copyTrade.id,
+        orderId: result.orderId,
+        allocationId: allocation.id,
+        side: trade.side as 'BUY' | 'SELL',
+        tokenId: trade.asset,
+        isPaper,
+        detectedPrice: trade.price,
+        amountUsd: copyAmountUsd,
+      });
+    } else {
+      scheduleDelayedOrderPoll({
+        copyTradeId: copyTrade.id,
+        orderId: result.orderId,
+        allocationId: allocation.id,
+        side: trade.side as 'BUY' | 'SELL',
+        tokenId: trade.asset,
+        isPaper,
+        detectedPrice: trade.price,
+      });
+    }
+
+    log.info(`COPY TRADE DELAYED (${reason}) — background poll scheduled`, {
       trader: trade.proxyWallet.slice(0, 10), mode: isPaper ? 'PAPER' : 'LIVE',
       side: trade.side, orderId: result.orderId,
       copyAmountUsd: copyAmountUsd.toFixed(2),

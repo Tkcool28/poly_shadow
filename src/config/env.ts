@@ -116,6 +116,13 @@ const envSchema = z.object({
     .default('false')
     .transform((v) => v === 'true'),
 
+  // GTC fallback: place resting limit order after FAK unmatched (BUY only)
+  GTC_FALLBACK_ENABLED: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+  GTC_FALLBACK_REST_MS: z.coerce.number().min(1000).max(30000).default(5000),
+
   // Order aggregation pool
   POOL_MIN_AMOUNT_USD: z.coerce.number().min(0.01).max(100).default(0.50), // min USD to pool paper trades
   LIVE_POOL_MIN_AMOUNT_USD: z.coerce.number().min(0.01).max(1000).default(1.0), // min USD to fire live pool (CLOB $1 minimum)

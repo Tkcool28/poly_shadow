@@ -26,6 +26,7 @@ export interface ExecuteOrderResult {
   failReason: string | null;
   transactionHashes: string[];
   estimatedFee?: number; // paper trades only: estimated fee in USD
+  delayedReason?: 'sports' | 'gtc_fallback'; // distinguishes DELAYED cause for caller routing
 }
 
 // Market metadata cache (tickSize + negRisk don't change per market)
@@ -105,7 +106,7 @@ export async function initialize(): Promise<void> {
   }
 }
 
-async function getMarketMetadata(tokenId: string): Promise<{ tickSize: TickSize; negRisk: boolean }> {
+export async function getMarketMetadata(tokenId: string): Promise<{ tickSize: TickSize; negRisk: boolean }> {
   const cached = metadataCache.get(tokenId);
   if (cached) return cached;
 
@@ -491,6 +492,7 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
           orderId, status: 'DELAYED',
           filledPrice: null, filledSize: null,
           failReason: null, transactionHashes: txHashes,
+          delayedReason: 'sports',
         };
       }
 
@@ -543,6 +545,22 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
         clobMs: Date.now() - t1!,
       });
       fireAsyncBookSnapshot(tokenId, orderId, side, slippagePrice);
+
+      // ── GTC Fallback: flag eligible for async resting limit order ──
+      // The actual GTC placement happens in the caller's async handler (zero latency impact).
+      if (config.GTC_FALLBACK_ENABLED && side === 'BUY') {
+        log.info('GTC fallback: eligible — FAK unmatched, will place async', {
+          side, amount, detectedPrice, slippagePrice,
+          tokenId: tokenId.slice(0, 20), restMs: config.GTC_FALLBACK_REST_MS,
+        });
+        return {
+          orderId, status: 'DELAYED',
+          filledPrice: null, filledSize: null,
+          failReason: null, transactionHashes: txHashes,
+          delayedReason: 'gtc_fallback',
+        };
+      }
+
       return {
         orderId, status: 'SKIPPED',
         filledPrice: null, filledSize: null,

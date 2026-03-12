@@ -1,8 +1,10 @@
 import { prisma } from '../lib/prisma';
 import { createJobLogger } from '../lib/logger';
-import { getClient } from './trade-executor';
+import { getClient, getMarketMetadata } from './trade-executor';
 import { auditAllocation } from '../lib/capital-audit';
 import { getOrCreateMutex } from '../lib/allocation-mutex';
+import { OrderType, Side } from '@polymarket/clob-client';
+import { config } from '../config/env';
 
 const log = createJobLogger('delayed-order-poller');
 
@@ -14,6 +16,10 @@ export interface DelayedOrderContext {
   tokenId: string;
   isPaper: boolean;
   detectedPrice: number; // for SELL price recovery (CLOB returns $0.01 limit floor)
+}
+
+export interface GtcFallbackContext extends DelayedOrderContext {
+  amountUsd: number; // copy trade USD amount (for shares calculation)
 }
 
 const POLL_DELAYS_MS = [4000, 8000, 15000];
@@ -169,5 +175,165 @@ async function correctCapital(allocationId: string): Promise<void> {
     log.error('Delayed order poll: capital correction failed', {
       allocationId, error: err.message,
     });
+  }
+}
+
+// ─── GTC Fallback: async place + single-shot poll ───
+
+/**
+ * GTC fallback: async place + single-shot poll.
+ * 1. Place GTC limit order at signal price (non-blocking).
+ * 2. Wait GTC_FALLBACK_REST_MS, then check status.
+ * 3. If MATCHED → FILLED. If LIVE → cancel, mark SKIPPED.
+ *
+ * Fire-and-forget — caller returns immediately after invoking this.
+ */
+export function scheduleGtcFallbackPoll(ctx: GtcFallbackContext): void {
+  if (ctx.isPaper) {
+    prisma.copyTrade.update({
+      where: { id: ctx.copyTradeId },
+      data: { status: 'SKIPPED', failReason: 'GTC fallback: paper trade (no CLOB order)' },
+    }).catch(() => {});
+    return;
+  }
+
+  placeAndPollGtc(ctx).catch((err) => {
+    log.error('GTC fallback: unhandled error', { copyTradeId: ctx.copyTradeId, error: err.message });
+    // Leave PENDING for reconcileStalePending() safety net
+  });
+}
+
+async function placeAndPollGtc(ctx: GtcFallbackContext): Promise<void> {
+  const client = getClient();
+  if (!client) {
+    log.warn('GTC fallback: CLOB client unavailable', { copyTradeId: ctx.copyTradeId });
+    await markGtcSkipped(ctx.copyTradeId, 'GTC fallback: CLOB client unavailable', ctx.allocationId);
+    return;
+  }
+
+  // ── Phase 1: Place GTC limit order at signal price ──
+  let gtcOrderId: string | undefined;
+  try {
+    const { tickSize, negRisk } = await getMarketMetadata(ctx.tokenId);
+    // GTC rests at signal price (detectedPrice), NOT the FAK bump price.
+    // A resting BUY at signal price is fair value — no overpay to incoming sellers.
+    const limitPrice = ctx.detectedPrice;
+    const shares = ctx.amountUsd / limitPrice;
+
+    const gtcResponse = await client.createAndPostOrder(
+      {
+        tokenID: ctx.tokenId,
+        price: limitPrice,
+        size: shares,
+        side: Side.BUY,
+      },
+      { tickSize, negRisk },
+      OrderType.GTC,
+    );
+
+    gtcOrderId = gtcResponse?.orderID;
+    if (!gtcOrderId) {
+      log.warn('GTC fallback: no orderId returned', { copyTradeId: ctx.copyTradeId });
+      await markGtcSkipped(ctx.copyTradeId, 'GTC fallback: no orderId returned from CLOB', ctx.allocationId);
+      return;
+    }
+
+    // Update CopyTrade with the real GTC orderId (replaces the FAK orderId placeholder)
+    await prisma.copyTrade.update({
+      where: { id: ctx.copyTradeId },
+      data: { orderId: gtcOrderId },
+    });
+
+    log.info('GTC fallback: resting limit order placed', {
+      copyTradeId: ctx.copyTradeId, gtcOrderId,
+      shares: shares.toFixed(4), limitPrice,
+      tokenId: ctx.tokenId.slice(0, 20), restMs: config.GTC_FALLBACK_REST_MS,
+    });
+  } catch (err: any) {
+    log.warn('GTC fallback: failed to place GTC order', {
+      copyTradeId: ctx.copyTradeId, error: err.message,
+    });
+    await markGtcSkipped(ctx.copyTradeId, `GTC fallback: placement failed — ${err.message}`, ctx.allocationId);
+    return;
+  }
+
+  // ── Phase 2: Wait REST_MS then resolve ──
+  await new Promise(resolve => setTimeout(resolve, config.GTC_FALLBACK_REST_MS));
+  await resolveGtcFallback(ctx.copyTradeId, gtcOrderId, ctx.allocationId);
+}
+
+async function resolveGtcFallback(
+  copyTradeId: string, orderId: string, allocationId: string,
+): Promise<void> {
+  const record = await prisma.copyTrade.findUnique({
+    where: { id: copyTradeId },
+    select: { status: true },
+  });
+  if (!record || record.status !== 'PENDING') return; // already resolved
+
+  const client = getClient();
+  if (!client) {
+    log.warn('GTC fallback: CLOB client unavailable for resolve', { copyTradeId });
+    return; // leave PENDING for reconcileStalePending()
+  }
+
+  const order = await client.getOrder(orderId);
+  const clobStatus = order?.status ?? 'unknown';
+
+  if (clobStatus === 'MATCHED') {
+    const sizeMatched = parseFloat(order.size_matched || '0');
+    const orderPrice = parseFloat(order.price || '0');
+    if (sizeMatched > 0 && orderPrice > 0 && orderPrice <= 1.0) {
+      await prisma.copyTrade.update({
+        where: { id: copyTradeId },
+        data: {
+          status: 'FILLED',
+          filledSize: sizeMatched,
+          filledPrice: orderPrice,
+          requestedAmount: sizeMatched * orderPrice,
+          failReason: `[gtc-fallback-filled] restMs=${config.GTC_FALLBACK_REST_MS}`,
+          filledAt: new Date(),
+        },
+      });
+      log.info('GTC fallback: FILLED', {
+        copyTradeId, orderId, sizeMatched, orderPrice,
+        restMs: config.GTC_FALLBACK_REST_MS,
+      });
+      await correctCapital(allocationId);
+      return;
+    }
+  }
+
+  // Not filled — cancel the resting order
+  if (clobStatus === 'LIVE' || clobStatus === 'DELAYED') {
+    try {
+      await client.cancelOrder({ orderID: orderId });
+      log.info('GTC fallback: cancelled unfilled order', { copyTradeId, orderId });
+    } catch (err: any) {
+      log.warn('GTC fallback: cancel failed (reconciler will clean up)', {
+        orderId, error: err.message,
+      });
+    }
+  }
+
+  await markGtcSkipped(
+    copyTradeId,
+    `GTC fallback: unfilled after ${config.GTC_FALLBACK_REST_MS}ms, cancelled (CLOB status=${clobStatus})`,
+    allocationId,
+  );
+}
+
+async function markGtcSkipped(copyTradeId: string, reason: string, allocationId?: string): Promise<void> {
+  try {
+    await prisma.copyTrade.update({
+      where: { id: copyTradeId },
+      data: { status: 'SKIPPED', failReason: reason },
+    });
+    // Release reserved capital immediately (don't wait for next audit cycle)
+    if (allocationId) {
+      await correctCapital(allocationId);
+    }
+  } catch (err) {
+    log.error('GTC fallback: failed to mark SKIPPED', { copyTradeId, error: (err as Error).message });
   }
 }

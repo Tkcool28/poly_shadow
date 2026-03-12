@@ -26,7 +26,7 @@ import { reconcileStalePending, reconcileSkippedGhostFills } from '../services/c
 import { sweepPreResolutionSells } from '../services/pre-resolution-seller';
 import { resolveMarkets } from '../services/market-resolver';
 import { computeSellCostBasis } from '../lib/cost-basis';
-import { scheduleDelayedOrderPoll, type DelayedOrderContext } from '../services/delayed-order-poller';
+import { scheduleDelayedOrderPoll, scheduleGtcFallbackPoll, type DelayedOrderContext } from '../services/delayed-order-poller';
 import { auditAllAllocations, auditPhantomPositions, cleanupPhantomPositions, checkCircuitBreakers } from '../lib/capital-audit';
 import { initMidpointCache, closeMidpointCache, ensureSubscribed } from '../services/midpoint-cache';
 import { getOrCreateMutex } from '../lib/allocation-mutex';
@@ -553,7 +553,7 @@ async function batchSettle(
   reservations: PhaseAResult[],
   clobResults: PromiseSettledResult<{ result: ExecuteOrderResult; clobMs: number }>[],
 ): Promise<void> {
-  const delayedPolls: DelayedOrderContext[] = [];
+  const delayedPolls: (DelayedOrderContext & { delayedReason?: string; amountUsd?: number })[] = [];
 
   await prisma.$transaction(async (tx) => {
     let totalBuyUsd = 0;
@@ -581,13 +581,14 @@ async function batchSettle(
         if (res.side === 'SELL') slippageBps = -slippageBps;
       }
 
-      // DELAYED: sports market 3s matching delay — keep PENDING, poll in background
+      // DELAYED: sports market 3s delay or GTC fallback — keep PENDING, poll in background
       if (result.status === 'DELAYED' && result.orderId) {
+        const reason = result.delayedReason ?? 'sports';
         await tx.copyTrade.update({
           where: { id: res.copyTradeId },
           data: {
             orderId: result.orderId,
-            failReason: 'delayed matching: background poll scheduled',
+            failReason: `delayed matching (${reason}): background poll scheduled`,
             latencyMs,
           },
         });
@@ -599,9 +600,11 @@ async function batchSettle(
           tokenId: res.tokenId,
           isPaper: res.isPaper,
           detectedPrice: res.detectedPrice,
+          delayedReason: result.delayedReason,
+          amountUsd: res.copyAmountUsd,
         });
         const mode = res.isPaper ? 'PAPER' : 'LIVE';
-        log.info(`COPY TRADE DELAYED — background poll scheduled [${mode}]`, {
+        log.info(`COPY TRADE DELAYED (${reason}) — background poll scheduled [${mode}]`, {
           trader: res.tradeInfo.proxyWallet.slice(0, 10),
           side: res.side, orderId: result.orderId,
           title: res.tradeInfo.title?.slice(0, 50),
@@ -708,7 +711,11 @@ async function batchSettle(
 
   // Schedule background polls for delayed orders (after transaction commits)
   for (const ctx of delayedPolls) {
-    scheduleDelayedOrderPoll(ctx);
+    if (ctx.delayedReason === 'gtc_fallback' && ctx.amountUsd != null) {
+      scheduleGtcFallbackPoll({ ...ctx, amountUsd: ctx.amountUsd });
+    } else {
+      scheduleDelayedOrderPoll(ctx);
+    }
   }
 }
 
