@@ -377,6 +377,36 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
       tokenId: tokenId.slice(0, 20) + '...',
     });
 
+    // Detect CLOB client error response (HTTP 4xx/5xx returns {error, status} instead of throwing)
+    if (response?.error || (response?.status != null && typeof response.status === 'number' && response.status >= 400)) {
+      const errorDetail = typeof response.error === 'string'
+        ? response.error
+        : JSON.stringify(response.error ?? response)?.slice(0, 400) ?? 'unknown';
+      const httpStatus = typeof response.status === 'number' ? response.status : 'unknown';
+
+      if (errorDetail.includes('orderbook does not exist')) {
+        metadataCache.delete(tokenId);
+        return {
+          orderId: null, status: 'SKIPPED',
+          filledPrice: null, filledSize: null,
+          failReason: `market expired: orderbook does not exist (HTTP ${httpStatus})`,
+          transactionHashes: [],
+        };
+      }
+
+      log.warn('CLOB order rejected (HTTP error response)', {
+        httpStatus, errorDetail: errorDetail.slice(0, 300),
+        side, tokenId: tokenId.slice(0, 20), amount,
+      });
+
+      return {
+        orderId: null, status: 'SKIPPED',
+        filledPrice: null, filledSize: null,
+        failReason: `CLOB rejected (HTTP ${httpStatus}): ${errorDetail.slice(0, 200)}`,
+        transactionHashes: [],
+      };
+    }
+
     if (response?.success === false || response?.errorMsg) {
       const errorMsg: string = response.errorMsg || 'Unknown order error';
 

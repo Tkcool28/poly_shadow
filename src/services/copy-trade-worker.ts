@@ -39,6 +39,25 @@ export function recordSellFill(allocationId: string, tokenId: string): void {
   }
 }
 
+// ─── Per-token SELL failure cool-down: prevents repeated SELL attempts on dead/closed markets ───
+const sellFailedAt = new Map<string, number>();
+const SELL_FAILURE_COOLDOWN_MS = 60_000; // 60s
+
+export function isInSellFailureCooldown(allocationId: string, tokenId: string): boolean {
+  const key = sellCooldownKey(allocationId, tokenId);
+  const ts = sellFailedAt.get(key);
+  if (!ts) return false;
+  if (Date.now() - ts >= SELL_FAILURE_COOLDOWN_MS) {
+    sellFailedAt.delete(key);
+    return false;
+  }
+  return true;
+}
+
+export function recordSellFailure(allocationId: string, tokenId: string): void {
+  sellFailedAt.set(sellCooldownKey(allocationId, tokenId), Date.now());
+}
+
 export interface DetectedTradeRow {
   id: string;
   proxyWallet: string;
@@ -102,11 +121,17 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   }
 
   // ─── Per-allocation event slug exclusion filter (BUY only — never block exits) ───
-  if (allocation.excludeEventSlugPatterns != null && trade.side === 'BUY' && trade.eventSlug) {
-    const patterns = allocation.excludeEventSlugPatterns.split(',').map(p => p.trim().toLowerCase());
-    if (patterns.some(p => trade.eventSlug!.toLowerCase().includes(p))) {
-      await createSkippedRecord(trade, `eventSlug "${trade.eventSlug}" matches exclude pattern`, allocation.id, isPaper);
-      return;
+  if (allocation.excludeEventSlugPatterns != null && trade.side === 'BUY') {
+    const eventSlug = trade.eventSlug ?? (await prisma.market.findUnique({
+      where: { conditionId: trade.conditionId },
+      select: { eventSlug: true },
+    }))?.eventSlug;
+    if (eventSlug) {
+      const patterns = allocation.excludeEventSlugPatterns.split(',').map(p => p.trim().toLowerCase());
+      if (patterns.some(p => eventSlug.toLowerCase().includes(p))) {
+        await createSkippedRecord(trade, `eventSlug "${eventSlug}" matches exclude pattern`, allocation.id, isPaper);
+        return;
+      }
     }
   }
 
@@ -136,6 +161,12 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   let traderTradeUsd: number | null = null;
 
   if (trade.side === 'SELL') {
+    // Short-circuit if a recent SELL on this tokenId already failed (market closed/dead)
+    if (isInSellFailureCooldown(allocation.id, trade.asset)) {
+      await createSkippedRecord(trade, 'sell failure cooldown active', allocation.id, isPaper);
+      return;
+    }
+
     const heldShares = await getHeldShares(trade.asset, allocation.id, isPaper);
     // getHeldShares() rounds sub-penny amounts (< 0.01 shares) to 0 — these are
     // unsellable on CLOB (2dp floor → 0) and settle at market resolution. This
@@ -600,6 +631,11 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       latencyMs,
       signalAgeMs,
     });
+  }
+
+  // Record SELL failure to prevent repeated attempts on dead/closed markets
+  if (trade.side === 'SELL' && (result.status === 'SKIPPED' || result.status === 'FAILED')) {
+    recordSellFailure(allocation.id, trade.asset);
   }
 }
 

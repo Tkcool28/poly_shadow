@@ -15,6 +15,7 @@ import { executeMarketOrder as paperExecute } from '../services/paper-executor';
 import type { ExecuteOrderResult } from '../services/trade-executor';
 import {
   processCopyTrade, isInSellCooldown, recordSellFill,
+  isInSellFailureCooldown, recordSellFailure,
   createSkippedRecord,
 } from '../services/copy-trade-worker';
 import type { DetectedTradeRow } from '../services/copy-trade-worker';
@@ -277,7 +278,8 @@ interface PhaseAResult {
 async function phaseA(
   trade: DetectedTradeRow,
   allocation: { id: string; isPaper: boolean; currentCapital: number;
-    copyTradePercent: number | null; maxPositionUsd: number | null; maxPredictionPositionUsd: number | null },
+    copyTradePercent: number | null; maxPositionUsd: number | null; maxPredictionPositionUsd: number | null;
+    minBuyPrice: number | null; excludeEventSlugPatterns: string | null },
   cache: DrainCache,
   drainStartMs: number,
 ): Promise<PhaseAResult | null> {
@@ -319,6 +321,24 @@ async function phaseA(
     }
   }
 
+  // Per-allocation min buy price filter
+  if (allocation.minBuyPrice != null && trade.side === 'BUY' && trade.price < allocation.minBuyPrice) {
+    await createSkippedRecord(trade, `price ${trade.price} below minBuyPrice ${allocation.minBuyPrice}`, allocation.id, isPaper);
+    return null;
+  }
+
+  // Per-allocation event slug exclusion filter (BUY only)
+  if (allocation.excludeEventSlugPatterns != null && trade.side === 'BUY') {
+    const eventSlug = trade.eventSlug ?? cache.getMarketEventSlug(trade.conditionId);
+    if (eventSlug) {
+      const patterns = allocation.excludeEventSlugPatterns.split(',').map(p => p.trim().toLowerCase());
+      if (patterns.some(p => eventSlug.toLowerCase().includes(p))) {
+        await createSkippedRecord(trade, `eventSlug "${eventSlug}" matches exclude pattern`, allocation.id, isPaper);
+        return null;
+      }
+    }
+  }
+
   if (trade.side === 'BUY' && isInSellCooldown(allocation.id, trade.asset)) {
     await createSkippedRecord(trade, 'token sell cool-down active', allocation.id, isPaper);
     return null;
@@ -330,6 +350,12 @@ async function phaseA(
   let traderTradeUsd: number | null = null;
 
   if (trade.side === 'SELL') {
+    // Short-circuit if a recent SELL on this tokenId already failed (market closed/dead)
+    if (isInSellFailureCooldown(allocation.id, trade.asset)) {
+      await createSkippedRecord(trade, 'sell failure cooldown active', allocation.id, isPaper);
+      return null;
+    }
+
     // cache.getPosition() rounds sub-penny amounts (< 0.01 shares) to 0 — these are
     // unsellable on CLOB (2dp floor → 0) and settle at market resolution.
     const heldShares = cache.getPosition(trade.asset, allocation.id, isPaper).netShares;
@@ -651,6 +677,11 @@ async function batchSettle(
         if (res.side === 'SELL') recordSellFill(allocation.id, res.tokenId);
       }
 
+      // Record SELL failure to prevent repeated attempts on dead/closed markets
+      if (res.side === 'SELL' && (result.status === 'SKIPPED' || result.status === 'FAILED')) {
+        recordSellFailure(allocation.id, res.tokenId);
+      }
+
       // Per-trade log
       const mode = res.isPaper ? 'PAPER' : 'LIVE';
       if (result.status === 'FILLED') {
@@ -773,6 +804,8 @@ async function drainParallel(
             copyTradePercent: allocation.copyTradePercent,
             maxPositionUsd: allocation.maxPositionUsd,
             maxPredictionPositionUsd: allocation.maxPredictionPositionUsd,
+            minBuyPrice: allocation.minBuyPrice,
+            excludeEventSlugPatterns: allocation.excludeEventSlugPatterns,
           }, drainCache, drainStartMs),
         );
         if (result) {
