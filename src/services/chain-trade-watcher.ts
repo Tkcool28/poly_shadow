@@ -13,6 +13,11 @@ const CTF_EXCHANGE_ADDRESSES = [
 const ORDER_FILLED_TOPIC = '0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6';
 const INITIAL_RECONNECT_MS = 1000;
 const TAKER_DEBOUNCE_MS = 200; // debounce taker events to let MAKER events arrive first
+const BACKFILL_CHUNK_SIZE = 500; // yield to event loop every N log entries during backfill
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
 
 // ABI types for decoding OrderFilled event data (non-indexed params only)
 // [makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled, fee]
@@ -87,6 +92,7 @@ export class ChainTradeWatcher {
   private lastProcessedBlock: number | null = null;
   private lastVerifyBlock: number | null = null;
   private backfillRecovered = 0;
+  private backfillInProgress = false;
   reconnectCount = 0;
   staleDisconnectCount = 0;
 
@@ -95,23 +101,33 @@ export class ChainTradeWatcher {
   private blockTimestampPending: Set<number> = new Set();
 
   readonly label: string;
+  private wsRpcUrl: string;
+  private httpRpcUrl: string;
   state: ChainWatcherState = 'disconnected';
   lastEventAt: Date | null = null;
   eventsReceived = 0;
   triggeredDetections = 0;
 
-  constructor(onTradeDetected: ChainTradeCallback, getLiveWallets: () => Set<string>, label = 'primary') {
+  constructor(
+    onTradeDetected: ChainTradeCallback,
+    getLiveWallets: () => Set<string>,
+    label = 'primary',
+    wsRpcUrl?: string,
+    httpRpcUrl?: string,
+  ) {
     this.onTradeDetected = onTradeDetected;
     this.getLiveWallets = getLiveWallets;
     this.label = label;
     this.log = createJobLogger(`chain-watcher-${label}`);
+    this.wsRpcUrl = wsRpcUrl ?? config.POLYGON_WS_RPC_URL;
+    this.httpRpcUrl = httpRpcUrl ?? config.POLYGON_HTTP_RPC_URL;
   }
 
   connect(): void {
     if (this.ws) return;
     this.shouldReconnect = true;
     this.state = 'connecting';
-    this.log.info('Connecting to Polygon WS RPC...', { url: config.POLYGON_WS_RPC_URL });
+    this.log.info('Connecting to Polygon WS RPC...', { url: this.wsRpcUrl });
     this.createConnection();
   }
 
@@ -138,7 +154,7 @@ export class ChainTradeWatcher {
   private createConnection(): void {
     const disconnectedAtBlock = this.lastProcessedBlock;
     this.pongEverReceived = false;
-    const ws = new WebSocket(config.POLYGON_WS_RPC_URL);
+    const ws = new WebSocket(this.wsRpcUrl);
     this.ws = ws;
 
     ws.on('open', () => {
@@ -541,7 +557,7 @@ export class ChainTradeWatcher {
     this.blockTimestampPending.add(blockNum);
     void (async () => {
       try {
-        const res = await fetch(config.POLYGON_HTTP_RPC_URL, {
+        const res = await fetch(this.httpRpcUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -578,44 +594,56 @@ export class ChainTradeWatcher {
    * CU cost: ~1 call per ~150 blocks; returns all OrderFilled events on our 2 contracts.
    */
   private async backfillFromBlock(fromBlock: number): Promise<void> {
-    const wallets = this.getLiveWallets();
-    if (wallets.size === 0) return;
-
-    // Cap block range to ~500 blocks (~17 min) to avoid huge RPC responses.
-    // If disconnected longer, we only catch recent misses; older trades are
-    // covered by LIVE_POLL / bulk polling detection.
-    if (this.lastProcessedBlock && fromBlock < this.lastProcessedBlock - 500) {
-      fromBlock = this.lastProcessedBlock - 500;
+    if (this.backfillInProgress) {
+      this.log.warn('Backfill already in progress, skipping', { requestedFromBlock: fromBlock });
+      return;
     }
+    this.backfillInProgress = true;
+    try {
+      const wallets = this.getLiveWallets();
+      if (wallets.size === 0) return;
 
-    // Broad filter: just contract + event topic — NO wallet filter.
-    // This avoids any topic array bugs that might exist on the RPC provider.
-    const filter = {
-      address: CTF_EXCHANGE_ADDRESSES.map(a => a.toLowerCase()),
-      topics: [ORDER_FILLED_TOPIC],
-      fromBlock: '0x' + fromBlock.toString(16),
-      toBlock: 'latest',
-    };
+      // Cap block range to ~500 blocks (~17 min) to avoid huge RPC responses.
+      // If disconnected longer, we only catch recent misses; older trades are
+      // covered by LIVE_POLL / bulk polling detection.
+      if (this.lastProcessedBlock && fromBlock < this.lastProcessedBlock - 500) {
+        fromBlock = this.lastProcessedBlock - 500;
+      }
 
-    const allLogs = await this.ethGetLogs(filter);
-    let recovered = 0;
-    for (const logEntry of allLogs) {
-      // processLogEvent handles dedup via recentTxHashes + wallet matching
-      const before = this.triggeredDetections;
-      this.processLogEvent(logEntry);
-      if (this.triggeredDetections > before) recovered++;
-    }
+      // Broad filter: just contract + event topic — NO wallet filter.
+      // This avoids any topic array bugs that might exist on the RPC provider.
+      const filter = {
+        address: CTF_EXCHANGE_ADDRESSES.map(a => a.toLowerCase()),
+        topics: [ORDER_FILLED_TOPIC],
+        fromBlock: '0x' + fromBlock.toString(16),
+        toBlock: 'latest',
+      };
 
-    if (recovered > 0) {
-      this.backfillRecovered += recovered;
-      this.log.info('Backfill recovered missed events', {
-        fromBlock,
-        logsScanned: allLogs.length,
-        recovered,
-        totalRecovered: this.backfillRecovered,
-      });
-    } else {
-      this.log.debug('Backfill scan clean', { fromBlock, logsScanned: allLogs.length });
+      const allLogs = await this.ethGetLogs(filter);
+      let recovered = 0;
+      for (let i = 0; i < allLogs.length; i++) {
+        const before = this.triggeredDetections;
+        this.processLogEvent(allLogs[i]);
+        if (this.triggeredDetections > before) recovered++;
+        // Yield to event loop every BACKFILL_CHUNK_SIZE entries so heartbeat timers can fire
+        if ((i + 1) % BACKFILL_CHUNK_SIZE === 0) {
+          await yieldToEventLoop();
+        }
+      }
+
+      if (recovered > 0) {
+        this.backfillRecovered += recovered;
+        this.log.info('Backfill recovered missed events', {
+          fromBlock,
+          logsScanned: allLogs.length,
+          recovered,
+          totalRecovered: this.backfillRecovered,
+        });
+      } else {
+        this.log.debug('Backfill scan clean', { fromBlock, logsScanned: allLogs.length });
+      }
+    } finally {
+      this.backfillInProgress = false;
     }
   }
 
@@ -657,7 +685,7 @@ export class ChainTradeWatcher {
       params: [filter],
     });
 
-    const res = await fetch(config.POLYGON_HTTP_RPC_URL, {
+    const res = await fetch(this.httpRpcUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body,
@@ -686,7 +714,7 @@ export class ChainTradeWatcher {
 
   /** Fetch the latest block number to seed lastProcessedBlock */
   private async fetchLatestBlockNumber(): Promise<void> {
-    const res = await fetch(config.POLYGON_HTTP_RPC_URL, {
+    const res = await fetch(this.httpRpcUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] }),
@@ -832,6 +860,7 @@ export class ChainTradeWatcher {
   private clearTimers(): void {
     this.clearHeartbeat();
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
+    if (this.verifyTimer) { clearInterval(this.verifyTimer); this.verifyTimer = null; }
   }
 
   private clearAllTimers(): void {

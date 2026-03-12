@@ -43,6 +43,8 @@ const envSchema = z.object({
   RAPID_POLL_LIMIT: z.coerce.number().default(20), // API limit per wallet per rapid-poll cycle
   POLYGON_WS_RPC_URL: z.string().default('wss://polygon-bor-rpc.publicnode.com'),
   POLYGON_HTTP_RPC_URL: z.string().default('https://polygon-bor-rpc.publicnode.com'),
+  POLYGON_WS_RPC_URL_B: z.string().default('wss://polygon-bor-rpc.publicnode.com'),
+  POLYGON_HTTP_RPC_URL_B: z.string().default('https://polygon-bor-rpc.publicnode.com'),
   CHAIN_VERIFY_INTERVAL_MS: z.coerce.number().default(60000), // periodic eth_getLogs verification (was 5 min, now 60s)
   CHAIN_HEARTBEAT_MS: z.coerce.number().default(10000), // WSS keepalive interval (was hardcoded 45s)
   CHAIN_STALE_MS: z.coerce.number().default(25000), // WSS stale threshold — force reconnect (was hardcoded 135s)

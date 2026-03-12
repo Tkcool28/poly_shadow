@@ -83,9 +83,15 @@ async function main() {
     primary.connect();
     chainWatchers.push(primary);
 
-    // Backup WSS connection (dual-WSS for zero-gap coverage)
+    // Backup WSS connection (dual-WSS for zero-gap coverage, separate provider)
     if (config.CHAIN_DUAL_WSS) {
-      const backup = new ChainTradeWatcher(chainCallback, getLiveAllocationWallets, 'B');
+      const backup = new ChainTradeWatcher(
+        chainCallback,
+        getLiveAllocationWallets,
+        'B',
+        config.POLYGON_WS_RPC_URL_B,
+        config.POLYGON_HTTP_RPC_URL_B,
+      );
       backup.connect();
       chainWatchers.push(backup);
       log.info('Dual-WSS enabled: 2 independent chain watcher connections');
