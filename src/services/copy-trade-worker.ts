@@ -56,6 +56,7 @@ export interface DetectedTradeRow {
   compositeScore: number | null;
   detectedAt: Date;
   detectionSource: string | null;
+  eventSlug?: string | null;
 }
 
 export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
@@ -92,6 +93,21 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       allocationId: allocation.id, copyPercent, maxPerTrade, maxPerPrediction,
     });
     return;
+  }
+
+  // ─── Per-allocation min buy price filter ───
+  if (allocation.minBuyPrice != null && trade.side === 'BUY' && trade.price < allocation.minBuyPrice) {
+    await createSkippedRecord(trade, `price ${trade.price} below minBuyPrice ${allocation.minBuyPrice}`, allocation.id, isPaper);
+    return;
+  }
+
+  // ─── Per-allocation event slug exclusion filter (BUY only — never block exits) ───
+  if (allocation.excludeEventSlugPatterns != null && trade.side === 'BUY' && trade.eventSlug) {
+    const patterns = allocation.excludeEventSlugPatterns.split(',').map(p => p.trim().toLowerCase());
+    if (patterns.some(p => trade.eventSlug!.toLowerCase().includes(p))) {
+      await createSkippedRecord(trade, `eventSlug "${trade.eventSlug}" matches exclude pattern`, allocation.id, isPaper);
+      return;
+    }
   }
 
   // Skip live BUYs when wallet balance is insufficient — SELLs and paper allocations continue normally

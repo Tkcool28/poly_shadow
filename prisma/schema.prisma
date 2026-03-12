@@ -315,6 +315,10 @@ model FollowAllocation {
   maxPositionUsd            Float?  // Override MAX_POSITION_USD (per-trade cap)
   maxPredictionPositionUsd  Float?  // Override MAX_PREDICTION_POSITION_USD (per-tokenId cap)
 
+  // Per-allocation trade filters (null = disabled, no filtering)
+  minBuyPrice              Float?   // Min price for BUY trades (e.g. 0.50 = skip sub-50c entries)
+  excludeEventSlugPatterns String?  // Comma-separated slug substrings to exclude (e.g. "5-minute")
+
   // Per-allocation detection source override
   copyMakerFills        Boolean  @default(false) // true = also copy CHAIN_MAKER signals for this trader
 
