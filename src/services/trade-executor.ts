@@ -20,7 +20,7 @@ export interface ExecuteOrderParams {
 
 export interface ExecuteOrderResult {
   orderId: string | null;
-  status: 'FILLED' | 'FAILED' | 'SKIPPED';
+  status: 'FILLED' | 'FAILED' | 'SKIPPED' | 'DELAYED';
   filledPrice: number | null;
   filledSize: number | null;
   failReason: string | null;
@@ -479,6 +479,21 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
 
     // Guard: FAK order submitted but not matched (no fill amounts) — treat as SKIPPED
     if (!filledSize || !filledPrice) {
+      // Sports markets impose a 3-second matching delay on marketable orders.
+      // The CLOB returns status="delayed" with empty amounts — the order fills ~3s later.
+      // Return DELAYED so callers can keep the record PENDING (visible to cap checks)
+      // and resolve via background poll.
+      if (orderId && response?.status === 'delayed') {
+        log.info('FAK order accepted with delayed matching (sports market)', {
+          orderId, side, amount, tokenId: tokenId.slice(0, 20),
+        });
+        return {
+          orderId, status: 'DELAYED',
+          filledPrice: null, filledSize: null,
+          failReason: null, transactionHashes: txHashes,
+        };
+      }
+
       // Background ghost-fill verification (non-blocking — saves ~1,100ms on critical path).
       // If the CLOB accepted the order (orderId present), the fill may be propagating
       // asynchronously. Schedule a background check that logs detection.

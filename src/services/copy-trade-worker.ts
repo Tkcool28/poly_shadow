@@ -7,6 +7,7 @@ import type { ExecuteOrderResult } from './trade-executor';
 import { addToPool } from './order-pool';
 import { resolveMarkets } from './market-resolver';
 import { computeSellCostBasis } from '../lib/cost-basis';
+import { scheduleDelayedOrderPoll } from './delayed-order-poller';
 
 const log = createJobLogger('copy-trade-worker');
 
@@ -402,6 +403,34 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   if (result.filledPrice && trade.price > 0) {
     slippageBps = Math.round(((result.filledPrice - trade.price) / trade.price) * 10000);
     if (trade.side === 'SELL') slippageBps = -slippageBps;
+  }
+
+  // ─── DELAYED: sports market 3s matching delay — keep PENDING, poll in background ───
+  if (result.status === 'DELAYED' && result.orderId) {
+    await prisma.copyTrade.update({
+      where: { id: copyTrade.id },
+      data: {
+        orderId: result.orderId,
+        failReason: 'delayed matching: background poll scheduled',
+        latencyMs,
+      },
+    });
+    scheduleDelayedOrderPoll({
+      copyTradeId: copyTrade.id,
+      orderId: result.orderId,
+      allocationId: allocation.id,
+      side: trade.side as 'BUY' | 'SELL',
+      tokenId: trade.asset,
+      isPaper,
+      detectedPrice: trade.price,
+    });
+    log.info('COPY TRADE DELAYED — background poll scheduled', {
+      trader: trade.proxyWallet.slice(0, 10), mode: isPaper ? 'PAPER' : 'LIVE',
+      side: trade.side, orderId: result.orderId,
+      copyAmountUsd: copyAmountUsd.toFixed(2),
+      title: trade.title?.slice(0, 50),
+    });
+    return;
   }
 
   // ─── Update record + capital atomically ───

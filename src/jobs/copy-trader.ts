@@ -26,6 +26,7 @@ import { reconcileStalePending, reconcileSkippedGhostFills } from '../services/c
 import { sweepPreResolutionSells } from '../services/pre-resolution-seller';
 import { resolveMarkets } from '../services/market-resolver';
 import { computeSellCostBasis } from '../lib/cost-basis';
+import { scheduleDelayedOrderPoll, type DelayedOrderContext } from '../services/delayed-order-poller';
 import { auditAllAllocations, auditPhantomPositions, cleanupPhantomPositions, checkCircuitBreakers } from '../lib/capital-audit';
 import { initMidpointCache, closeMidpointCache, ensureSubscribed } from '../services/midpoint-cache';
 import { getOrCreateMutex } from '../lib/allocation-mutex';
@@ -552,6 +553,8 @@ async function batchSettle(
   reservations: PhaseAResult[],
   clobResults: PromiseSettledResult<{ result: ExecuteOrderResult; clobMs: number }>[],
 ): Promise<void> {
+  const delayedPolls: DelayedOrderContext[] = [];
+
   await prisma.$transaction(async (tx) => {
     let totalBuyUsd = 0;
     let totalSellReturn = 0;
@@ -576,6 +579,34 @@ async function batchSettle(
       if (result.filledPrice && res.detectedPrice > 0) {
         slippageBps = Math.round(((result.filledPrice - res.detectedPrice) / res.detectedPrice) * 10000);
         if (res.side === 'SELL') slippageBps = -slippageBps;
+      }
+
+      // DELAYED: sports market 3s matching delay — keep PENDING, poll in background
+      if (result.status === 'DELAYED' && result.orderId) {
+        await tx.copyTrade.update({
+          where: { id: res.copyTradeId },
+          data: {
+            orderId: result.orderId,
+            failReason: 'delayed matching: background poll scheduled',
+            latencyMs,
+          },
+        });
+        delayedPolls.push({
+          copyTradeId: res.copyTradeId,
+          orderId: result.orderId,
+          allocationId: allocation.id,
+          side: res.side,
+          tokenId: res.tokenId,
+          isPaper: res.isPaper,
+          detectedPrice: res.detectedPrice,
+        });
+        const mode = res.isPaper ? 'PAPER' : 'LIVE';
+        log.info(`COPY TRADE DELAYED — background poll scheduled [${mode}]`, {
+          trader: res.tradeInfo.proxyWallet.slice(0, 10),
+          side: res.side, orderId: result.orderId,
+          title: res.tradeInfo.title?.slice(0, 50),
+        });
+        continue;
       }
 
       await tx.copyTrade.update({
@@ -674,6 +705,11 @@ async function batchSettle(
       });
     }
   });
+
+  // Schedule background polls for delayed orders (after transaction commits)
+  for (const ctx of delayedPolls) {
+    scheduleDelayedOrderPoll(ctx);
+  }
 }
 
 // ─── Parallel drain pipeline ───
