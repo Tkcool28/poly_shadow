@@ -93,8 +93,10 @@ export class ChainTradeWatcher {
   private lastVerifyBlock: number | null = null;
   private backfillRecovered = 0;
   private backfillInProgress = false;
+  private connectedAt = 0;
   reconnectCount = 0;
   staleDisconnectCount = 0;
+  eventStaleReconnectCount = 0;
 
   // Block timestamp cache: blockNumber → Unix epoch seconds
   private blockTimestampCache: Map<number, number> = new Map();
@@ -105,6 +107,7 @@ export class ChainTradeWatcher {
   private httpRpcUrl: string;
   state: ChainWatcherState = 'disconnected';
   lastEventAt: Date | null = null;
+  private lastWssEventAt: Date | null = null;
   eventsReceived = 0;
   triggeredDetections = 0;
 
@@ -162,6 +165,8 @@ export class ChainTradeWatcher {
       this.reconnectDelayMs = INITIAL_RECONNECT_MS;
       this.lastHeartbeatAt = new Date();
       this.lastPongAt = new Date();
+      this.lastWssEventAt = null;  // Reset: don't carry stale timestamp from previous connection
+      this.connectedAt = Date.now();
       this.lastPreemptiveBackfillAt = 0;
       this.log.info('Connected, subscribing to CTF Exchange OrderFilled events');
 
@@ -220,6 +225,7 @@ export class ChainTradeWatcher {
 
         // Subscription event
         if (msg.method === 'eth_subscription' && msg.params?.result?.topics?.length >= 4) {
+          this.lastWssEventAt = new Date();
           this.processLogEvent(msg.params.result);
         }
       } catch {
@@ -765,6 +771,34 @@ export class ChainTradeWatcher {
         return;
       }
 
+      // ─── Event delivery staleness: connection alive but no events flowing ───
+      // Catches providers that respond to pings but silently stop delivering
+      // eth_subscription events (observed with publicnode after ~18min).
+      // Uses lastWssEventAt (not lastEventAt) to avoid being fooled by periodic
+      // verification's HTTP backfill which also calls processLogEvent().
+      if (this.confirmedSubIds.size > 0 && this.connectedAt > 0) {
+        const wssEventAge = this.lastWssEventAt
+          ? now - this.lastWssEventAt.getTime()
+          : now - this.connectedAt;  // Never received any WSS event: use connection uptime
+        if (wssEventAge > config.CHAIN_EVENT_STALE_MS) {
+          this.staleDisconnectCount++;
+          this.eventStaleReconnectCount++;
+          const neverReceived = !this.lastWssEventAt;
+          this.log.warn('Event delivery stale, forcing reconnect', {
+            wssEventAgeMs: wssEventAge,
+            eventStaleThresholdMs: config.CHAIN_EVENT_STALE_MS,
+            neverReceivedWssEvents: neverReceived,
+            lastWssEventAt: this.lastWssEventAt?.toISOString() ?? 'never',
+            lastEventAt: this.lastEventAt?.toISOString() ?? 'never',
+            eventsReceived: this.eventsReceived,
+            confirmedSubs: this.confirmedSubIds.size,
+          });
+          this.isStaleDisconnect = true;
+          ws.terminate();
+          return;
+        }
+      }
+
       // Pre-emptive backfill: if 1.5× heartbeat without response, fire eth_getLogs as insurance
       const warningThresholdMs = config.CHAIN_HEARTBEAT_MS * 1.5;
       if (effectiveAge > warningThresholdMs && this.canFirePreemptiveBackfill()) {
@@ -830,6 +864,8 @@ export class ChainTradeWatcher {
           failedWallets,
           reconnectCount: this.reconnectCount,
           staleDisconnectCount: this.staleDisconnectCount,
+          eventStaleReconnects: this.eventStaleReconnectCount,
+          lastWssEventAt: this.lastWssEventAt?.toISOString() ?? 'never',
           pongSupported: this.pongEverReceived,
           raceStats,
         });
