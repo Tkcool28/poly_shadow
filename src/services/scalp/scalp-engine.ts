@@ -48,12 +48,12 @@ export class ScalpEngine {
       return;
     }
 
-    // Check processing lock (prevent double-entry from bot + game API)
-    const lockKey = tokenInfo.tokenId;
+    // Check processing lock (per-MARKET slug, not per-token)
+    const lockKey = market.slug;
     const existingLock = processingLock.get(lockKey);
     if (existingLock && Date.now() - existingLock.timestamp < LOCK_EXPIRY_MS) {
-      // Already processing or entered for this token — upgrade confidence if possible
-      log.info('Lock exists, skipping duplicate entry', {
+      // Already processing or entered for this market — upgrade confidence if possible
+      log.info('Market lock exists, skipping duplicate entry', {
         slug: market.slug,
         existingCycleId: existingLock.cycleId.slice(0, 12),
       });
@@ -68,10 +68,14 @@ export class ScalpEngine {
       return;
     }
 
+    // Set lock EAGERLY before async work to prevent race condition
+    processingLock.set(lockKey, { cycleId: `pending-${Date.now()}`, timestamp: Date.now() });
+
     // Estimate fair value
     const currentPrice = await getCurrentPrice(tokenInfo.tokenId);
     if (currentPrice === null) {
       log.warn('Cannot get current price, skipping game event', { slug: market.slug });
+      processingLock.delete(lockKey); // Release eager lock on failure
       return;
     }
     const fairValue = estimateSeriesFairValue(
@@ -105,8 +109,7 @@ export class ScalpEngine {
 
   /**
    * Handle a bot detection signal (fast bot bought on trade stream).
-   * INVERSE MODE: bot buys token A → we buy the OPPOSITE token B.
-   * Bots are pump-and-dump; fading them is profitable ~90% of the time.
+   * FOLLOW MODE: bot buys token A → we also buy token A.
    */
   async onBotSignal(signal: BotSignal): Promise<void> {
     const market = getMarketByTokenId(signal.tokenId);
@@ -114,54 +117,44 @@ export class ScalpEngine {
 
     if (market.marketType !== 'series') return;
 
-    // Find which outcome the bot bought
-    const botTokenInfo = resolveTokenOutcome(market, signal.tokenId);
-    if (!botTokenInfo) return;
+    // Find which outcome this token is
+    const tokenInfo = resolveTokenOutcome(market, signal.tokenId);
+    if (!tokenInfo) return;
 
-    // Resolve the OPPOSITE token (the one the bot did NOT buy)
-    const oppositeToken = resolveOppositeToken(market, signal.tokenId);
-    if (!oppositeToken) {
-      log.warn('Cannot resolve opposite token for inverse', {
-        slug: market.slug,
-        botOutcome: botTokenInfo.outcomeLabel,
-      });
-      return;
-    }
-
-    // Check processing lock on the opposite token (what we're actually buying)
-    const existingLock = processingLock.get(oppositeToken.tokenId);
+    // Check processing lock (per-MARKET slug, not per-token)
+    const lockKey = market.slug;
+    const existingLock = processingLock.get(lockKey);
     if (existingLock && Date.now() - existingLock.timestamp < LOCK_EXPIRY_MS) {
-      log.debug('Lock exists for inverse bot signal, skipping', { slug: market.slug });
+      log.debug('Market lock exists for bot signal, skipping', { slug: market.slug });
       return;
     }
 
-    // Get the opposite token's current ask price from orderbook
-    const oppositePrice = await getCurrentPrice(oppositeToken.tokenId);
-    if (oppositePrice === null || oppositePrice <= 0 || oppositePrice >= 1) {
-      log.debug('Cannot get opposite token price, skipping', {
-        slug: market.slug,
-        oppositeOutcome: oppositeToken.outcomeLabel,
-      });
+    // Set lock EAGERLY before async work to prevent race condition
+    // (previously 3 signals in 71ms all passed lock check before any set it)
+    processingLock.set(lockKey, { cycleId: `pending-${Date.now()}`, timestamp: Date.now() });
+
+    // Get the actual current ask from orderbook (not bot's avg price)
+    const currentAsk = await getCurrentPrice(signal.tokenId);
+    if (currentAsk === null || currentAsk <= 0 || currentAsk >= 1) {
+      log.debug('Cannot get current price, skipping', { slug: market.slug });
+      processingLock.delete(lockKey); // Release eager lock on failure
       return;
     }
 
-    // Edge estimation for inverse: bot pumped side A, so side B is cheap.
-    // Fair value of opposite ≈ current price + 15¢ (conservative)
-    const estimatedFairValue = Math.min(oppositePrice + 0.15, 0.95);
-    const estimatedEdge = (estimatedFairValue - oppositePrice) * 100;
+    // Edge: assume bot knows the result, fair value ~15¢ higher
+    const estimatedFairValue = Math.min(currentAsk + 0.15, 0.95);
+    const estimatedEdge = (estimatedFairValue - currentAsk) * 100;
 
     await this.evaluateAndEnter({
-      matchId: `bot-inv-${oppositeToken.tokenId.slice(0, 16)}-${Date.now()}`,
+      matchId: `bot-${signal.tokenId.slice(0, 16)}-${Date.now()}`,
       game: market.game as any,
       slug: market.slug,
       conditionId: market.conditionId,
-      tokenId: oppositeToken.tokenId,
-      outcomeLabel: oppositeToken.outcomeLabel,
+      tokenId: signal.tokenId,
+      outcomeLabel: tokenInfo.outcomeLabel,
       eventType: 'bot_signal' as any,
       eventSequence: 0,
       eventDetail: JSON.stringify({
-        inverse: true,
-        botBoughtOutcome: botTokenInfo.outcomeLabel,
         botTotalUsd: signal.totalUsd,
         botTradeCount: signal.tradeCount,
         botAvgPrice: signal.avgPrice,
@@ -169,7 +162,7 @@ export class ScalpEngine {
       signalSource: 'bot',
       signalConfidence: signal.confidence === 'HIGH' ? 'HIGH' : 'MEDIUM',
       estimatedFairValue,
-      currentAsk: oppositePrice,
+      currentAsk,
       estimatedEdge,
       timestamp: signal.timestamp,
     });
@@ -324,8 +317,8 @@ export class ScalpEngine {
         },
       });
 
-      // Set processing lock
-      processingLock.set(signal.tokenId, { cycleId: cycle.id, timestamp: Date.now() });
+      // Upgrade processing lock with real cycleId (replaces eager pending lock)
+      processingLock.set(signal.slug, { cycleId: cycle.id, timestamp: Date.now() });
 
       // Add to exit manager (pass exact amount decremented for capital accounting)
       this.exitManager.addPosition(
@@ -416,21 +409,6 @@ function resolveTokenOutcome(
     if (idx >= 0 && idx < outcomes.length) {
       return { outcomeLabel: outcomes[idx].trim(), outcomeIndex: idx };
     }
-  } catch {}
-  return null;
-}
-
-function resolveOppositeToken(
-  market: ScalpMarketWatch,
-  tokenId: string,
-): { tokenId: string; outcomeLabel: string } | null {
-  try {
-    const outcomes: string[] = JSON.parse(market.outcomes);
-    const tokenIds: string[] = JSON.parse(market.clobTokenIds);
-    const idx = tokenIds.indexOf(tokenId);
-    if (idx < 0 || outcomes.length !== 2 || tokenIds.length !== 2) return null;
-    const oppositeIdx = idx === 0 ? 1 : 0;
-    return { tokenId: tokenIds[oppositeIdx], outcomeLabel: outcomes[oppositeIdx].trim() };
   } catch {}
   return null;
 }

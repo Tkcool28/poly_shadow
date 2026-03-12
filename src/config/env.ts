@@ -259,7 +259,7 @@ const envSchema = z.object({
   SCALP_MAX_ENTRY_SPREAD: z.coerce.number().default(0.30),          // skip entry if spread > 30¢
 
   // Scalp exit
-  SCALP_CONVERGENCE_SELL_TIMEOUT_MS: z.coerce.number().default(120000),       // 2 min
+  SCALP_CONVERGENCE_SELL_TIMEOUT_MS: z.coerce.number().default(600000),       // 10 min
   SCALP_CONVERGENCE_SELL_DISCOUNT_CENTS: z.coerce.number().default(3),
   SCALP_SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(30000),       // 30s
   SCALP_ORDER_POLL_INTERVAL_MS: z.coerce.number().default(5000),              // 5s

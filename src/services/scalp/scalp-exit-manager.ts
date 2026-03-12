@@ -91,36 +91,22 @@ export class ScalpExitManager {
     const book = await scalpGetOrderBook(exit.tokenId);
     const bestBid = parseFloat(book?.bids?.[0]?.price ?? '0');
 
-    if (bestBid < config.SCALP_MIN_MEANINGFUL_BID) {
-      log.debug('Bid below meaningful threshold, holding for settlement', {
-        cycleId: cycleId.slice(0, 12),
-        bestBid: bestBid.toFixed(4),
-        threshold: config.SCALP_MIN_MEANINGFUL_BID,
-      });
-      return; // Skip stop-loss — let convergence timeout → settlement handle it
-    }
-
-    // Stop-loss check
-    const stopLossPrice = exit.entryPrice - config.SCALP_STOP_LOSS_CENTS / 100;
-    if (bestBid < stopLossPrice) {
-      await this.executeExit(cycleId, exit, bestBid, 'stop_loss');
-      return;
-    }
-
-    // Convergence sell check
+    // Convergence sell: take profit when bid reaches target
     if (bestBid >= exit.targetSellPrice) {
       await this.executeExit(cycleId, exit, bestBid, 'convergence_sell');
       return;
     }
 
-    // Timeout → hold for settlement
+    // Timeout → hand off to settlement sweep (let the match finish)
     if (Date.now() - exit.startedAt > config.SCALP_CONVERGENCE_SELL_TIMEOUT_MS) {
       log.info('Convergence timeout, holding for settlement', {
         cycleId: cycleId.slice(0, 12),
+        bestBid: bestBid.toFixed(4),
+        target: exit.targetSellPrice.toFixed(4),
         elapsed: `${((Date.now() - exit.startedAt) / 1000).toFixed(0)}s`,
       });
       this.activeExits.delete(cycleId);
-      // Cycle stays ENTERED — settlement sweep will handle it
+      // Cycle stays ENTERED — settlement sweep handles final resolution
     }
   }
 
@@ -128,7 +114,7 @@ export class ScalpExitManager {
     cycleId: string,
     exit: ExitState,
     bidPrice: number,
-    method: 'convergence_sell' | 'stop_loss',
+    method: 'convergence_sell',
   ): Promise<void> {
     // Paper mode: simulate sell at bid price with slippage + fees
     const slippage = bidPrice * (config.SCALP_PAPER_SLIPPAGE_FRACTION / 2);
