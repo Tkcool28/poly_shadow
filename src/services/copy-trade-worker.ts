@@ -160,6 +160,21 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     }
   }
 
+  // Per-allocation title exclusion filter (BUY only — never block exits)
+  if (allocation.excludeTitlePatterns != null && trade.side === 'BUY') {
+    const title = trade.title ?? (await prisma.market.findUnique({
+      where: { conditionId: trade.conditionId },
+      select: { question: true },
+    }))?.question;
+    if (title) {
+      const patterns = allocation.excludeTitlePatterns.split(',').map(p => p.trim().toLowerCase());
+      if (patterns.some(p => title.toLowerCase().includes(p))) {
+        await createSkippedRecord(trade, `title matches exclude pattern`, allocation.id, isPaper);
+        return;
+      }
+    }
+  }
+
   // Skip live BUYs when wallet balance is insufficient — SELLs and paper allocations continue normally
   if (!isPaper && trade.side === 'BUY' && isBalancePaused()) {
     await createSkippedRecord(trade, 'live trading paused: insufficient wallet balance', allocation.id, isPaper);

@@ -1,3 +1,4 @@
+import pLimit from 'p-limit';
 import { prisma } from '../lib/prisma';
 import { createJobLogger } from '../lib/logger';
 import { normalizeOutcome } from '../lib/normalize';
@@ -93,7 +94,19 @@ async function doSweepPositionSettlements(): Promise<void> {
     return;
   }
 
-  const freshMarkets = await getMarketsByConditionIds(uniqueConditionIds);
+  // Split conditionIds by negRisk flag to avoid Gamma garbage for NegRisk markets
+  const marketRows = await prisma.market.findMany({
+    where: { conditionId: { in: uniqueConditionIds } },
+    select: { conditionId: true, negRisk: true, outcomes: true },
+  });
+  const negRiskSet = new Set(marketRows.filter(m => m.negRisk).map(m => m.conditionId));
+  const standardIds = uniqueConditionIds.filter(id => !negRiskSet.has(id));
+  const negRiskIds = uniqueConditionIds.filter(id => negRiskSet.has(id));
+
+  // Standard markets: Gamma API (existing path)
+  const freshMarkets = standardIds.length > 0
+    ? await getMarketsByConditionIds(standardIds)
+    : [];
 
   // Update cache (batched)
   if (freshMarkets.length > 0) {
@@ -106,6 +119,7 @@ async function doSweepPositionSettlements(): Promise<void> {
             active: market.active,
             outcomePrices: market.outcomePrices ?? null,
             endDate: market.endDate ? new Date(market.endDate) : undefined,
+            negRisk: market.negRisk ?? undefined,
           },
         })
       )
@@ -123,9 +137,36 @@ async function doSweepPositionSettlements(): Promise<void> {
     }
   }
 
-  // ── Fallback: on-chain resolution for overdue markets ──
+  // NegRisk markets: on-chain resolution (Gamma returns wrong data for these)
+  if (negRiskIds.length > 0) {
+    const negRiskMarkets = marketRows.filter(m => negRiskSet.has(m.conditionId));
+    const rpcLimit = pLimit(3);
+    const onChainResults = await Promise.allSettled(
+      negRiskMarkets.map(m => rpcLimit(async () => {
+        const outcomes: string[] = JSON.parse(m.outcomes);
+        const resolution = await checkOnChainResolution(m.conditionId, outcomes.length);
+        return { conditionId: m.conditionId, outcomes, resolution };
+      }))
+    );
+    for (const result of onChainResults) {
+      if (result.status !== 'fulfilled') continue;
+      const { conditionId, outcomes, resolution } = result.value;
+      if (!resolution.resolved) continue;
+      await prisma.market.updateMany({
+        where: { conditionId },
+        data: { closed: true, outcomePrices: JSON.stringify(resolution.payouts) },
+      });
+      resolvedMarkets.set(conditionId, {
+        outcomes: JSON.stringify(outcomes),
+        outcomePrices: JSON.stringify(resolution.payouts),
+      });
+      log.info('Settlement: NegRisk market resolved on-chain', { conditionId, payouts: resolution.payouts });
+    }
+  }
+
+  // ── Fallback: on-chain resolution for overdue standard markets ──
   if (config.SETTLEMENT_ONCHAIN_FALLBACK_ENABLED) {
-    const unresolvedConditionIds = uniqueConditionIds.filter(cid => !resolvedMarkets.has(cid));
+    const unresolvedConditionIds = standardIds.filter(cid => !resolvedMarkets.has(cid));
     if (unresolvedConditionIds.length > 0) {
       const marketEndDates = await prisma.market.findMany({
         where: { conditionId: { in: unresolvedConditionIds } },
@@ -154,6 +195,10 @@ async function doSweepPositionSettlements(): Promise<void> {
           const { conditionId, outcomes, resolution } = result.value;
           if (!resolution.resolved) continue;
 
+          await prisma.market.updateMany({
+            where: { conditionId },
+            data: { closed: true, outcomePrices: JSON.stringify(resolution.payouts) },
+          });
           resolvedMarkets.set(conditionId, {
             outcomes: JSON.stringify(outcomes),
             outcomePrices: JSON.stringify(resolution.payouts),
@@ -464,4 +509,95 @@ async function doSweepUnclaimedSettledPositions(): Promise<void> {
   if (claimedIds.length > 0) {
     log.info(`Unclaimed sweep: claimed ${claimedIds.length} conditionId(s)`);
   }
+}
+
+// ─── Stale market refresh sweep ─────────────────────────────────────────────
+// Periodically refreshes ALL non-closed markets (not just those with open positions).
+// Standard markets use Gamma API; NegRisk markets use on-chain CTF resolution
+// (Gamma returns wrong data for NegRisk conditionIds).
+let marketRefreshRunning = false;
+
+export async function sweepStaleMarkets(): Promise<void> {
+  if (marketRefreshRunning) return;
+  marketRefreshRunning = true;
+  try {
+    await doSweepStaleMarkets();
+  } finally {
+    marketRefreshRunning = false;
+  }
+}
+
+async function doSweepStaleMarkets(): Promise<void> {
+  const MAX_BATCH = 100;
+
+  const staleMarkets = await prisma.market.findMany({
+    where: { closed: false },
+    select: { conditionId: true, negRisk: true, outcomes: true },
+    orderBy: { updatedAt: 'asc' },
+    take: MAX_BATCH,
+  });
+
+  if (staleMarkets.length === 0) return;
+
+  const standardMarkets = staleMarkets.filter(m => !m.negRisk);
+  const negRiskMarkets = staleMarkets.filter(m => m.negRisk);
+  let newlyClosed = 0;
+
+  // Standard markets: refresh via Gamma API
+  if (standardMarkets.length > 0) {
+    const ids = standardMarkets.map(m => m.conditionId);
+    try {
+      const fresh = await getMarketsByConditionIds(ids);
+      if (fresh.length > 0) {
+        await prisma.$transaction(
+          fresh.map(market => prisma.market.updateMany({
+            where: { conditionId: market.conditionId },
+            data: {
+              closed: market.closed,
+              active: market.active,
+              outcomePrices: market.outcomePrices ?? null,
+              endDate: market.endDate ? new Date(market.endDate) : undefined,
+              negRisk: market.negRisk ?? undefined,
+            },
+          }))
+        );
+        newlyClosed += fresh.filter(m => m.closed).length;
+      }
+    } catch (err: any) {
+      log.warn(`Market refresh: Gamma API failed: ${err.message}`);
+    }
+  }
+
+  // NegRisk markets: on-chain CTF resolution
+  if (negRiskMarkets.length > 0) {
+    const limit = pLimit(3);
+    const results = await Promise.allSettled(
+      negRiskMarkets.map(m => limit(async () => {
+        const outcomes: string[] = JSON.parse(m.outcomes);
+        const res = await checkOnChainResolution(m.conditionId, outcomes.length);
+        return { conditionId: m.conditionId, res };
+      }))
+    );
+
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        log.debug('Market refresh: NegRisk on-chain check failed', { error: String(result.reason) });
+        continue;
+      }
+      const { conditionId, res } = result.value;
+      if (!res.resolved) continue;
+      await prisma.market.updateMany({
+        where: { conditionId },
+        data: { closed: true, outcomePrices: JSON.stringify(res.payouts) },
+      });
+      newlyClosed++;
+    }
+  }
+
+  log.info('Market refresh sweep', {
+    totalNonClosed: staleMarkets.length,
+    standard: standardMarkets.length,
+    negRisk: negRiskMarkets.length,
+    newlyClosed,
+  });
 }

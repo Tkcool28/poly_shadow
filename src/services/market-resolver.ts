@@ -47,6 +47,7 @@ export async function resolveMarkets(conditionIds: string[]): Promise<void> {
     image: market.image ?? null,
     icon: market.icon ?? null,
     eventSlug: market.eventSlug ?? null,
+    negRisk: market.negRisk ?? false,
   }));
 
   const { count: inserted } = await prisma.market.createMany({
@@ -71,6 +72,7 @@ export async function resolveMarkets(conditionIds: string[]): Promise<void> {
                 active: market.active,
                 volume: market.volume ?? null,
                 liquidity: market.liquidity ?? null,
+                negRisk: market.negRisk ?? false,
               },
             })
           )

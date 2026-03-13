@@ -23,7 +23,7 @@ import type { DetectedTradeRow } from '../services/copy-trade-worker';
 import { addToPool } from '../services/order-pool';
 import { startPortfolioRefresh, stopPortfolioRefresh } from '../services/portfolio-cache';
 import { rehydratePool, sweepPool } from '../services/order-pool';
-import { sweepPositionSettlements, sweepUnclaimedSettledPositions } from '../services/position-settlement';
+import { sweepPositionSettlements, sweepUnclaimedSettledPositions, sweepStaleMarkets } from '../services/position-settlement';
 import { reconcileStalePending, reconcileSkippedGhostFills } from '../services/clob-reconciler';
 import { sweepPreResolutionSells } from '../services/pre-resolution-seller';
 import { resolveMarkets } from '../services/market-resolver';
@@ -37,6 +37,7 @@ import { PgListener } from '../lib/pg-listen';
 const JOB_NAME = 'copy-trader';
 const log = createJobLogger(JOB_NAME);
 const CAPITAL_AUDIT_INTERVAL_MS = 3_600_000; // 1 hour
+const MARKET_REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 min
 
 // ─── Pipeline infrastructure (Change 5) ───
 
@@ -57,6 +58,7 @@ interface DrainCache {
   isMarketClosed(conditionId: string): boolean;
   getMarketEndDate(conditionId: string): Date | null;
   getMarketEventSlug(conditionId: string): string | null;
+  getMarketTitle(conditionId: string): string | null;
 }
 
 async function buildDrainCache(
@@ -135,15 +137,17 @@ async function buildDrainCache(
   const uniqueConditionIds = [...new Set(conditionIds)];
   const markets = await prisma.market.findMany({
     where: { conditionId: { in: uniqueConditionIds } },
-    select: { conditionId: true, closed: true, endDate: true, eventSlug: true },
+    select: { conditionId: true, closed: true, endDate: true, eventSlug: true, question: true },
   });
   const marketClosedMap = new Map<string, boolean>();
   const marketEndDateMap = new Map<string, Date | null>();
   const marketEventSlugMap = new Map<string, string | null>();
+  const marketQuestionMap = new Map<string, string | null>();
   for (const m of markets) {
     marketClosedMap.set(m.conditionId, m.closed);
     marketEndDateMap.set(m.conditionId, m.endDate);
     marketEventSlugMap.set(m.conditionId, m.eventSlug ?? null);
+    marketQuestionMap.set(m.conditionId, m.question ?? null);
   }
 
   // Resolve missing markets from Gamma API
@@ -153,12 +157,13 @@ async function buildDrainCache(
       await resolveMarkets(missing);
       const resolved = await prisma.market.findMany({
         where: { conditionId: { in: missing } },
-        select: { conditionId: true, closed: true, endDate: true, eventSlug: true },
+        select: { conditionId: true, closed: true, endDate: true, eventSlug: true, question: true },
       });
       for (const m of resolved) {
         marketClosedMap.set(m.conditionId, m.closed);
         marketEndDateMap.set(m.conditionId, m.endDate);
         marketEventSlugMap.set(m.conditionId, m.eventSlug ?? null);
+        marketQuestionMap.set(m.conditionId, m.question ?? null);
       }
     } catch (err: any) {
       log.warn(`DrainCache: resolveMarkets failed (fail-open): ${err.message}`);
@@ -247,6 +252,10 @@ async function buildDrainCache(
     getMarketEventSlug(conditionId) {
       return marketEventSlugMap.get(conditionId) ?? null;
     },
+
+    getMarketTitle(conditionId) {
+      return marketQuestionMap.get(conditionId) ?? null;
+    },
   };
 }
 
@@ -280,7 +289,7 @@ async function phaseA(
   trade: DetectedTradeRow,
   allocation: { id: string; isPaper: boolean; currentCapital: number;
     copyTradePercent: number | null; maxPositionUsd: number | null; maxPredictionPositionUsd: number | null;
-    minBuyPrice: number | null; excludeEventSlugPatterns: string | null },
+    minBuyPrice: number | null; excludeEventSlugPatterns: string | null; excludeTitlePatterns: string | null },
   cache: DrainCache,
   drainStartMs: number,
 ): Promise<PhaseAResult | null> {
@@ -335,6 +344,18 @@ async function phaseA(
       const patterns = allocation.excludeEventSlugPatterns.split(',').map(p => p.trim().toLowerCase());
       if (patterns.some(p => eventSlug.toLowerCase().includes(p))) {
         await createSkippedRecord(trade, `eventSlug "${eventSlug}" matches exclude pattern`, allocation.id, isPaper);
+        return null;
+      }
+    }
+  }
+
+  // Per-allocation title exclusion filter (BUY only — never block exits)
+  if (allocation.excludeTitlePatterns != null && trade.side === 'BUY') {
+    const title = trade.title ?? cache.getMarketTitle(trade.conditionId);
+    if (title) {
+      const patterns = allocation.excludeTitlePatterns.split(',').map(p => p.trim().toLowerCase());
+      if (patterns.some(p => title.toLowerCase().includes(p))) {
+        await createSkippedRecord(trade, `title matches exclude pattern`, allocation.id, isPaper);
         return null;
       }
     }
@@ -820,6 +841,7 @@ async function drainParallel(
             maxPredictionPositionUsd: allocation.maxPredictionPositionUsd,
             minBuyPrice: allocation.minBuyPrice,
             excludeEventSlugPatterns: allocation.excludeEventSlugPatterns,
+            excludeTitlePatterns: allocation.excludeTitlePatterns,
           }, drainCache, drainStartMs),
         );
         if (result) {
@@ -1252,6 +1274,15 @@ async function main() {
     }
   }, config.SETTLEMENT_SWEEP_INTERVAL_MS);
 
+  const marketRefreshTimer = setInterval(async () => {
+    if (shuttingDown || isShuttingDown()) return;
+    try {
+      await sweepStaleMarkets();
+    } catch (err: any) {
+      log.warn(`Market refresh sweep failed: ${err.message}`);
+    }
+  }, MARKET_REFRESH_INTERVAL_MS);
+
   // Fire housekeeping once on startup (matches old behavior where lastX=0 triggered first cycle)
   // Chain unclaimed sweep after settlement to avoid overlap via shared sweepRunning guard
   sweepPositionSettlements()
@@ -1259,6 +1290,7 @@ async function main() {
     .catch((err: any) => log.warn(`Settlement/claim sweep failed: ${err.message}`));
   auditAllAllocations({ isPaper: false, threshold: 1.0 }).catch((err: any) => log.warn(`Capital audit failed: ${err.message}`));
   sweepPreResolutionSells().catch((err: any) => log.warn(`Pre-resolution sweep failed: ${err.message}`));
+  sweepStaleMarkets().catch((err: any) => log.warn(`Market refresh sweep failed: ${err.message}`));
 
   // ─── Upgrade shutdown handler: now all resources exist ───
   process.removeAllListeners('SIGTERM');
@@ -1272,6 +1304,7 @@ async function main() {
     if (balanceTimer) clearInterval(balanceTimer);
     clearInterval(capitalAuditTimer);
     clearInterval(preResTimer);
+    clearInterval(marketRefreshTimer);
     stopPortfolioRefresh();
     await listener.close();
     // Wait for in-flight drain to complete before disconnecting DB
