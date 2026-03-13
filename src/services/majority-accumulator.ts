@@ -26,27 +26,29 @@ export function recordTraderBuy(proxyWallet: string, conditionId: string, outcom
   outcomes.set(outcome, stats);
 }
 
-/** Returns the majority outcome if detection threshold met, else null. */
+/** Returns the majority outcome (by USD volume) if detection threshold met, else null. */
 export function getMajoritySide(
   proxyWallet: string, conditionId: string,
   minTrades: number, minRatio: number,
-): { outcome: string; ratio: number; totalTrades: number } | null {
+): { outcome: string; ratio: number; totalTrades: number; totalUsd: number } | null {
   const outcomes = accumulator.get(`${proxyWallet}:${conditionId}`);
   if (!outcomes) return null;
-  let total = 0;
-  let maxCount = 0;
+  let totalCount = 0;
+  let totalUsd = 0;
+  let maxUsd = 0;
   let majorityOutcome = '';
   for (const [outcome, stats] of outcomes) {
-    total += stats.count;
-    if (stats.count > maxCount) {
-      maxCount = stats.count;
+    totalCount += stats.count;
+    totalUsd += stats.totalUsd;
+    if (stats.totalUsd > maxUsd) {
+      maxUsd = stats.totalUsd;
       majorityOutcome = outcome;
     }
   }
-  if (total < minTrades) return null;
-  const ratio = maxCount / total;
+  if (totalCount < minTrades) return null;       // timing gate: still count-based
+  const ratio = totalUsd > 0 ? maxUsd / totalUsd : 0;
   if (ratio < minRatio) return null;
-  return { outcome: majorityOutcome, ratio, totalTrades: total };
+  return { outcome: majorityOutcome, ratio, totalTrades: totalCount, totalUsd };
 }
 
 /** Prune stale entries. Default 25h — covers daily-timeframe markets. */

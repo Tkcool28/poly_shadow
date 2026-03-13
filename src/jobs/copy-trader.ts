@@ -390,11 +390,11 @@ async function phaseA(
     }
     if (trade.outcome !== majority.outcome) {
       await createSkippedRecord(trade,
-        `majority is "${majority.outcome}" (${(majority.ratio * 100).toFixed(0)}% of ${majority.totalTrades} trades) — skipping minority "${trade.outcome}"`,
+        `majority is "${majority.outcome}" (${(majority.ratio * 100).toFixed(0)}% of $${majority.totalUsd.toFixed(0)}, ${majority.totalTrades} trades) — skipping minority "${trade.outcome}"`,
         allocation.id, isPaper);
       return null;
     }
-    log.debug(`Majority confirmed: copying "${trade.outcome}" (${(majority.ratio * 100).toFixed(0)}% of ${majority.totalTrades} trades)`, {
+    log.debug(`Majority confirmed: copying "${trade.outcome}" (${(majority.ratio * 100).toFixed(0)}% of $${majority.totalUsd.toFixed(0)}, ${majority.totalTrades} trades)`, {
       conditionId: trade.conditionId, proxyWallet: trade.proxyWallet,
     });
   }
