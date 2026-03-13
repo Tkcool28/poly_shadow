@@ -379,6 +379,7 @@ async function phaseA(
   }
 
   // ── Majority gate (opt-in per allocation) ──
+  let majorityTotalUsd: number | null = null;
   if (trade.side === 'BUY' && allocation.majorityOnlyMode) {
     const majority = getMajoritySide(
       trade.proxyWallet, trade.conditionId,
@@ -394,6 +395,7 @@ async function phaseA(
         allocation.id, isPaper);
       return null;
     }
+    majorityTotalUsd = majority.totalUsd;
     log.debug(`Majority confirmed: copying "${trade.outcome}" (${(majority.ratio * 100).toFixed(0)}% of $${majority.totalUsd.toFixed(0)}, ${majority.totalTrades} trades)`, {
       conditionId: trade.conditionId, proxyWallet: trade.proxyWallet,
     });
@@ -437,7 +439,14 @@ async function phaseA(
       return null;
     }
 
-    traderTradeUsd = trade.size * trade.price;
+    const fragmentUsd = trade.size * trade.price;
+    traderTradeUsd = majorityTotalUsd ?? fragmentUsd;
+    if (majorityTotalUsd != null && majorityTotalUsd !== fragmentUsd) {
+      log.debug('Sizing from accumulator aggregate', {
+        accumulatorUsd: majorityTotalUsd.toFixed(2),
+        fragmentUsd: fragmentUsd.toFixed(2),
+      });
+    }
 
     if (trade.compositeScore !== null && trade.compositeScore < config.MIN_COMPOSITE_SCORE) {
       await createSkippedRecord(trade, `composite score ${trade.compositeScore.toFixed(4)} below minimum ${config.MIN_COMPOSITE_SCORE}`, allocation.id, isPaper);

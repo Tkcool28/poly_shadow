@@ -190,6 +190,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   }
 
   // ── Majority gate (opt-in per allocation) ──
+  let majorityTotalUsd: number | null = null;
   if (trade.side === 'BUY' && allocation.majorityOnlyMode) {
     const majority = getMajoritySide(
       trade.proxyWallet, trade.conditionId,
@@ -205,6 +206,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
         allocation.id, isPaper);
       return;
     }
+    majorityTotalUsd = majority.totalUsd;
   }
 
   // Skip live BUYs when wallet balance is insufficient — SELLs and paper allocations continue normally
@@ -260,7 +262,14 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
       return;
     }
 
-    traderTradeUsd = trade.size * trade.price;
+    const fragmentUsd = trade.size * trade.price;
+    traderTradeUsd = majorityTotalUsd ?? fragmentUsd;
+    if (majorityTotalUsd != null && majorityTotalUsd !== fragmentUsd) {
+      log.debug('Sizing from accumulator aggregate', {
+        accumulatorUsd: majorityTotalUsd.toFixed(2),
+        fragmentUsd: fragmentUsd.toFixed(2),
+      });
+    }
 
     // ─── Quality gates ───
     if (trade.compositeScore !== null && trade.compositeScore < config.MIN_COMPOSITE_SCORE) {
