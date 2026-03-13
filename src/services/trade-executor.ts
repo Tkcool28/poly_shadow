@@ -402,6 +402,20 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
         };
       }
 
+      // SELL balance/allowance — actionable: likely NegRisk approval gap or tokenId mismatch
+      if (side === 'SELL' && (errorDetail.includes('not enough balance') || errorDetail.includes('not enough allowance'))) {
+        log.warn('SELL balance/allowance failure', {
+          httpStatus, side, tokenId: tokenId.slice(0, 20), amount, negRisk,
+          hint: negRisk ? 'check NegRisk CTF Exchange approval (0xC5d563A3...)' : 'check on-chain balance',
+        });
+        return {
+          orderId: null, status: 'SKIPPED',
+          filledPrice: null, filledSize: null,
+          failReason: `SELL rejected (HTTP ${httpStatus}): ${errorDetail.slice(0, 150)}${negRisk ? ' [NegRisk — check approval]' : ''}`,
+          transactionHashes: [],
+        };
+      }
+
       log.warn('CLOB order rejected (HTTP error response)', {
         httpStatus, errorDetail: errorDetail.slice(0, 300),
         side, tokenId: tokenId.slice(0, 20), amount,
@@ -702,6 +716,31 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
         filledPrice: null,
         filledSize: null,
         failReason: 'market expired: orderbook does not exist',
+        transactionHashes: [],
+      };
+    }
+
+    // Circular JSON crash: CLOB client's errorHandling() calls JSON.stringify on
+    // axios response.config containing TLSSocket circular refs. Original error is
+    // a transient network failure. Retry once, then SKIPPED (not FAILED).
+    if (msg.includes('Converting circular structure to JSON')) {
+      if (!params._isRetry) {
+        log.warn('CLOB client circular JSON crash (transient network error), retrying in 1s...', {
+          tokenId: tokenId.slice(0, 20), side, amount,
+        });
+        await new Promise((r) => setTimeout(r, 1000));
+        try {
+          return await executeMarketOrder({ ...params, _isRetry: true });
+        } catch {
+          // Retry also failed — fall through to SKIPPED below
+        }
+      }
+      return {
+        orderId: null,
+        status: 'SKIPPED',
+        filledPrice: null,
+        filledSize: null,
+        failReason: 'transient network error (CLOB client circular JSON)',
         transactionHashes: [],
       };
     }
