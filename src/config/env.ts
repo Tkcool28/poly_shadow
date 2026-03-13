@@ -98,6 +98,11 @@ const envSchema = z.object({
   // Anti-cycle: per-token cool-down after a SELL fill to prevent market-making spread loss
   TOKEN_SELL_COOLDOWN_MS: z.coerce.number().min(0).default(60000), // 60s — 0 = disabled
 
+  // Majority Side Accumulator: wait for enough trader BUYs before copying
+  MAJORITY_MIN_TRADES: z.coerce.number().min(1).max(50).default(7),        // min BUY signals before majority detection
+  MAJORITY_MIN_RATIO: z.coerce.number().min(0.50).max(0.95).default(0.55), // min fraction of BUYs on one side
+  MAJORITY_PRUNE_AGE_MS: z.coerce.number().min(3_600_000).default(90_000_000), // 25h — covers daily markets
+
   // Midpoint WS cache (eliminates REST getMidpoint() in stale-signal guard)
   MIDPOINT_CACHE_ENABLED: z
     .string()

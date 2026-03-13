@@ -8,6 +8,7 @@ import { addToPool } from './order-pool';
 import { resolveMarkets } from './market-resolver';
 import { computeSellCostBasis } from '../lib/cost-basis';
 import { scheduleDelayedOrderPoll, scheduleGtcFallbackPoll } from './delayed-order-poller';
+import { recordTraderBuy, getMajoritySide } from './majority-accumulator';
 
 const log = createJobLogger('copy-trade-worker');
 
@@ -133,6 +134,11 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     return;
   }
 
+  // ── Majority accumulator: record every trader BUY (before any per-allocation filters) ──
+  if (trade.side === 'BUY') {
+    recordTraderBuy(trade.proxyWallet, trade.conditionId, trade.outcome, trade.size * trade.price);
+  }
+
   // ─── Per-allocation min buy price filter ───
   if (allocation.minBuyPrice != null && trade.side === 'BUY' && trade.price < allocation.minBuyPrice - 0.001) {
     await createSkippedRecord(trade, `price ${trade.price} below minBuyPrice ${allocation.minBuyPrice}`, allocation.id, isPaper);
@@ -179,6 +185,24 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     } else {
       // Fail-closed: title unavailable — cannot verify exclusion
       await createSkippedRecord(trade, 'title unavailable (fail-closed for exclude filter)', allocation.id, isPaper);
+      return;
+    }
+  }
+
+  // ── Majority gate (opt-in per allocation) ──
+  if (trade.side === 'BUY' && allocation.majorityOnlyMode) {
+    const majority = getMajoritySide(
+      trade.proxyWallet, trade.conditionId,
+      config.MAJORITY_MIN_TRADES, config.MAJORITY_MIN_RATIO,
+    );
+    if (!majority) {
+      await createSkippedRecord(trade, 'majority accumulating: insufficient signal', allocation.id, isPaper);
+      return;
+    }
+    if (trade.outcome !== majority.outcome) {
+      await createSkippedRecord(trade,
+        `majority is "${majority.outcome}" (${(majority.ratio * 100).toFixed(0)}% of ${majority.totalTrades} trades) — skipping minority "${trade.outcome}"`,
+        allocation.id, isPaper);
       return;
     }
   }

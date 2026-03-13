@@ -33,6 +33,7 @@ import { auditAllAllocations, auditPhantomPositions, cleanupPhantomPositions, ch
 import { initMidpointCache, closeMidpointCache, ensureSubscribed } from '../services/midpoint-cache';
 import { getOrCreateMutex } from '../lib/allocation-mutex';
 import { PgListener } from '../lib/pg-listen';
+import { recordTraderBuy, getMajoritySide, pruneAccumulator, seedAccumulator } from '../services/majority-accumulator';
 
 const JOB_NAME = 'copy-trader';
 const log = createJobLogger(JOB_NAME);
@@ -259,6 +260,8 @@ async function buildDrainCache(
   };
 }
 
+let pruneCounter = 0;
+
 // ─── PhaseA result ───
 
 interface PhaseAResult {
@@ -289,7 +292,8 @@ async function phaseA(
   trade: DetectedTradeRow,
   allocation: { id: string; isPaper: boolean; currentCapital: number;
     copyTradePercent: number | null; maxPositionUsd: number | null; maxPredictionPositionUsd: number | null;
-    minBuyPrice: number | null; excludeEventSlugPatterns: string | null; excludeTitlePatterns: string | null },
+    minBuyPrice: number | null; excludeEventSlugPatterns: string | null; excludeTitlePatterns: string | null;
+    majorityOnlyMode: boolean },
   cache: DrainCache,
   drainStartMs: number,
 ): Promise<PhaseAResult | null> {
@@ -331,6 +335,11 @@ async function phaseA(
     }
   }
 
+  // ── Majority accumulator: record every trader BUY (before per-allocation sizing/exclusion filters) ──
+  if (trade.side === 'BUY') {
+    recordTraderBuy(trade.proxyWallet, trade.conditionId, trade.outcome, trade.size * trade.price);
+  }
+
   // Per-allocation min buy price filter
   if (allocation.minBuyPrice != null && trade.side === 'BUY' && trade.price < allocation.minBuyPrice - 0.001) {
     await createSkippedRecord(trade, `price ${trade.price} below minBuyPrice ${allocation.minBuyPrice}`, allocation.id, isPaper);
@@ -367,6 +376,27 @@ async function phaseA(
       await createSkippedRecord(trade, 'title unavailable (fail-closed for exclude filter)', allocation.id, isPaper);
       return null;
     }
+  }
+
+  // ── Majority gate (opt-in per allocation) ──
+  if (trade.side === 'BUY' && allocation.majorityOnlyMode) {
+    const majority = getMajoritySide(
+      trade.proxyWallet, trade.conditionId,
+      config.MAJORITY_MIN_TRADES, config.MAJORITY_MIN_RATIO,
+    );
+    if (!majority) {
+      await createSkippedRecord(trade, 'majority accumulating: insufficient signal', allocation.id, isPaper);
+      return null;
+    }
+    if (trade.outcome !== majority.outcome) {
+      await createSkippedRecord(trade,
+        `majority is "${majority.outcome}" (${(majority.ratio * 100).toFixed(0)}% of ${majority.totalTrades} trades) — skipping minority "${trade.outcome}"`,
+        allocation.id, isPaper);
+      return null;
+    }
+    log.debug(`Majority confirmed: copying "${trade.outcome}" (${(majority.ratio * 100).toFixed(0)}% of ${majority.totalTrades} trades)`, {
+      conditionId: trade.conditionId, proxyWallet: trade.proxyWallet,
+    });
   }
 
   if (trade.side === 'BUY' && isInSellCooldown(allocation.id, trade.asset)) {
@@ -850,6 +880,7 @@ async function drainParallel(
             minBuyPrice: allocation.minBuyPrice,
             excludeEventSlugPatterns: allocation.excludeEventSlugPatterns,
             excludeTitlePatterns: allocation.excludeTitlePatterns,
+            majorityOnlyMode: allocation.majorityOnlyMode,
           }, drainCache, drainStartMs),
         );
         if (result) {
@@ -1153,6 +1184,9 @@ async function main() {
 
       // Sweep pool: burn expired FIFO entries (fast, trade-related)
       await sweepPool();
+
+      // Periodic pruning of stale majority accumulator entries
+      if (++pruneCounter % 100 === 0) pruneAccumulator(config.MAJORITY_PRUNE_AGE_MS);
     } catch (err: any) {
       result = 'error';
       errorMessage = err.message?.slice(0, 500);
@@ -1167,6 +1201,18 @@ async function main() {
         mode: parallelDrainEnabled ? 'parallel' : 'sequential',
       });
     }
+  }
+
+  // Seed majority accumulator from recent DetectedTrades to survive restart
+  {
+    const seedCutoff = new Date(Date.now() - config.MAJORITY_PRUNE_AGE_MS);
+    const recentBuys = await prisma.detectedTrade.findMany({
+      where: { side: 'BUY', detectedAt: { gte: seedCutoff } },
+      select: { proxyWallet: true, conditionId: true, outcome: true, size: true, price: true },
+      orderBy: { detectedAt: 'asc' },
+    });
+    seedAccumulator(recentBuys);
+    log.info(`Majority accumulator seeded: ${recentBuys.length} recent BUYs`);
   }
 
   // Connect pg LISTEN for instant wake on DetectedTrade INSERT

@@ -321,6 +321,9 @@ model FollowAllocation {
   excludeEventSlugPatterns String?  // Comma-separated slug substrings to exclude (e.g. "5-minute")
   excludeTitlePatterns     String?  // Comma-separated title substrings to exclude BUY trades (checked against Market.question)
 
+  // Majority Side Accumulator: only copy majority side after enough signal
+  majorityOnlyMode         Boolean  @default(false) // true = accumulate trader BUYs per conditionId, only copy majority side
+
   // Per-allocation detection source override
   copyMakerFills        Boolean  @default(false) // true = also copy CHAIN_MAKER signals for this trader
 
