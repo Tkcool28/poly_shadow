@@ -58,6 +58,25 @@ export function recordSellFailure(allocationId: string, tokenId: string): void {
   sellFailedAt.set(sellCooldownKey(allocationId, tokenId), Date.now());
 }
 
+// ─── Per-token BUY failure cool-down: prevents rapid FAK retries on illiquid markets ───
+const buyFailedAt = new Map<string, number>();
+const BUY_FAILURE_COOLDOWN_MS = 30_000; // 30s — shorter than SELL (60s) since BUY signals are time-sensitive
+
+export function isInBuyFailureCooldown(allocationId: string, tokenId: string): boolean {
+  const key = sellCooldownKey(allocationId, tokenId);
+  const ts = buyFailedAt.get(key);
+  if (!ts) return false;
+  if (Date.now() - ts >= BUY_FAILURE_COOLDOWN_MS) {
+    buyFailedAt.delete(key);
+    return false;
+  }
+  return true;
+}
+
+export function recordBuyFailure(allocationId: string, tokenId: string): void {
+  buyFailedAt.set(sellCooldownKey(allocationId, tokenId), Date.now());
+}
+
 export interface DetectedTradeRow {
   id: string;
   proxyWallet: string;
@@ -115,8 +134,14 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   }
 
   // ─── Per-allocation min buy price filter ───
-  if (allocation.minBuyPrice != null && trade.side === 'BUY' && trade.price < allocation.minBuyPrice) {
+  if (allocation.minBuyPrice != null && trade.side === 'BUY' && trade.price < allocation.minBuyPrice - 0.001) {
     await createSkippedRecord(trade, `price ${trade.price} below minBuyPrice ${allocation.minBuyPrice}`, allocation.id, isPaper);
+    return;
+  }
+
+  // ─── Per-token BUY failure cool-down ───
+  if (trade.side === 'BUY' && isInBuyFailureCooldown(allocation.id, trade.asset)) {
+    await createSkippedRecord(trade, 'buy failure cooldown active', allocation.id, isPaper);
     return;
   }
 
@@ -636,6 +661,14 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   // Record SELL failure to prevent repeated attempts on dead/closed markets
   if (trade.side === 'SELL' && (result.status === 'SKIPPED' || result.status === 'FAILED')) {
     recordSellFailure(allocation.id, trade.asset);
+  }
+
+  // Record BUY failure to prevent FAK spam on illiquid markets
+  if (trade.side === 'BUY' && (result.status === 'SKIPPED' || result.status === 'FAILED')) {
+    const reason = result.failReason ?? '';
+    if (reason.includes('FAK unmatched') || reason.includes('FAK order') || reason.includes('not enough balance') || reason.includes('insufficient balance')) {
+      recordBuyFailure(allocation.id, trade.asset);
+    }
   }
 }
 

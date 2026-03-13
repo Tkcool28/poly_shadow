@@ -16,6 +16,7 @@ import type { ExecuteOrderResult } from '../services/trade-executor';
 import {
   processCopyTrade, isInSellCooldown, recordSellFill,
   isInSellFailureCooldown, recordSellFailure,
+  isInBuyFailureCooldown, recordBuyFailure,
   createSkippedRecord,
 } from '../services/copy-trade-worker';
 import type { DetectedTradeRow } from '../services/copy-trade-worker';
@@ -322,7 +323,7 @@ async function phaseA(
   }
 
   // Per-allocation min buy price filter
-  if (allocation.minBuyPrice != null && trade.side === 'BUY' && trade.price < allocation.minBuyPrice) {
+  if (allocation.minBuyPrice != null && trade.side === 'BUY' && trade.price < allocation.minBuyPrice - 0.001) {
     await createSkippedRecord(trade, `price ${trade.price} below minBuyPrice ${allocation.minBuyPrice}`, allocation.id, isPaper);
     return null;
   }
@@ -341,6 +342,11 @@ async function phaseA(
 
   if (trade.side === 'BUY' && isInSellCooldown(allocation.id, trade.asset)) {
     await createSkippedRecord(trade, 'token sell cool-down active', allocation.id, isPaper);
+    return null;
+  }
+
+  if (trade.side === 'BUY' && isInBuyFailureCooldown(allocation.id, trade.asset)) {
+    await createSkippedRecord(trade, 'buy failure cooldown active', allocation.id, isPaper);
     return null;
   }
 
@@ -680,6 +686,14 @@ async function batchSettle(
       // Record SELL failure to prevent repeated attempts on dead/closed markets
       if (res.side === 'SELL' && (result.status === 'SKIPPED' || result.status === 'FAILED')) {
         recordSellFailure(allocation.id, res.tokenId);
+      }
+
+      // Record BUY failure to prevent FAK spam on illiquid markets
+      if (res.side === 'BUY' && (result.status === 'SKIPPED' || result.status === 'FAILED')) {
+        const reason = result.failReason ?? '';
+        if (reason.includes('FAK unmatched') || reason.includes('FAK order') || reason.includes('not enough balance') || reason.includes('insufficient balance')) {
+          recordBuyFailure(allocation.id, res.tokenId);
+        }
       }
 
       // Per-trade log

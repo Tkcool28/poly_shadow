@@ -379,9 +379,17 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
 
     // Detect CLOB client error response (HTTP 4xx/5xx returns {error, status} instead of throwing)
     if (response?.error || (response?.status != null && typeof response.status === 'number' && response.status >= 400)) {
-      const errorDetail = typeof response.error === 'string'
-        ? response.error
-        : JSON.stringify(response.error ?? response)?.slice(0, 400) ?? 'unknown';
+      let errorDetail: string;
+      if (typeof response.error === 'string') {
+        errorDetail = response.error;
+      } else {
+        try {
+          const { error, status: s, orderID, errorMsg, success } = response;
+          errorDetail = JSON.stringify({ error: String(error), status: s, orderID, errorMsg, success }).slice(0, 400);
+        } catch {
+          errorDetail = String(response.error ?? response.errorMsg ?? 'unknown');
+        }
+      }
       const httpStatus = typeof response.status === 'number' ? response.status : 'unknown';
 
       if (errorDetail.includes('orderbook does not exist')) {

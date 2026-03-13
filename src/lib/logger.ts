@@ -18,7 +18,11 @@ export const logger = winston.createLogger({
         winston.format.colorize(),
         winston.format.printf(({ timestamp, level, message, service, job, ...rest }) => {
           const jobTag = job ? `[${job}]` : '';
-          const extra = Object.keys(rest).length ? ` ${JSON.stringify(rest)}` : '';
+          let extra = '';
+          if (Object.keys(rest).length) {
+            try { extra = ` ${JSON.stringify(rest)}`; }
+            catch { extra = ` [unserializable metadata]`; }
+          }
           return `${timestamp} ${level} ${jobTag} ${message}${extra}`;
         })
       ),
