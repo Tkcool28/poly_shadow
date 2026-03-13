@@ -137,6 +137,52 @@ async function doSweepPositionSettlements(): Promise<void> {
     }
   }
 
+  // ── Price-based resolution: Gamma API lag workaround ────────────────────────
+  // Gamma sometimes returns terminal outcomePrices (e.g. ["0.9995","0.0005"])
+  // but keeps closed=false for hours. Detect these by checking if maxPrice >= 0.99
+  // AND endDate has passed (with a short 5-min grace to avoid premature settlement).
+  if (freshMarkets.length > 0) {
+    const unresolvedWithPrices = freshMarkets.filter(
+      m => !m.closed && m.outcomePrices && !resolvedMarkets.has(m.conditionId)
+    );
+    if (unresolvedWithPrices.length > 0) {
+      const conditionIds = unresolvedWithPrices.map(m => m.conditionId);
+      const endDates = await prisma.market.findMany({
+        where: { conditionId: { in: conditionIds } },
+        select: { conditionId: true, endDate: true },
+      });
+      const endDateMap = new Map(endDates.map(m => [m.conditionId, m.endDate]));
+      const priceGraceMs = 300_000; // 5 minutes after endDate
+      const now = Date.now();
+
+      for (const market of unresolvedWithPrices) {
+        try {
+          const prices = JSON.parse(market.outcomePrices!).map(Number);
+          const maxPrice = Math.max(...prices);
+          if (maxPrice < 0.99) continue;
+
+          const endDate = endDateMap.get(market.conditionId);
+          if (!endDate || endDate.getTime() + priceGraceMs > now) continue;
+
+          resolvedMarkets.set(market.conditionId, {
+            outcomes: market.outcomes ?? '[]',
+            outcomePrices: market.outcomePrices!,
+          });
+          // Also mark closed in DB to prevent re-checking
+          await prisma.market.updateMany({
+            where: { conditionId: market.conditionId },
+            data: { closed: true },
+          });
+          log.warn('Settlement: price-based resolution (Gamma closed=false lag)', {
+            conditionId: market.conditionId,
+            maxPrice,
+            endDate: endDate.toISOString(),
+          });
+        } catch { /* parse failure — skip */ }
+      }
+    }
+  }
+
   // NegRisk markets: on-chain resolution (Gamma returns wrong data for these)
   if (negRiskIds.length > 0) {
     const negRiskMarkets = marketRows.filter(m => negRiskSet.has(m.conditionId));
