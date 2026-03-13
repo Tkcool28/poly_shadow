@@ -157,6 +157,10 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
         await createSkippedRecord(trade, `eventSlug "${eventSlug}" matches exclude pattern`, allocation.id, isPaper);
         return;
       }
+    } else {
+      // Fail-closed: eventSlug unavailable — cannot verify exclusion
+      await createSkippedRecord(trade, 'eventSlug unavailable (fail-closed for exclude filter)', allocation.id, isPaper);
+      return;
     }
   }
 
@@ -172,6 +176,10 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
         await createSkippedRecord(trade, `title matches exclude pattern`, allocation.id, isPaper);
         return;
       }
+    } else {
+      // Fail-closed: title unavailable — cannot verify exclusion
+      await createSkippedRecord(trade, 'title unavailable (fail-closed for exclude filter)', allocation.id, isPaper);
+      return;
     }
   }
 

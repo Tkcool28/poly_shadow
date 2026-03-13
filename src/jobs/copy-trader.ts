@@ -346,6 +346,10 @@ async function phaseA(
         await createSkippedRecord(trade, `eventSlug "${eventSlug}" matches exclude pattern`, allocation.id, isPaper);
         return null;
       }
+    } else {
+      // Fail-closed: eventSlug unavailable from trade record and Market table — cannot verify exclusion
+      await createSkippedRecord(trade, 'eventSlug unavailable (fail-closed for exclude filter)', allocation.id, isPaper);
+      return null;
     }
   }
 
@@ -358,6 +362,10 @@ async function phaseA(
         await createSkippedRecord(trade, `title matches exclude pattern`, allocation.id, isPaper);
         return null;
       }
+    } else {
+      // Fail-closed: title unavailable — cannot verify exclusion
+      await createSkippedRecord(trade, 'title unavailable (fail-closed for exclude filter)', allocation.id, isPaper);
+      return null;
     }
   }
 

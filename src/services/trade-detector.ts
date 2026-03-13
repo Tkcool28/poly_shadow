@@ -132,12 +132,15 @@ export function getLiveAllocationWallets(): Set<string> {
 // Pattern matches arb-executor.ts:39
 const readOnlyClobClient = new ClobClient('https://clob.polymarket.com', 137);
 
-// In-memory cache: tokenId → { conditionId, outcome }
-const tokenMetadataCache = new Map<string, { conditionId: string; outcome: string }>();
+// In-memory cache: tokenId → { conditionId, outcome, eventSlug, question }
+const tokenMetadataCache = new Map<string, {
+  conditionId: string; outcome: string;
+  eventSlug: string | null; question: string | null;
+}>();
 
 async function resolveTokenMetadata(
   tokenId: string,
-): Promise<{ conditionId: string; outcome: string }> {
+): Promise<{ conditionId: string; outcome: string; eventSlug: string | null; question: string | null }> {
   // 1. In-memory cache
   const cached = tokenMetadataCache.get(tokenId);
   if (cached) return cached;
@@ -145,16 +148,36 @@ async function resolveTokenMetadata(
   // 2. DB: check DetectedTrade table for prior records with this tokenId
   const existing = await prisma.detectedTrade.findFirst({
     where: { asset: tokenId },
-    select: { conditionId: true, outcome: true },
+    select: { conditionId: true, outcome: true, eventSlug: true, title: true },
   });
   if (existing) {
-    const result = { conditionId: existing.conditionId, outcome: existing.outcome };
-    tokenMetadataCache.set(tokenId, result);
+    let eventSlug = existing.eventSlug;
+    let question = existing.title;
+
+    // If this record lacks metadata (CHAIN-source), check siblings with same conditionId
+    // that came from POLL source and DO have eventSlug populated
+    if (eventSlug == null) {
+      const sibling = await prisma.detectedTrade.findFirst({
+        where: { conditionId: existing.conditionId, eventSlug: { not: null } },
+        select: { eventSlug: true, title: true },
+      });
+      if (sibling) {
+        eventSlug = sibling.eventSlug;
+        question = sibling.title ?? question;
+      }
+    }
+
+    const result = { conditionId: existing.conditionId, outcome: existing.outcome, eventSlug, question };
+    // Only cache if metadata is populated; otherwise re-check on next call
+    if (eventSlug != null) {
+      tokenMetadataCache.set(tokenId, result);
+    }
     return result;
   }
 
   // 3. CLOB API fallback: getOrderBook(tokenId).market = conditionId
   //    getMarket(conditionId).tokens[].outcome for outcome name
+  //    Also extract market_slug (≈ eventSlug) and question (≈ title)
   const orderBook = await readOnlyClobClient.getOrderBook(tokenId);
   const conditionId = orderBook.market;
   if (!conditionId) {
@@ -164,8 +187,11 @@ async function resolveTokenMetadata(
   const tokens: Array<{ token_id: string; outcome: string }> = market?.tokens ?? [];
   const tokenEntry = tokens.find((t) => t.token_id === tokenId);
   const outcome = tokenEntry?.outcome ?? 'Unknown';
+  // CLOB API returns market_slug (not event_slug) — verified via curl
+  const eventSlug: string | null = (market as any)?.market_slug ?? null;
+  const question: string | null = (market as any)?.question ?? null;
 
-  const result = { conditionId, outcome };
+  const result = { conditionId, outcome, eventSlug, question };
   tokenMetadataCache.set(tokenId, result);
   return result;
 }
@@ -179,7 +205,10 @@ export async function createDetectedTradeFromChain(
   data: ChainTradeData,
 ): Promise<boolean> {
   const normalizedWallet = data.proxyWallet.toLowerCase();
-  const { conditionId, outcome } = await resolveTokenMetadata(data.tokenId);
+  const { conditionId, outcome, eventSlug, question } = await resolveTokenMetadata(data.tokenId);
+  if (eventSlug == null) {
+    logger.debug(`Chain trade ${data.transactionHash?.slice(0, 10)}: eventSlug not resolved for conditionId ${conditionId.slice(0, 16)}`);
+  }
   const compositeScore = scoreCache.get(normalizedWallet) ?? null;
   const userName = userNameCache.get(normalizedWallet) ?? null;
   const now = Math.floor(Date.now() / 1000);
@@ -209,8 +238,8 @@ export async function createDetectedTradeFromChain(
         size: data.size,
         price: data.price,
         outcome,
-        title: null,
-        eventSlug: null,
+        title: question ?? null,
+        eventSlug: eventSlug ?? null,
         transactionHash: data.transactionHash,
         timestamp,
         realTimestamp,
