@@ -99,8 +99,8 @@ const envSchema = z.object({
   TOKEN_SELL_COOLDOWN_MS: z.coerce.number().min(0).default(60000), // 60s — 0 = disabled
 
   // Majority Side Accumulator: wait for enough trader BUYs before copying
-  MAJORITY_MIN_TRADES: z.coerce.number().min(1).max(50).default(7),        // min BUY signals before majority detection
-  MAJORITY_MIN_RATIO: z.coerce.number().min(0.50).max(0.95).default(0.55), // min fraction of BUYs on one side
+  MAJORITY_MIN_TRADES: z.coerce.number().min(1).max(50).default(10),       // min BUY signals before majority detection
+  MAJORITY_MIN_RATIO: z.coerce.number().min(0.50).max(0.95).default(0.50), // min fraction of BUYs on one side
   MAJORITY_PRUNE_AGE_MS: z.coerce.number().min(3_600_000).default(90_000_000), // 25h — covers daily markets
 
   // Midpoint WS cache (eliminates REST getMidpoint() in stale-signal guard)
@@ -263,7 +263,7 @@ const envSchema = z.object({
     .default('true')
     .transform((v) => v === 'true'),
   SCALP_INITIAL_CAPITAL_USD: z.coerce.number().min(5).default(100),
-  SCALP_POSITION_SIZE_USD: z.coerce.number().min(5).max(50000).default(5),
+  SCALP_POSITION_SIZE_USD: z.coerce.number().min(1).max(50000).default(5),
   SCALP_MAX_DAILY_LOSS_USD: z.coerce.number().min(1).default(30),
   SCALP_MIN_EDGE_CENTS: z.coerce.number().min(1).default(5),
   SCALP_STOP_LOSS_CENTS: z.coerce.number().min(1).default(15),
@@ -290,6 +290,32 @@ const envSchema = z.object({
     .default('true')
     .transform((v) => v === 'true'),
   SCALP_HLTV_RECONNECT_MAX_MS: z.coerce.number().default(30000),
+
+  // Scalp observer + improved strategy
+  SCALP_OBSERVER_MODE: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+  SCALP_OBSERVER_LOG_ALL_TRADES: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+  SCALP_DYNAMIC_EDGE: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+  SCALP_ENTRY_DELAY_MS: z.coerce.number().default(5000),
+  SCALP_MIN_NET_IMBALANCE: z.coerce.number().default(0.30),
+  SCALP_TRAILING_STOP_CENTS: z.coerce.number().default(5),
+  SCALP_STOP_LOSS_ENABLED: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+  SCALP_CONFIDENCE_SIZING: z
+    .string()
+    .default('false')
+    .transform((v) => v === 'true'),
+  SCALP_MAX_POSITION_SIZE_USD: z.coerce.number().default(10),
 
   // Scalp paper trading (separate from copy-trade paper config)
   SCALP_PAPER_FEE_RATE: z.coerce.number().default(0.0175),      // Sports market fee rate
