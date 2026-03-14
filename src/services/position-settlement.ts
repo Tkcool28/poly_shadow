@@ -32,7 +32,7 @@ async function markConditionsClaimed(conditionIds: string[]): Promise<void> {
         AND dt."conditionId" = ${conditionId}
         AND ct."isPaper" = false
         AND ct.status = 'SETTLED'
-        AND ct."settlementPrice" BETWEEN 0.9999 AND 1.0001
+        AND ct."settlementPrice" BETWEEN 0.95 AND 1.0001
         AND ct."claimedAt" IS NULL
     `;
   }
@@ -436,7 +436,7 @@ async function doSweepPositionSettlements(): Promise<void> {
 
     // Collect for on-chain claiming after all DB work is done
     // Use range check to handle float precision (e.g. 0.9999999 from Gamma API)
-    if (!pos.isPaper && settlementPrice >= 0.9999 && settlementPrice <= 1.0001) {
+    if (!pos.isPaper && settlementPrice >= 0.95 && settlementPrice <= 1.0001) {
       claimablePositions.push({
         conditionId: meta.conditionId,
         outcomeIndex,
@@ -507,7 +507,7 @@ async function doSweepUnclaimedSettledPositions(): Promise<void> {
     JOIN "DetectedTrade" dt ON ct."detectedTradeId" = dt.id
     WHERE ct."isPaper" = false
       AND ct.status = 'SETTLED'
-      AND ct."settlementPrice" BETWEEN 0.9999 AND 1.0001
+      AND ct."settlementPrice" BETWEEN 0.95 AND 1.0001
       AND ct."claimedAt" IS NULL
     GROUP BY dt."conditionId", dt.outcome
     HAVING SUM(CASE WHEN ct.side='BUY' THEN COALESCE(ct."filledSize", ct."requestedAmount" / NULLIF(ct."filledPrice", 0)) ELSE 0 END) >

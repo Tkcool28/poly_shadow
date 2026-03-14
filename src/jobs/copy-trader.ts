@@ -423,6 +423,21 @@ async function phaseA(
       return null;
     }
 
+    // Skip SELL if position is already settled — tokens redeemed on-chain, CLOB will reject
+    const settledRecord = await prisma.copyTrade.findFirst({
+      where: {
+        tokenId: trade.asset,
+        followAllocationId: allocation.id,
+        isPaper,
+        status: 'SETTLED',
+      },
+      select: { id: true },
+    });
+    if (settledRecord) {
+      await createSkippedRecord(trade, 'position already settled (tokens redeemed)', allocation.id, isPaper);
+      return null;
+    }
+
     // cache.getPosition() rounds sub-penny amounts (< 0.01 shares) to 0 — these are
     // unsellable on CLOB (2dp floor → 0) and settle at market resolution.
     const heldShares = cache.getPosition(trade.asset, allocation.id, isPaper).netShares;
