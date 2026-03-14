@@ -101,6 +101,10 @@ const envSchema = z.object({
   // Majority Side Accumulator: wait for enough trader BUYs before copying
   MAJORITY_MIN_TRADES: z.coerce.number().min(1).max(50).default(10),       // min BUY signals before majority detection
   MAJORITY_MIN_RATIO: z.coerce.number().min(0.50).max(0.95).default(0.50), // min fraction of BUYs on one side
+  COMMITTED_SIDE_LOCK: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'), // once FILLED on one outcome, block opposite-side BUYs
   MAJORITY_PRUNE_AGE_MS: z.coerce.number().min(3_600_000).default(90_000_000), // 25h — covers daily markets
 
   // Midpoint WS cache (eliminates REST getMidpoint() in stale-signal guard)

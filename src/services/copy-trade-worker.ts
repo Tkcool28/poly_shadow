@@ -222,6 +222,17 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     return;
   }
 
+  // ─── Committed side lock: once FILLED on one outcome, block opposite-side BUYs ───
+  if (trade.side === 'BUY' && config.COMMITTED_SIDE_LOCK) {
+    const oppositePos = await getOppositePosition(trade.conditionId, trade.asset, allocation.id, isPaper);
+    if (oppositePos.netUsd >= 0.01) {
+      await createSkippedRecord(trade,
+        `committed side lock: $${oppositePos.netUsd.toFixed(2)} already deployed on opposite outcome`,
+        allocation.id, isPaper);
+      return;
+    }
+  }
+
   // ─── Per-token cool-down: prevent rapid re-BUY after SELL (market-making cycle guard) ───
   if (trade.side === 'BUY' && isInSellCooldown(allocation.id, trade.asset)) {
     await createSkippedRecord(trade, 'token sell cool-down active', allocation.id, isPaper);

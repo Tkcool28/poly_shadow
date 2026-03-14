@@ -401,6 +401,20 @@ async function phaseA(
     });
   }
 
+  // ── Committed side lock: once FILLED on one outcome, block opposite-side BUYs ──
+  if (trade.side === 'BUY' && config.COMMITTED_SIDE_LOCK) {
+    const oppositeTokenId = cache.getOppositeTokenId(trade.conditionId, trade.asset);
+    if (oppositeTokenId) {
+      const oppositePos = cache.getPosition(oppositeTokenId, allocation.id, isPaper);
+      if (oppositePos.netUsd >= 0.01) {
+        await createSkippedRecord(trade,
+          `committed side lock: $${oppositePos.netUsd.toFixed(2)} already deployed on opposite outcome`,
+          allocation.id, isPaper);
+        return null;
+      }
+    }
+  }
+
   if (trade.side === 'BUY' && isInSellCooldown(allocation.id, trade.asset)) {
     await createSkippedRecord(trade, 'token sell cool-down active', allocation.id, isPaper);
     return null;
