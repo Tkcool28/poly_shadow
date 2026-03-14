@@ -26,6 +26,15 @@ export interface BotSignal {
   timestamp: Date;
 }
 
+export interface EnhancedBotSignal extends BotSignal {
+  buyVolumeUsd: number;
+  sellVolumeUsd: number;
+  netImbalance: number;        // (buy-sell)/(buy+sell), -1 to 1
+  confidenceScore: number;     // 0.0 to 1.0 composite
+  volumeSpike: number;         // current volume / trailing average
+  pricePersisted: boolean;     // did price hold after ENTRY_DELAY_MS?
+}
+
 export interface ScalpSignal {
   matchId: string;
   game: string;
@@ -42,6 +51,7 @@ export interface ScalpSignal {
   currentAsk: number;
   estimatedEdge: number;
   timestamp: Date;
+  confidenceScore?: number;
 }
 
 export interface GameFeed {

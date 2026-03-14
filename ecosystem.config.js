@@ -83,5 +83,17 @@ module.exports = {
         NODE_ENV: 'production',
       },
     },
+    {
+      name: 'scalp-observer',
+      script: './node_modules/.bin/tsx',
+      args: 'src/jobs/scalp-observer.ts',
+      autorestart: true,
+      watch: false,
+      max_restarts: 50,
+      exp_backoff_restart_delay: 1000,
+      env: {
+        NODE_ENV: 'production',
+      },
+    },
   ],
 };

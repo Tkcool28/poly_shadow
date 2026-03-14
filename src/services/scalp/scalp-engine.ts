@@ -7,7 +7,7 @@ import {
   getMarketByTokenId,
 } from './scalp-market-discovery';
 import { ScalpExitManager } from './scalp-exit-manager';
-import { estimateSeriesFairValue, type GameEvent, type BotSignal, type ScalpSignal } from './scalp-types';
+import { estimateSeriesFairValue, type GameEvent, type BotSignal, type EnhancedBotSignal, type ScalpSignal } from './scalp-types';
 import { ScalpCycleStatus } from '../../../prisma/generated/prisma/client/enums';
 import type { ScalpMarketWatchModel as ScalpMarketWatch } from '../../../prisma/generated/prisma/client/models/ScalpMarketWatch';
 
@@ -111,7 +111,7 @@ export class ScalpEngine {
    * Handle a bot detection signal (fast bot bought on trade stream).
    * FOLLOW MODE: bot buys token A → we also buy token A.
    */
-  async onBotSignal(signal: BotSignal): Promise<void> {
+  async onBotSignal(signal: BotSignal | EnhancedBotSignal): Promise<void> {
     const market = getMarketByTokenId(signal.tokenId);
     if (!market) return;
 
@@ -141,9 +141,38 @@ export class ScalpEngine {
       return;
     }
 
-    // Edge: assume bot knows the result, fair value ~15¢ higher
-    const estimatedFairValue = Math.min(currentAsk + 0.15, 0.95);
-    const estimatedEdge = (estimatedFairValue - currentAsk) * 100;
+    // Reject high-price entries: risk/reward is terrible (e.g., buy at 0.80 → lose 80c if wrong, gain 20c if right)
+    if (currentAsk > 0.75) {
+      log.debug('Entry price too high, skipping', { slug: market.slug, currentAsk: currentAsk.toFixed(4) });
+      processingLock.delete(lockKey);
+      return;
+    }
+
+    // Dynamic edge from order flow analysis, or legacy hardcoded 15c
+    let estimatedFairValue: number;
+    let estimatedEdge: number;
+
+    if (config.SCALP_DYNAMIC_EDGE && 'netImbalance' in signal) {
+      const enhanced = signal as EnhancedBotSignal;
+      // Reduced from 0.10 to 0.05: avg edge was 8c but avg max move is only 7.1c, making targets unreachable
+      const imbalanceEdge = Math.max(enhanced.netImbalance, 0) * 0.05;
+      const magnitudeEdge = Math.min(enhanced.totalUsd / 1000, 0.05);
+      const rawEdge = (imbalanceEdge + magnitudeEdge) * enhanced.confidenceScore;
+      estimatedFairValue = Math.min(currentAsk + rawEdge, 0.95);
+      estimatedEdge = rawEdge * 100;
+    } else if (config.SCALP_DYNAMIC_EDGE) {
+      // SCALP_DYNAMIC_EDGE is on but signal lacks netImbalance (legacy BotSignal).
+      // Reject: the hardcoded 15c fallback lets every signal through indiscriminately.
+      log.debug('Rejecting legacy signal without netImbalance (SCALP_DYNAMIC_EDGE=true)', {
+        slug: market.slug,
+        tokenId: signal.tokenId.slice(0, 20),
+      });
+      processingLock.delete(lockKey);
+      return;
+    } else {
+      estimatedFairValue = Math.min(currentAsk + 0.15, 0.95);
+      estimatedEdge = (estimatedFairValue - currentAsk) * 100;
+    }
 
     await this.evaluateAndEnter({
       matchId: `bot-${signal.tokenId.slice(0, 16)}-${Date.now()}`,
@@ -165,13 +194,15 @@ export class ScalpEngine {
       currentAsk,
       estimatedEdge,
       timestamp: signal.timestamp,
+      confidenceScore: 'confidenceScore' in signal ? (signal as EnhancedBotSignal).confidenceScore : undefined,
     });
   }
 
   /**
    * Core entry logic: check edge, check capital, execute order.
    */
-  private async evaluateAndEnter(signal: ScalpSignal): Promise<void> {
+  private async evaluateAndEnter(inputSignal: ScalpSignal): Promise<void> {
+    let signal = inputSignal;
     const startMs = Date.now();
 
     // Edge check
@@ -183,6 +214,19 @@ export class ScalpEngine {
       });
       await recordCycle(signal, 'SKIPPED', `edge too small: ${signal.estimatedEdge.toFixed(1)}¢`);
       return;
+    }
+
+    // Entry delay: wait for price persistence confirmation
+    if (config.SCALP_ENTRY_DELAY_MS > 0) {
+      await new Promise((r) => setTimeout(r, config.SCALP_ENTRY_DELAY_MS));
+      const freshAsk = await getCurrentPrice(signal.tokenId);
+      if (freshAsk === null || freshAsk < signal.currentAsk - 0.02) {
+        processingLock.delete(signal.slug);
+        await recordCycle(signal, 'SKIPPED', `price faded after ${config.SCALP_ENTRY_DELAY_MS}ms delay`);
+        return;
+      }
+      // Use fresh price for entry without mutating the original signal object
+      signal = { ...signal, currentAsk: freshAsk };
     }
 
     // Daily loss check
@@ -222,7 +266,9 @@ export class ScalpEngine {
       return;
     }
 
-    const bestBid = parseFloat(entryBook?.bids?.[0]?.price ?? '0');
+    // CLOB API returns bids in ASCENDING order (lowest first).
+    // Best (highest) bid is the LAST element.
+    const bestBid = parseFloat(entryBook?.bids?.[entryBook.bids.length - 1]?.price ?? '0');
     if (bestBid < config.SCALP_MIN_MEANINGFUL_BID) {
       log.info('No bid liquidity, skipping', {
         slug: signal.slug,
@@ -263,7 +309,13 @@ export class ScalpEngine {
     }
 
     // Atomic capital decrement FIRST (prevents over-deployment race)
-    const amount = config.SCALP_POSITION_SIZE_USD;
+    let amount = config.SCALP_POSITION_SIZE_USD;
+    if (config.SCALP_CONFIDENCE_SIZING && signal.confidenceScore != null) {
+      amount = Math.max(
+        Math.min(config.SCALP_POSITION_SIZE_USD * signal.confidenceScore, config.SCALP_MAX_POSITION_SIZE_USD),
+        1, // absolute floor: CLOB minimum
+      );
+    }
     const reserved = await atomicDecrementCapital(amount);
     if (!reserved) {
       log.warn('Insufficient capital', { slug: signal.slug, amount });
@@ -355,7 +407,9 @@ export class ScalpEngine {
 async function getCurrentPrice(tokenId: string): Promise<number | null> {
   const book = await scalpGetOrderBook(tokenId);
   if (!book?.asks?.length) return null;
-  return parseFloat(book.asks[0].price);
+  // CLOB API returns asks in DESCENDING order (highest first).
+  // Best (lowest) ask is the LAST element.
+  return parseFloat(book.asks[book.asks.length - 1].price);
 }
 
 function resolveWinnerToken(

@@ -13,6 +13,7 @@ interface ExitState {
   entryShares: number;
   entryAmountUsd: number; // exact amount decremented from capital
   targetSellPrice: number;
+  highWaterBid: number;
   startedAt: number;
   stopLossCooldownUntil?: number;
 }
@@ -36,6 +37,7 @@ export class ScalpExitManager {
       entryShares,
       entryAmountUsd,
       targetSellPrice,
+      highWaterBid: entryPrice,
       startedAt: Date.now(),
     });
 
@@ -68,8 +70,10 @@ export class ScalpExitManager {
       const [cycleId, exit] = entries[idx];
 
       // Count only NEW orderbook reads (not cached duplicates)
+      // Scale limit with active position count to avoid timeout-induced abandonment
+      const maxReadsPerTick = Math.min(Math.max(Math.ceil(entries.length / 3), 5), 20);
       const isNewRead = !readTokens.has(exit.tokenId);
-      if (isNewRead && uniqueReads >= 5) continue; // Defer to next tick
+      if (isNewRead && uniqueReads >= maxReadsPerTick) continue; // Defer to next tick
 
       try {
         await this.checkExit(cycleId, exit);
@@ -89,7 +93,20 @@ export class ScalpExitManager {
 
   private async checkExit(cycleId: string, exit: ExitState): Promise<void> {
     const book = await scalpGetOrderBook(exit.tokenId);
-    const bestBid = parseFloat(book?.bids?.[0]?.price ?? '0');
+    // CLOB API returns bids in ASCENDING order (lowest first).
+    // Best (highest) bid is the LAST element.
+    const bestBid = parseFloat(book?.bids?.length ? book.bids[book.bids.length - 1].price : '0');
+
+    // Stop-loss: cut position if bid dropped too far below entry
+    if (config.SCALP_STOP_LOSS_ENABLED) {
+      const lossCents = (exit.entryPrice - bestBid) * 100;
+      if (lossCents >= config.SCALP_STOP_LOSS_CENTS) {
+        if (!exit.stopLossCooldownUntil || Date.now() >= exit.stopLossCooldownUntil) {
+          await this.executeExit(cycleId, exit, bestBid, 'stop_loss');
+          return;
+        }
+      }
+    }
 
     // Convergence sell: take profit when bid reaches target
     if (bestBid >= exit.targetSellPrice) {
@@ -97,16 +114,31 @@ export class ScalpExitManager {
       return;
     }
 
-    // Timeout → hand off to settlement sweep (let the match finish)
+    // Trailing stop: lock in gains if price rallied then dropped
+    exit.highWaterBid = Math.max(exit.highWaterBid, bestBid);
+    const trailDropCents = (exit.highWaterBid - bestBid) * 100;
+    const hasGain = exit.highWaterBid > exit.entryPrice + 0.01;
+    if (hasGain && trailDropCents >= config.SCALP_TRAILING_STOP_CENTS) {
+      await this.executeExit(cycleId, exit, bestBid, 'trailing_stop');
+      return;
+    }
+
+    // Timeout → sell at current bid to prevent catastrophic settlement losses.
+    // Previously this abandoned the position (removed from exit manager, stayed ENTERED in DB).
+    // Orphan recovery would re-discover it hours later after match settlement at 0.01 → massive loss.
     if (Date.now() - exit.startedAt > config.SCALP_CONVERGENCE_SELL_TIMEOUT_MS) {
-      log.info('Convergence timeout, holding for settlement', {
+      log.info('Convergence timeout, selling at current bid', {
         cycleId: cycleId.slice(0, 12),
         bestBid: bestBid.toFixed(4),
         target: exit.targetSellPrice.toFixed(4),
         elapsed: `${((Date.now() - exit.startedAt) / 1000).toFixed(0)}s`,
       });
-      this.activeExits.delete(cycleId);
-      // Cycle stays ENTERED — settlement sweep handles final resolution
+      if (bestBid > 0.01) {
+        await this.executeExit(cycleId, exit, bestBid, 'convergence_sell');
+      } else {
+        // Bid is at floor — hold for settlement (better chance of recovery than selling at 1c)
+        this.activeExits.delete(cycleId);
+      }
     }
   }
 
@@ -114,7 +146,7 @@ export class ScalpExitManager {
     cycleId: string,
     exit: ExitState,
     bidPrice: number,
-    method: 'convergence_sell',
+    method: 'convergence_sell' | 'stop_loss' | 'trailing_stop',
   ): Promise<void> {
     // Paper mode: simulate sell at bid price with slippage + fees
     const slippage = bidPrice * (config.SCALP_PAPER_SLIPPAGE_FRACTION / 2);

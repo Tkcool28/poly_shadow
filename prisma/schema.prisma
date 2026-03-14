@@ -632,3 +632,59 @@ model ScalpMarketWatch {
   @@index([game, isActive, marketType])
   @@index([homeTeam, awayTeam])
 }
+
+// ─── Scalp Observation (data collection for strategy calibration) ───
+
+model ScalpTradeLog {
+  id            String   @id @default(cuid())
+  tokenId       String
+  slug          String?
+  side          String // BUY or SELL
+  price         Float
+  size          Float
+  usdValue      Float
+  txHash        String?
+  clobTimestamp BigInt // ms from CLOB WS
+  receivedAt    DateTime @default(now())
+
+  @@index([tokenId, receivedAt])
+  @@index([receivedAt(sort: Desc)])
+}
+
+model ScalpSignalLog {
+  id              String  @id @default(cuid())
+  tokenId         String
+  slug            String?
+  game            String?
+  signalType      String // "cluster_buy", "flow_imbalance"
+  buyVolumeUsd    Float
+  sellVolumeUsd   Float
+  netImbalance    Float // (buy-sell)/(buy+sell)
+  tradeCount      Int
+  avgBuyPrice     Float
+  priceAtSignal   Float // best ask at signal time
+  bidAtSignal     Float?
+  spreadAtSignal  Float?
+  confidenceScore Float? // 0.0 - 1.0 composite confidence
+
+  // Forward price snapshots (filled asynchronously)
+  priceAt30s Float?
+  priceAt1m  Float?
+  priceAt5m  Float?
+  priceAt10m Float?
+  bidAt30s   Float?
+  bidAt1m    Float?
+  bidAt5m    Float?
+  bidAt10m   Float?
+
+  // Outcome (computed after T+10m)
+  wouldHaveWon  Boolean?
+  maxPriceAfter Float?
+  minPriceAfter Float?
+
+  signalAt  DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tokenId, signalAt])
+  @@index([signalAt(sort: Desc)])
+}

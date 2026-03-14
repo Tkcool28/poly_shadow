@@ -6,6 +6,7 @@ import { isShuttingDown } from '../lib/shutdown';
 import { initScalpExecutor } from '../services/scalp/scalp-executor';
 import { discoverMarkets, loadMarketsIntoCache, getAllEsportsTokenIds, getCacheSize } from '../services/scalp/scalp-market-discovery';
 import { ScalpBotDetector } from '../services/scalp/scalp-bot-detector';
+import { ScalpFlowTracker } from '../services/scalp/scalp-flow-tracker';
 import { ScalpEngine, cleanupProcessingLocks } from '../services/scalp/scalp-engine';
 import { sweepScalpSettlements } from '../services/scalp/scalp-settlement';
 import { CS2Feed } from '../services/scalp/feeds/cs2-feed';
@@ -22,6 +23,7 @@ const LOCK_CLEANUP_INTERVAL_MS = 30_000; // 30s
 // Module-level for cleanup handler
 const feeds: GameFeed[] = [];
 let botDetector: ScalpBotDetector | null = null;
+let flowTracker: ScalpFlowTracker | null = null;
 
 /**
  * Bootstrap ScalpCapital record if it doesn't exist.
@@ -120,9 +122,12 @@ async function main() {
     shuttingDown = true;
     log.info(`Received ${signal}, shutting down...`);
 
-    // Stop bot detector
+    // Stop bot detector / flow tracker
     if (botDetector) {
       try { botDetector.stop(); } catch {}
+    }
+    if (flowTracker) {
+      try { flowTracker.stop(); } catch {}
     }
 
     // Stop game feeds
@@ -174,15 +179,30 @@ async function main() {
   // Recover orphaned ENTERED cycles → re-add to exit manager for active monitoring
   await recoverOrphans(engine);
 
-  // Start bot detector
-  botDetector = new ScalpBotDetector();
-  botDetector.updateTokens(getAllEsportsTokenIds());
-  botDetector.on('botSignal', (signal) => {
-    engine.onBotSignal(signal).catch((err: any) =>
-      log.error('Bot signal handler error', { error: err.message }),
-    );
-  });
-  botDetector.start();
+  // Start signal detector: use ScalpFlowTracker (with flow analysis, cooldowns,
+  // price filter, netImbalance) when SCALP_DYNAMIC_EDGE is enabled; fall back to
+  // legacy ScalpBotDetector otherwise.
+  if (config.SCALP_DYNAMIC_EDGE) {
+    flowTracker = new ScalpFlowTracker();
+    flowTracker.updateTokens(getAllEsportsTokenIds());
+    flowTracker.on('signal', (signal) => {
+      engine.onBotSignal(signal).catch((err: any) =>
+        log.error('Flow signal handler error', { error: err.message }),
+      );
+    });
+    flowTracker.start();
+    log.info('Using ScalpFlowTracker (SCALP_DYNAMIC_EDGE=true)');
+  } else {
+    botDetector = new ScalpBotDetector();
+    botDetector.updateTokens(getAllEsportsTokenIds());
+    botDetector.on('botSignal', (signal) => {
+      engine.onBotSignal(signal).catch((err: any) =>
+        log.error('Bot signal handler error', { error: err.message }),
+      );
+    });
+    botDetector.start();
+    log.info('Using ScalpBotDetector (SCALP_DYNAMIC_EDGE=false)');
+  }
 
   // Start game feeds
   const cs2Feed = new CS2Feed();
@@ -202,6 +222,8 @@ async function main() {
   await cs2Feed.start();
   await dota2Feed.start();
 
+  const detectorType = config.SCALP_DYNAMIC_EDGE ? 'flow-tracker' : 'bot-detector';
+  const detectorHealthy = flowTracker ? flowTracker.isHealthy() : (botDetector?.isHealthy() ?? false);
   log.info('Scalp worker started', {
     mode: config.SCALP_IS_PAPER ? 'PAPER' : 'LIVE',
     positionSize: `$${config.SCALP_POSITION_SIZE_USD}`,
@@ -210,7 +232,8 @@ async function main() {
     maxDailyLoss: `$${config.SCALP_MAX_DAILY_LOSS_USD}`,
     marketsInCache: getCacheSize(),
     tokenIds: getAllEsportsTokenIds().size,
-    botDetector: botDetector.isHealthy() ? 'connected' : 'connecting',
+    signalDetector: detectorType,
+    detectorStatus: detectorHealthy ? 'connected' : 'connecting',
     cs2: cs2Feed.isHealthy() ? 'ready' : 'disabled',
     dota2: dota2Feed.isHealthy() ? 'ready' : 'disabled',
   });
@@ -239,9 +262,12 @@ async function main() {
       if (Date.now() - lastDiscovery >= config.SCALP_MARKET_DISCOVERY_INTERVAL_MS) {
         try {
           await discoverMarkets();
-          // Update bot detector with fresh token set
-          if (botDetector) {
-            botDetector.updateTokens(getAllEsportsTokenIds());
+          // Update active detector with fresh token set
+          const freshTokens = getAllEsportsTokenIds();
+          if (flowTracker) {
+            flowTracker.updateTokens(freshTokens);
+          } else if (botDetector) {
+            botDetector.updateTokens(freshTokens);
           }
           lastDiscovery = Date.now();
         } catch (err: any) {
