@@ -5,7 +5,7 @@
 export interface GameEvent {
   matchId: string;
   game: 'cs2' | 'dota2' | 'lol' | 'val' | 'atp' | 'wta';
-  eventType: 'map_win' | 'series_end';
+  eventType: 'map_win' | 'series_end' | 'baron_kill' | 'elder_dragon';
   winner: string;
   loser: string;
   seriesScore: [number, number];
@@ -123,4 +123,33 @@ function binomialCoeff(n: number, k: number): number {
     result = (result * (n - i)) / (i + 1);
   }
   return result;
+}
+
+/**
+ * Estimate probability shift for in-game events (Baron, Elder Dragon).
+ * These are ADDITIVE shifts to the current series-level price.
+ *
+ * Sources for game-level win probability impact:
+ * - Baron Nashor: ~60-75% game win rate for team that takes it
+ *   (Oracle's Elixir 2023-24 pro data, ~+15-25% over baseline 50%)
+ * - Elder Dragon: ~55-70% game win rate
+ *   (~+10-20% over baseline, lower than Baron due to conditional availability)
+ *
+ * Series-level dampening: in a bo3/bo5, one game's outcome shifts series
+ * probability by roughly (game_shift × 1/remaining_games). We use conservative
+ * fixed estimates: non-decisive ~40% dampening, decisive game = full game shift.
+ */
+export function estimateInGameProbShift(
+  eventType: 'baron_kill' | 'elder_dragon',
+  isDecisiveGame: boolean,
+): number {
+  if (eventType === 'baron_kill') {
+    // Baron Nashor: +15-25% game win probability → ~6-12% series shift
+    return isDecisiveGame ? 0.12 : 0.06;
+  }
+  if (eventType === 'elder_dragon') {
+    // Elder Dragon: +10-20% game win probability → ~4-8% series shift
+    return isDecisiveGame ? 0.08 : 0.04;
+  }
+  return 0;
 }

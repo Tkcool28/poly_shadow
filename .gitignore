@@ -5,5 +5,19 @@ dist/
 logs/
 *.log
 prisma/generated/
-.claude/
+# Ignore .claude contents (sessions, plans, auto-memory) but keep agent + scalp memory
+.claude/*
+!.claude/agents
+!.claude/SCALP_MEMORY.md
+!.claude/SCALP_LOG.md
+.claude/agents/*
+!.claude/agents/scalp-agent.md
 src/scripts/backtest-cache/
+
+# CSV output from tests, backtests, investigations
+*.csv
+backtest-data/
+
+# Ad-hoc investigation/doc files
+data-*.csv
+investigate-*.csv

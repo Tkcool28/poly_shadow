@@ -11,6 +11,7 @@ import { ScalpEngine, cleanupProcessingLocks } from '../services/scalp/scalp-eng
 import { sweepScalpSettlements } from '../services/scalp/scalp-settlement';
 import { CS2Feed } from '../services/scalp/feeds/cs2-feed';
 import { Dota2Feed } from '../services/scalp/feeds/dota2-feed';
+import { LolFeed } from '../services/scalp/feeds/lol-feed';
 import { ScalpCycleStatus } from '../../prisma/generated/prisma/client/enums';
 import type { GameFeed } from '../services/scalp/scalp-types';
 
@@ -207,6 +208,7 @@ async function main() {
   // Start game feeds
   const cs2Feed = new CS2Feed();
   const dota2Feed = new Dota2Feed();
+  const lolFeed = new LolFeed();
 
   const gameEventHandler = (event: any) => {
     engine.onGameEvent(event).catch((err: any) =>
@@ -216,11 +218,13 @@ async function main() {
 
   cs2Feed.onEvent(gameEventHandler);
   dota2Feed.onEvent(gameEventHandler);
+  lolFeed.onEvent(gameEventHandler);
 
-  feeds.push(cs2Feed, dota2Feed);
+  feeds.push(cs2Feed, dota2Feed, lolFeed);
 
   await cs2Feed.start();
   await dota2Feed.start();
+  await lolFeed.start();
 
   const detectorType = config.SCALP_DYNAMIC_EDGE ? 'flow-tracker' : 'bot-detector';
   const detectorHealthy = flowTracker ? flowTracker.isHealthy() : (botDetector?.isHealthy() ?? false);
@@ -236,6 +240,7 @@ async function main() {
     detectorStatus: detectorHealthy ? 'connected' : 'connecting',
     cs2: cs2Feed.isHealthy() ? 'ready' : 'disabled',
     dota2: dota2Feed.isHealthy() ? 'ready' : 'disabled',
+    lol: lolFeed.isHealthy() ? 'ready' : 'disabled',
   });
 
   // Main loop: exit manager tick + settlement sweep + periodic discovery

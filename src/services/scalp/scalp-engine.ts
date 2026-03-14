@@ -7,7 +7,7 @@ import {
   getMarketByTokenId,
 } from './scalp-market-discovery';
 import { ScalpExitManager } from './scalp-exit-manager';
-import { estimateSeriesFairValue, type GameEvent, type BotSignal, type EnhancedBotSignal, type ScalpSignal } from './scalp-types';
+import { estimateSeriesFairValue, estimateInGameProbShift, type GameEvent, type BotSignal, type EnhancedBotSignal, type ScalpSignal } from './scalp-types';
 import { ScalpCycleStatus } from '../../../prisma/generated/prisma/client/enums';
 import type { ScalpMarketWatchModel as ScalpMarketWatch } from '../../../prisma/generated/prisma/client/models/ScalpMarketWatch';
 
@@ -78,11 +78,21 @@ export class ScalpEngine {
       processingLock.delete(lockKey); // Release eager lock on failure
       return;
     }
-    const fairValue = estimateSeriesFairValue(
-      event.seriesScore,
-      event.seriesFormat,
-      currentPrice,
-    );
+
+    let fairValue: number;
+    if (event.eventType === 'baron_kill' || event.eventType === 'elder_dragon') {
+      // In-game event: additive probability shift model
+      const isDecisiveGame = (event.rawData?.isDecisiveGame as boolean) ?? false;
+      const shift = estimateInGameProbShift(event.eventType, isDecisiveGame);
+      fairValue = Math.max(Math.min(currentPrice + shift, 0.95), 0.05);
+    } else {
+      // Series-level event (map_win / series_end): binomial model
+      fairValue = estimateSeriesFairValue(
+        event.seriesScore,
+        event.seriesFormat,
+        currentPrice,
+      );
+    }
 
     await this.evaluateAndEnter({
       matchId: event.matchId,

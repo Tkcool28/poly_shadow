@@ -33,7 +33,7 @@ import { auditAllAllocations, auditPhantomPositions, cleanupPhantomPositions, ch
 import { initMidpointCache, closeMidpointCache, ensureSubscribed } from '../services/midpoint-cache';
 import { getOrCreateMutex } from '../lib/allocation-mutex';
 import { PgListener } from '../lib/pg-listen';
-import { recordTraderBuy, getMajoritySide, pruneAccumulator, seedAccumulator } from '../services/majority-accumulator';
+import { recordTraderBuy, getMajoritySide, pruneAccumulator, seedAccumulator, clearAccumulator } from '../services/majority-accumulator';
 
 const JOB_NAME = 'copy-trader';
 const log = createJobLogger(JOB_NAME);
@@ -1262,6 +1262,24 @@ async function main() {
 
   // Initial drain on startup (recover unprocessed trades from downtime)
   scheduleDrain('startup');
+
+  // Post-startup re-seed: close the race window between seedAccumulator() and PgListener.
+  // Trades detected by chain watcher during that gap are now in DB.
+  setTimeout(async () => {
+    try {
+      const seedCutoff = new Date(Date.now() - config.MAJORITY_PRUNE_AGE_MS);
+      const recentBuys = await prisma.detectedTrade.findMany({
+        where: { side: 'BUY', detectedAt: { gte: seedCutoff } },
+        select: { proxyWallet: true, conditionId: true, outcome: true, size: true, price: true },
+        orderBy: { detectedAt: 'asc' },
+      });
+      clearAccumulator();
+      seedAccumulator(recentBuys);
+      log.info(`Post-startup re-seed complete: ${recentBuys.length} BUYs`);
+    } catch (err: any) {
+      log.warn(`Post-startup re-seed failed: ${err.message}`);
+    }
+  }, 10_000);
 
   // ─── Independent housekeeping timers ───
   // These run on their own schedules, never blocking trade processing.

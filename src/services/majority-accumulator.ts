@@ -68,6 +68,11 @@ export function pruneAccumulator(maxAgeMs = 25 * 60 * 60 * 1000): void {
   if (pruned > 0) log.debug(`Pruned ${pruned} stale accumulator entries (${accumulator.size} remaining)`);
 }
 
+/** Clear all entries. Used for post-startup re-seed to close the seed-vs-listen race window. */
+export function clearAccumulator(): void {
+  accumulator.clear();
+}
+
 /** Seed from DB on startup. Prevents cold-start miss for active markets. */
 export function seedAccumulator(trades: Array<{ proxyWallet: string; conditionId: string; outcome: string | null; size: number; price: number }>): void {
   for (const trade of trades) {

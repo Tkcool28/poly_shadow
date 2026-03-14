@@ -285,7 +285,7 @@ const envSchema = z.object({
 
   // Scalp market discovery
   SCALP_MARKET_DISCOVERY_INTERVAL_MS: z.coerce.number().default(300000),      // 5 min
-  SCALP_GAMES: z.string().default('cs2,dota2'),
+  SCALP_GAMES: z.string().default('cs2,dota2,lol'),
 
   // Scalp data feeds
   SCALP_STEAM_API_KEY: z.string().default(''),
@@ -295,6 +295,11 @@ const envSchema = z.object({
     .default('true')
     .transform((v) => v === 'true'),
   SCALP_HLTV_RECONNECT_MAX_MS: z.coerce.number().default(30000),
+
+  // LoL Esports feed
+  SCALP_LOL_API_KEY: z.string().default(''),                                 // public gateway key (default baked in, override for rotation)
+  SCALP_LOL_POLL_INTERVAL_MS: z.coerce.number().default(5000),              // live stats polling (5s)
+  SCALP_LOL_DISCOVERY_INTERVAL_MS: z.coerce.number().default(30000),        // match discovery (30s)
 
   // Scalp observer + improved strategy
   SCALP_OBSERVER_MODE: z
