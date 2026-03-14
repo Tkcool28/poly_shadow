@@ -1,6 +1,7 @@
 import { ethers } from 'ethers';
 import { createJobLogger } from '../lib/logger';
 import { config } from '../config/env';
+import { checkOnChainResolution } from '../lib/ctf-resolution';
 
 const log = createJobLogger('position-claim');
 
@@ -57,6 +58,17 @@ let gnosisSafeWarned = false;
 // Populated when claimOne() fails; cleared on success.
 // Resets on process restart (acceptable: MATIC refill or RPC recovery likely triggers restart).
 const pendingRetries = new Map<string, ClaimablePosition>();
+
+const RPC_TIMEOUT_MS = 15_000; // 15s — same as ctf-resolution.ts
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`RPC timeout after ${ms}ms`)), ms)
+    ),
+  ]);
+}
 
 function getProvider(): ethers.providers.JsonRpcProvider {
   if (!provider) provider = new ethers.providers.JsonRpcProvider(config.POLYGON_RPC_URL);
@@ -166,22 +178,55 @@ async function claimOne(pos: ClaimablePosition): Promise<boolean> {
   const indexSets = [1 << pos.outcomeIndex]; // Yes=0→[1], No=1→[2]
   const s = getSigner();
 
-  // Polygon requires a minimum priority fee of 25 gwei.
-  // ethers v5 default (1.5 gwei) is too low, and hardcoded maxFeePerGas can undershoot
-  // when the baseFee spikes. Fetch current network fees and apply a 2× buffer.
+  // ── Step 1: callStatic dry-run (zero gas cost) ──────────────────────────────
+  // Prevents wasting MATIC on TXs that will revert because:
+  // (a) on-chain oracle hasn't resolved the condition yet (price-based settlement lag)
+  // (b) position was already redeemed (e.g. manually claimed on Polymarket.com)
+  try {
+    if (config.SIGNATURE_TYPE === 0) {
+      const ctf = new ethers.Contract(CTF_ADDRESS, CTF_ABI, s);
+      await withTimeout(
+        ctf.callStatic.redeemPositions(
+          USDC_ADDRESS, ethers.constants.HashZero, pos.conditionId, indexSets,
+        ),
+        RPC_TIMEOUT_MS,
+      );
+    } else {
+      const ctfIface = new ethers.utils.Interface(CTF_ABI);
+      const redeemData = ctfIface.encodeFunctionData('redeemPositions', [
+        USDC_ADDRESS, ethers.constants.HashZero, pos.conditionId, indexSets,
+      ]);
+      const factory = new ethers.Contract(PROXY_FACTORY_ADDRESS, PROXY_FACTORY_ABI, s);
+      await withTimeout(
+        factory.callStatic.proxy(
+          [{ typeCode: 1, to: CTF_ADDRESS, value: 0, data: redeemData }],
+        ),
+        RPC_TIMEOUT_MS,
+      );
+    }
+  } catch (dryRunErr: any) {
+    // RPC timeout — transient, keep in retry queue without diagnosis
+    if (dryRunErr.message?.includes('RPC timeout')) {
+      log.debug('Auto-claim deferred: dry-run RPC timeout', { conditionId: pos.conditionId });
+      return false;
+    }
+    // Dry-run reverted — diagnose why without spending gas
+    return handleDryRunFailure(pos, dryRunErr);
+  }
+
+  // ── Step 2: callStatic passed — safe to submit real TX ──────────────────────
   const feeData = await getProvider().getFeeData();
   const priorityFee = feeData.maxPriorityFeePerGas?.gt(ethers.utils.parseUnits('30', 'gwei'))
     ? feeData.maxPriorityFeePerGas
     : ethers.utils.parseUnits('30', 'gwei');
   const baseFee = feeData.lastBaseFeePerGas ?? ethers.utils.parseUnits('100', 'gwei');
-  const maxFee = baseFee.mul(2).add(priorityFee); // 2× buffer over current baseFee
+  const maxFee = baseFee.mul(2).add(priorityFee);
   const gasOverrides = { maxPriorityFeePerGas: priorityFee, maxFeePerGas: maxFee };
 
   try {
     let txHash: string;
 
     if (config.SIGNATURE_TYPE === 0) {
-      // EOA is the funder — call CTF directly
       const ctf = new ethers.Contract(CTF_ADDRESS, CTF_ABI, s);
       const tx = await ctf.redeemPositions(
         USDC_ADDRESS, ethers.constants.HashZero, pos.conditionId, indexSets,
@@ -190,7 +235,6 @@ async function claimOne(pos: ClaimablePosition): Promise<boolean> {
       txHash = tx.hash;
       await pollReceipt(txHash);
     } else {
-      // POLY_PROXY (type=1): route through ProxyWalletFactory
       const ctfIface = new ethers.utils.Interface(CTF_ABI);
       const redeemData = ctfIface.encodeFunctionData('redeemPositions', [
         USDC_ADDRESS, ethers.constants.HashZero, pos.conditionId, indexSets,
@@ -204,9 +248,7 @@ async function claimOne(pos: ClaimablePosition): Promise<boolean> {
       await pollReceipt(txHash);
     }
 
-    // Remove from retry queue on success
     pendingRetries.delete(pos.conditionId);
-
     log.info('Auto-claim success', {
       conditionId: pos.conditionId,
       outcomeIndex: pos.outcomeIndex,
@@ -216,19 +258,9 @@ async function claimOne(pos: ClaimablePosition): Promise<boolean> {
     });
     return true;
   } catch (err: any) {
-    const msg = err.message?.toLowerCase() ?? '';
-    // CTF reverts with empty data when token balance=0 (already redeemed).
-    // Treat as success so DB gets marked claimed and we stop retrying.
-    if (msg.includes('execution reverted')) {
-      log.info('Auto-claim: position likely already redeemed, removing from queue', {
-        conditionId: pos.conditionId,
-        error: msg.slice(0, 200),
-      });
-      pendingRetries.delete(pos.conditionId);
-      return true;
-    }
-    // Transient failure: keep in retry queue for next sweep
-    log.warn('Auto-claim failed (kept in retry queue)', {
+    // Real TX failed after callStatic passed — likely a race (resolved between dry-run and submit).
+    // Keep in retry queue for next sweep.
+    log.warn('Auto-claim TX failed after dry-run passed', {
       conditionId: pos.conditionId,
       tokenId: pos.tokenId.slice(0, 20),
       error: err.message?.slice(0, 300),
@@ -236,4 +268,34 @@ async function claimOne(pos: ClaimablePosition): Promise<boolean> {
     });
     return false;
   }
+}
+
+// Diagnose why a callStatic dry-run failed — zero gas cost diagnosis
+async function handleDryRunFailure(pos: ClaimablePosition, err: any): Promise<boolean> {
+  // Check if condition is resolved on-chain
+  let resolved = false;
+  try {
+    const resolution = await checkOnChainResolution(pos.conditionId);
+    resolved = resolution.resolved;
+  } catch {
+    // RPC failure — can't diagnose, keep in retry queue
+  }
+
+  if (!resolved) {
+    // Condition not resolved on-chain yet — expected lag from price-based settlement.
+    // Debug-level: this is normal and will resolve itself, not worth warning about.
+    log.debug('Auto-claim deferred: condition not yet resolved on-chain', {
+      conditionId: pos.conditionId,
+    });
+    return false;
+  }
+
+  // Condition IS resolved but redeemPositions still reverts → already redeemed
+  // (e.g. manually claimed on Polymarket.com). Treat as success to stop retrying.
+  log.info('Auto-claim: already redeemed on-chain (dry-run revert + resolved), marking claimed', {
+    conditionId: pos.conditionId,
+    netShares: pos.netShares.toFixed(4),
+  });
+  pendingRetries.delete(pos.conditionId);
+  return true;
 }
