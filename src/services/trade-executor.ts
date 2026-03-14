@@ -33,6 +33,46 @@ export interface ExecuteOrderResult {
 const metadataCache = new Map<string, { tickSize: TickSize; negRisk: boolean }>();
 const metadataLimit = pLimit(5);
 
+// Fee rate cache: tokenId → baseFee in basis points (from CLOB /fee-rate endpoint)
+const feeRateCache = new Map<string, number>();
+
+/**
+ * Calculate taker fee in shares.
+ * Polymarket crypto fee formula (from docs):
+ *   fee = shares × (baseFee/10000) × price × (price × (1 - price))
+ *
+ * baseFee from CLOB /fee-rate is typically 1000 for crypto markets.
+ * At baseFee=1000, p=0.50: fee = shares × 0.10 × 0.50 × 0.25 = 1.25% of shares.
+ * At baseFee=1000, p=0.60: fee = shares × 0.10 × 0.60 × 0.24 = 1.44% of shares.
+ *
+ * Note: the docs state exponent=2 for crypto but the on-chain CTF Exchange uses
+ * the baseFee directly (no quadratic). We use the linear formula matching the
+ * `@polymarket/clob-client` order builder behavior. Monitor `feePct` in logs
+ * to validate against actual wallet drain.
+ */
+function calculateTakerFeeShares(grossShares: number, price: number, baseFee: number): number {
+  if (baseFee <= 0 || price <= 0 || price >= 1) return 0;
+  const feeRate = baseFee / 10000;
+  return grossShares * feeRate * price * (1 - price);
+}
+
+const FEE_CACHE_TTL_MS = 3600_000; // 1 hour
+
+async function getCachedFeeRate(tokenId: string): Promise<number> {
+  const cached = feeRateCache.get(tokenId);
+  if (cached !== undefined) return cached;
+  try {
+    if (!client) return 0;
+    const baseFee = await client.getFeeRateBps(tokenId);
+    feeRateCache.set(tokenId, baseFee);
+    // Expire cache entry after TTL
+    setTimeout(() => feeRateCache.delete(tokenId), FEE_CACHE_TTL_MS);
+    return baseFee;
+  } catch {
+    return 0; // fail-open: 0 = no fee deduction
+  }
+}
+
 let client: ClobClient | null = null;
 
 let consecutiveBalanceFailures = 0;
@@ -677,11 +717,59 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
 
     resetBalancePause(); // clear any prior balance failure count on successful fill
 
+    // ── Taker fee deduction: adjust filledSize to NET shares (what we actually hold on-chain) ──
+    // The CLOB returns gross amounts but the CTF Exchange contract deducts taker fees in shares.
+    let estimatedFee: number | undefined;
+    if (filledSize && filledPrice && filledSize > 0) {
+      try {
+        const baseFee = await getCachedFeeRate(tokenId);
+        if (baseFee > 0) {
+          const grossShares = filledSize;
+          const grossPrice = filledPrice;
+
+          if (side === 'BUY') {
+            // BUY: fee deducted in shares — we receive fewer shares than CLOB reports
+            const feeShares = calculateTakerFeeShares(grossShares, grossPrice, baseFee);
+            const feeUsd = feeShares * grossPrice;
+            filledSize = grossShares - feeShares;
+            // Recalculate effective price: same USD paid, fewer shares received
+            const totalPaid = grossShares * grossPrice; // original USD amount
+            filledPrice = filledSize > 0 ? totalPaid / filledSize : grossPrice;
+            estimatedFee = feeUsd;
+
+            log.info('Taker fee (BUY)', {
+              grossShares: grossShares.toFixed(4), feeShares: feeShares.toFixed(6),
+              netShares: filledSize.toFixed(4), feeUsd: feeUsd.toFixed(4),
+              grossPrice: grossPrice.toFixed(4), effectivePrice: filledPrice.toFixed(4),
+              baseFee, feePct: ((feeUsd / totalPaid) * 100).toFixed(2) + '%',
+            });
+          } else {
+            // SELL: fee deducted in USDC — we receive less USDC than CLOB reports
+            const feeUsd = calculateTakerFeeShares(grossShares, grossPrice, baseFee) * grossPrice;
+            filledPrice = grossPrice - (feeUsd / grossShares); // effective price lower
+            estimatedFee = feeUsd;
+
+            log.info('Taker fee (SELL)', {
+              shares: grossShares.toFixed(4), feeUsd: feeUsd.toFixed(4),
+              grossPrice: grossPrice.toFixed(4), effectivePrice: filledPrice.toFixed(4),
+              baseFee,
+            });
+          }
+        }
+      } catch (err: any) {
+        // Fail-open: if fee calc fails, use gross amounts (current behavior)
+        log.warn('Taker fee calculation failed, using gross amounts', { error: err.message });
+      }
+    }
+
     log.info('Order filled', {
       orderId,
       status: response?.status,
-      filledSize,
-      filledPrice,
+      filledSize,          // NET shares (after fee deduction)
+      filledPrice,         // effective price per net share
+      grossShares: makingAmount || null,  // original CLOB response
+      grossPrice: (makingAmount > 0 && takingAmount > 0) ? (side === 'BUY' ? takingAmount / makingAmount : makingAmount / takingAmount) : null,
+      estimatedFee: estimatedFee?.toFixed(4) ?? null,
       txHashes: txHashes.length,
     });
 
@@ -692,6 +780,7 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
       filledSize,
       failReason: null,
       transactionHashes: txHashes,
+      estimatedFee,
     };
   } catch (err: any) {
     const tErr = Date.now();
