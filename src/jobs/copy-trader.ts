@@ -383,7 +383,7 @@ async function phaseA(
   if (trade.side === 'BUY' && allocation.majorityOnlyMode) {
     const majority = getMajoritySide(
       trade.proxyWallet, trade.conditionId,
-      config.MAJORITY_MIN_TRADES, config.MAJORITY_MIN_RATIO,
+      config.MAJORITY_MIN_USD, config.MAJORITY_MIN_RATIO,
     );
     if (!majority) {
       await createSkippedRecord(trade, 'majority accumulating: insufficient signal', allocation.id, isPaper);

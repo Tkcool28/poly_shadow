@@ -99,7 +99,8 @@ const envSchema = z.object({
   TOKEN_SELL_COOLDOWN_MS: z.coerce.number().min(0).default(60000), // 60s — 0 = disabled
 
   // Majority Side Accumulator: wait for enough trader BUYs before copying
-  MAJORITY_MIN_TRADES: z.coerce.number().min(1).max(50).default(10),       // min BUY signals before majority detection
+  MAJORITY_MIN_TRADES: z.coerce.number().min(1).max(50).default(10),       // LEGACY: count-based gate (kept for .env compat)
+  MAJORITY_MIN_USD: z.coerce.number().min(0).max(10000).default(200),      // volume-based gate: min USD across all BUYs before majority detection
   MAJORITY_MIN_RATIO: z.coerce.number().min(0.50).max(0.95).default(0.50), // min fraction of BUYs on one side
   COMMITTED_SIDE_LOCK: z
     .string()

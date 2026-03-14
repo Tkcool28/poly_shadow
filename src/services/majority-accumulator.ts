@@ -29,7 +29,7 @@ export function recordTraderBuy(proxyWallet: string, conditionId: string, outcom
 /** Returns the majority outcome (by USD volume) if detection threshold met, else null. */
 export function getMajoritySide(
   proxyWallet: string, conditionId: string,
-  minTrades: number, minRatio: number,
+  minUsd: number, minRatio: number,
 ): { outcome: string; ratio: number; totalTrades: number; totalUsd: number } | null {
   const outcomes = accumulator.get(`${proxyWallet}:${conditionId}`);
   if (!outcomes) return null;
@@ -45,7 +45,7 @@ export function getMajoritySide(
       majorityOutcome = outcome;
     }
   }
-  if (totalCount < minTrades) return null;       // timing gate: still count-based
+  if (totalUsd < minUsd) return null;             // volume-based timing gate
   const ratio = totalUsd > 0 ? maxUsd / totalUsd : 0;
   if (ratio < minRatio) return null;
   return { outcome: majorityOutcome, ratio, totalTrades: totalCount, totalUsd };
