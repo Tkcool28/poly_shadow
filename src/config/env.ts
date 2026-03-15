@@ -150,6 +150,7 @@ const envSchema = z.object({
   // Position settlement
   SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(300000), // 5 minutes
   STALE_TRADE_CUTOFF_MS: z.coerce.number().default(600000), // 10 min (was hardcoded 5 min)
+  MAX_SIGNAL_AGE_MS: z.coerce.number().default(90000), // 90s — reject live BUYs older than this (0 = disabled)
   MARKET_END_GATEKEEP_ENABLED: z.string().default('true').transform((v) => v === 'true'),
   SETTLEMENT_ONCHAIN_FALLBACK_ENABLED: z.string().default('true').transform((v) => v === 'true'),
   SETTLEMENT_ENDDATE_GRACE_MS: z.coerce.number().default(86400000), // 24h grace (sports endDate = game start, not close)
@@ -285,7 +286,7 @@ const envSchema = z.object({
 
   // Scalp market discovery
   SCALP_MARKET_DISCOVERY_INTERVAL_MS: z.coerce.number().default(300000),      // 5 min
-  SCALP_GAMES: z.string().default('cs2,dota2,lol'),
+  SCALP_GAMES: z.string().default('cs2,dota2,lol,nba,soccer'),
 
   // Scalp data feeds
   SCALP_STEAM_API_KEY: z.string().default(''),
@@ -300,6 +301,24 @@ const envSchema = z.object({
   SCALP_LOL_API_KEY: z.string().default(''),                                 // public gateway key (default baked in, override for rotation)
   SCALP_LOL_POLL_INTERVAL_MS: z.coerce.number().default(5000),              // live stats polling (5s)
   SCALP_LOL_DISCOVERY_INTERVAL_MS: z.coerce.number().default(30000),        // match discovery (30s)
+
+  // NBA feed
+  SCALP_NBA_ENABLED: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+  SCALP_NBA_SERIES_ID: z.string().default('10345'),                          // Gamma API series ID for NBA 2026
+  SCALP_NBA_POLL_INTERVAL_MS: z.coerce.number().default(5000),              // play-by-play polling for live games
+  SCALP_NBA_SCOREBOARD_INTERVAL_MS: z.coerce.number().default(30000),       // scoreboard polling (30s)
+
+  // Soccer/EPL feed
+  SCALP_SOCCER_ENABLED: z
+    .string()
+    .default('true')
+    .transform((v) => v === 'true'),
+  SCALP_SOCCER_POLL_INTERVAL_MS: z.coerce.number().default(15000),         // scoreboard polling (15s)
+  SCALP_SOCCER_LEAGUES: z.string().default('eng.1'),                        // ESPN league slugs (comma-separated)
+  SCALP_SOCCER_SERIES_ID: z.string().default('10188'),                      // Gamma API series ID for Premier League 2025
 
   // Scalp observer + improved strategy
   SCALP_OBSERVER_MODE: z

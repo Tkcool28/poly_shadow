@@ -301,6 +301,24 @@ async function phaseA(
   const signalAgeMs = startMs - (trade.realTimestamp ?? trade.timestamp) * 1000;
   const isPaper = allocation.isPaper;
 
+  // ─── Signal age guard (live BUYs only) ───
+  if (!isPaper && trade.side === 'BUY' && config.MAX_SIGNAL_AGE_MS > 0 && signalAgeMs > config.MAX_SIGNAL_AGE_MS) {
+    log.warn('Signal age guard: rejecting stale live BUY', {
+      trader: trade.proxyWallet.slice(0, 10),
+      signalAgeSec: (signalAgeMs / 1000).toFixed(1),
+      maxAgeSec: (config.MAX_SIGNAL_AGE_MS / 1000).toFixed(0),
+      title: trade.title?.slice(0, 50),
+      price: trade.price,
+    });
+    await createSkippedRecord(
+      trade,
+      `signal too old: ${(signalAgeMs / 1000).toFixed(0)}s > ${(config.MAX_SIGNAL_AGE_MS / 1000).toFixed(0)}s max`,
+      allocation.id,
+      isPaper,
+    );
+    return null;
+  }
+
   const copyPercent = allocation.copyTradePercent ?? config.COPY_TRADE_PERCENT;
   const maxPerTrade = allocation.maxPositionUsd ?? config.MAX_POSITION_USD;
   const maxPerPrediction = allocation.maxPredictionPositionUsd ?? config.MAX_PREDICTION_POSITION_USD;
@@ -932,6 +950,7 @@ async function drainParallel(
               amount: result.executorAmount,
               detectedPrice: result.detectedPrice,
               detectionSource: result.detectionSource,
+              signalAgeMs: result.signalAgeMs,
             });
             return { result: clobResult, clobMs: Date.now() - result.clobStartMs! };
           });
