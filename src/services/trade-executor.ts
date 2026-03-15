@@ -38,22 +38,30 @@ const feeRateCache = new Map<string, number>();
 
 /**
  * Calculate taker fee in shares.
- * Polymarket crypto fee formula (from docs):
- *   fee = shares × (baseFee/10000) × price × (price × (1 - price))
+ * Polymarket fee formula (matching paper-executor.ts and docs):
+ *   fee = shares × feeRate × (price × (1 - price))^exponent
  *
- * baseFee from CLOB /fee-rate is typically 1000 for crypto markets.
- * At baseFee=1000, p=0.50: fee = shares × 0.10 × 0.50 × 0.25 = 1.25% of shares.
- * At baseFee=1000, p=0.60: fee = shares × 0.10 × 0.60 × 0.24 = 1.44% of shares.
- *
- * Note: the docs state exponent=2 for crypto but the on-chain CTF Exchange uses
- * the baseFee directly (no quadratic). We use the linear formula matching the
- * `@polymarket/clob-client` order builder behavior. Monitor `feePct` in logs
- * to validate against actual wallet drain.
+ * Fee tiers by baseFee from CLOB /fee-rate endpoint:
+ *   Crypto (baseFee=1000): feeRate=0.25, exponent=2 → peak 1.56% at p=0.50
+ *   Sports (baseFee=700):  feeRate=0.0175, exponent=1 → peak 0.44% at p=0.50
+ *   No fees (baseFee=0):   0%
  */
 function calculateTakerFeeShares(grossShares: number, price: number, baseFee: number): number {
   if (baseFee <= 0 || price <= 0 || price >= 1) return 0;
-  const feeRate = baseFee / 10000;
-  return grossShares * feeRate * price * (1 - price);
+  // Map baseFee to (feeRate, exponent) matching Polymarket's tiered fee structure
+  let feeRate: number;
+  let exponent: number;
+  if (baseFee >= 1000) {
+    feeRate = 0.25;
+    exponent = 2;
+  } else if (baseFee >= 700) {
+    feeRate = 0.0175;
+    exponent = 1;
+  } else {
+    feeRate = baseFee / 10000;
+    exponent = 1;
+  }
+  return grossShares * feeRate * Math.pow(price * (1 - price), exponent);
 }
 
 const FEE_CACHE_TTL_MS = 3600_000; // 1 hour

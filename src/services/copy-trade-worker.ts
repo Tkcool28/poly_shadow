@@ -239,6 +239,17 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     return;
   }
 
+  // ─── Disable SELL-copy for live trades ───
+  // Analysis of 0x8dxd allocation shows copying trader SELL signals loses money:
+  //   - 67% of sells are on winning positions (destroys profits)
+  //   - Sells + re-entry whipsaw costs more than holding to settlement
+  //   - Hold-to-settlement matches the backtested strategy (backtest never modeled sells)
+  // Paper trades still copy sells for simulation accuracy.
+  if (!isPaper && trade.side === 'SELL') {
+    await createSkippedRecord(trade, 'live SELL-copy disabled (hold-to-settlement strategy)', allocation.id, isPaper);
+    return;
+  }
+
   // ─── Sizing ───
 
   let copyAmountUsd: number;
