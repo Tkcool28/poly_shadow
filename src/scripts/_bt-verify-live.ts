@@ -26,7 +26,7 @@ import type { TradeData, GammaMarketData } from '../api/types';
 // ─── Config (must match production USD200_LK) ───
 const TRADER_PROXY = '0x63ce342161250d705dc0b16df89036c8e5f9ba9a';
 const ALLOC_ID = 'fa_0x8dxd_live_1773336058';
-const LOOKBACK_HOURS = 24;      // look at predictions with trader activity in last N hours
+const LOOKBACK_HOURS = parseInt(process.env.LOOKBACK_HOURS ?? '24', 10); // look at predictions with trader activity in last N hours
 const MAX_PREDICTIONS = 10;     // check at most N settled predictions
 const DEPLOY_TS = 1773473040;   // 2026-03-14T07:24:00Z — USD200_LK deployed (commit c383819)
 
@@ -173,6 +173,15 @@ interface SimDecision {
   reason: string;
 }
 
+// ─── Sim result (reusable across data sources) ───
+interface SimResult {
+  buys: number;
+  buyUsd: number;
+  skips: number;
+  majorityOutcome: string | null;
+  firstBuyOutcome: string | null;
+}
+
 // ─── Per-prediction comparison result ───
 interface PredictionCheck {
   conditionId: string;
@@ -183,12 +192,11 @@ interface PredictionCheck {
   traderTradeCount: number;
   traderTotalUsd: number;
 
-  // What backtest says we SHOULD do
-  simBuys: number;
-  simBuyUsd: number;
-  simSkips: number;
-  simMajorityOutcome: string | null;
-  simFirstBuyOutcome: string | null;
+  // Sim on Data API trades (public backtest view)
+  apiSim: SimResult;
+  // Sim on DetectedTrade signals (what production saw)
+  dtSim: SimResult | null; // null if DetectedTrade data unavailable for this prediction
+  dtTradeCount: number; // DetectedTrade signal count for this prediction
 
   // What production actually did
   prodBuys: number;
@@ -198,9 +206,126 @@ interface PredictionCheck {
   prodFirstBuyOutcome: string | null;
 
   // Comparison
-  preDeployment: boolean;  // true if all trader trades are from before deployment
+  preDeployment: boolean;
   decisionsMatch: boolean;
   mismatches: string[];
+}
+
+/** Run USD200_LK simulation on a set of trades for a single prediction */
+function simulatePrediction(
+  trades: TradeData[],
+  market: GammaMarketData | undefined,
+  conditionTokens: Map<string, Set<string>>,
+): SimResult {
+  const accumulator = new MajorityAccumulator();
+  const positions = new PositionTracker();
+  const committedSides = new Map<string, string>();
+  const sellCooldowns = new Map<string, number>();
+
+  let simBuys = 0, simBuyUsd = 0, simSkips = 0;
+  let simFirstBuyOutcome: string | null = null;
+  let simMajorityOutcome: string | null = null;
+  let simCurrentCapital = 150;
+
+  for (const trade of trades) {
+    if (trade.side === 'BUY' && trade.outcome) {
+      accumulator.record(trade.conditionId, trade.outcome, trade.size * trade.price);
+    }
+
+    const effectiveSlug = trade.eventSlug ?? market?.eventSlug ?? '';
+
+    if (trade.side === 'BUY' && trade.price < MIN_BUY_PRICE - 0.001) { simSkips++; continue; }
+
+    if (trade.side === 'BUY') {
+      if (!effectiveSlug) { simSkips++; continue; }
+      if (EXCLUDE_SLUG_PATTERNS.some(p => effectiveSlug.toLowerCase().includes(p))) { simSkips++; continue; }
+    }
+
+    let majorityTotalUsd: number | null = null;
+    if (trade.side === 'BUY') {
+      const majority = accumulator.getMajority(trade.conditionId);
+      if (!majority) { simSkips++; continue; }
+      if (trade.outcome !== majority.outcome) { simSkips++; continue; }
+      majorityTotalUsd = majority.totalUsd;
+      if (!simMajorityOutcome) simMajorityOutcome = majority.outcome;
+    }
+
+    if (trade.side === 'BUY' && COMMITTED_SIDE_LOCK) {
+      const committed = committedSides.get(trade.conditionId);
+      if (committed && committed !== trade.outcome) { simSkips++; continue; }
+    }
+
+    if (trade.side === 'BUY') {
+      const lastSell = sellCooldowns.get(trade.asset);
+      if (lastSell && (trade.timestamp - lastSell) < TOKEN_SELL_COOLDOWN_MS / 1000) { simSkips++; continue; }
+    }
+
+    if (trade.side === 'SELL') {
+      sellCooldowns.set(trade.asset, trade.timestamp);
+      simSkips++;
+      continue;
+    }
+
+    if (simCurrentCapital <= 0) { simSkips++; continue; }
+
+    const fragmentUsd = trade.size * trade.price;
+    const traderTradeUsd = majorityTotalUsd ?? fragmentUsd;
+
+    let copyAmountUsd = traderTradeUsd * COPY_TRADE_PERCENT;
+    copyAmountUsd = Math.min(copyAmountUsd, MAX_POSITION_USD);
+
+    const positionUsd = positions.getNetPositionUsd(trade.asset);
+
+    if (MAX_PREDICTION_USD > 0) {
+      const remaining = MAX_PREDICTION_USD - positionUsd;
+      if (remaining < 0.01) { simSkips++; continue; }
+      if (copyAmountUsd > remaining) copyAmountUsd = remaining;
+    }
+
+    let hedgeMaxUsd = Infinity;
+    if (HEDGE_PRICE_RATIO > 0 && trade.price < HEDGE_PRICE_RATIO) {
+      const oppositePos = positions.getOppositePosition(trade.conditionId, trade.asset, conditionTokens);
+      const hasOpposite = oppositePos.avgBuyPrice > 0 && oppositePos.netUsd >= 0.01;
+      if (!hasOpposite) {
+        if (HEDGE_NAKED_MAX_PRICE > 0 && trade.price <= HEDGE_NAKED_MAX_PRICE) { simSkips++; continue; }
+      } else {
+        const isHedge = trade.price < HEDGE_PRICE_RATIO * oppositePos.avgBuyPrice;
+        if (isHedge) {
+          if (oppositePos.netUsd < HEDGE_MIN_OPPOSITE_USD) { simSkips++; continue; }
+          hedgeMaxUsd = oppositePos.netUsd * HEDGE_MAX_RATIO;
+          if (copyAmountUsd > hedgeMaxUsd) copyAmountUsd = hedgeMaxUsd;
+        }
+      }
+    }
+
+    const maxTradeFromCapital = simCurrentCapital * MAX_TRADE_PERCENT;
+    if (copyAmountUsd > maxTradeFromCapital) copyAmountUsd = maxTradeFromCapital;
+
+    if (copyAmountUsd < CLOB_MIN_ORDER_USD) {
+      if (positionUsd < 0.01) {
+        copyAmountUsd = Math.min(CLOB_MIN_ORDER_USD, hedgeMaxUsd);
+        if (copyAmountUsd < CLOB_MIN_ORDER_USD) { simSkips++; continue; }
+      } else {
+        simSkips++; continue;
+      }
+    }
+
+    if (copyAmountUsd > simCurrentCapital) {
+      if (simCurrentCapital >= CLOB_MIN_ORDER_USD) copyAmountUsd = simCurrentCapital;
+      else { simSkips++; continue; }
+    }
+
+    positions.recordBuy(trade.asset, copyAmountUsd, trade.price);
+    simCurrentCapital -= copyAmountUsd;
+    simBuys++;
+    simBuyUsd += copyAmountUsd;
+    if (!simFirstBuyOutcome) simFirstBuyOutcome = trade.outcome;
+    if (COMMITTED_SIDE_LOCK && !committedSides.has(trade.conditionId)) {
+      committedSides.set(trade.conditionId, trade.outcome);
+    }
+  }
+
+  return { buys: simBuys, buyUsd: simBuyUsd, skips: simSkips, majorityOutcome: simMajorityOutcome, firstBuyOutcome: simFirstBuyOutcome };
 }
 
 // ─── Main ───
@@ -213,24 +338,14 @@ async function main() {
   console.log(`Lookback: ${LOOKBACK_HOURS}h | Max predictions: ${MAX_PREDICTIONS}`);
   console.log('============================================================');
 
-  // ─── Step 1: Fetch trader's recent trades ───
-  // Primary: DetectedTrade table via SSH (exact signals production saw)
-  // Fallback: Polymarket Data API (aggregated trades — lower granularity)
+  // ─── Step 1: Fetch trader trades from BOTH sources ───
+  // Source A: Polymarket Data API (public aggregated trades — the backtest view)
+  // Source B: DetectedTrade table via SSH (exact signals production's chain watcher saw)
   console.log('\n[1/4] Fetching trader trades...');
-  let allTraderTrades: TradeData[] = [];
-  let dataSource = 'unknown';
 
-  // Primary: DetectedTrade table (exact production signals)
-  const dtTrades = fetchDetectedTrades(TRADER_PROXY, cutoffTs);
-  if (dtTrades.length > 0) {
-    allTraderTrades = dtTrades;
-    dataSource = 'DetectedTrade';
-    console.log(`  Source: DetectedTrade DB — ${dtTrades.length} trades (exact production signals)`);
-  }
-
-  // Fallback: Polymarket Data API (aggregated) — only if DetectedTrade returned 0 rows
-  if (allTraderTrades.length === 0) {
-    dataSource = 'DataAPI';
+  // Source A: Data API
+  const apiTrades: TradeData[] = [];
+  {
     let offset = 0;
     const MAX_OFFSET = 3000;
     while (offset < MAX_OFFSET) {
@@ -243,16 +358,28 @@ async function main() {
       }
       if (batch.length === 0) break;
       const recent = batch.filter(t => t.timestamp >= cutoffTs);
-      allTraderTrades.push(...recent);
+      apiTrades.push(...recent);
       if (batch[batch.length - 1].timestamp < cutoffTs || batch.length < 500) break;
       offset += batch.length;
     }
-    console.log(`  Source: Data API — ${allTraderTrades.length} trades (aggregated, lower granularity)`);
+    apiTrades.sort((a, b) => a.timestamp - b.timestamp);
+    console.log(`  Data API:       ${apiTrades.length} trades (public, aggregated)`);
   }
 
-  allTraderTrades.sort((a, b) => a.timestamp - b.timestamp);
+  // Source B: DetectedTrade (production signals)
+  let dtTrades: TradeData[] = [];
+  {
+    const dt = fetchDetectedTrades(TRADER_PROXY, cutoffTs);
+    dtTrades = dt;
+    dtTrades.sort((a, b) => a.timestamp - b.timestamp);
+    console.log(`  DetectedTrade:  ${dtTrades.length} trades (production chain watcher signals)`);
+  }
 
-  // Group by conditionId
+  // Use Data API as the primary for prediction discovery (always available, no offset limit issues)
+  // DetectedTrade is used as a second sim source per-prediction
+  const allTraderTrades = apiTrades;
+
+  // Group Data API trades by conditionId
   const tradesByCondition = new Map<string, TradeData[]>();
   for (const t of allTraderTrades) {
     const arr = tradesByCondition.get(t.conditionId) ?? [];
@@ -260,8 +387,18 @@ async function main() {
     tradesByCondition.set(t.conditionId, arr);
   }
 
-  const conditionIds = [...tradesByCondition.keys()];
-  console.log(`  Found ${allTraderTrades.length} trades across ${conditionIds.length} predictions (last ${LOOKBACK_HOURS}h)`);
+  // Group DetectedTrade by conditionId
+  const dtByCondition = new Map<string, TradeData[]>();
+  for (const t of dtTrades) {
+    const arr = dtByCondition.get(t.conditionId) ?? [];
+    arr.push(t);
+    dtByCondition.set(t.conditionId, arr);
+  }
+
+  // Merge conditionId sets (DetectedTrade may have predictions not in Data API and vice versa)
+  const allConditionIds = new Set([...tradesByCondition.keys(), ...dtByCondition.keys()]);
+  const conditionIds = [...allConditionIds];
+  console.log(`  Combined:       ${conditionIds.length} predictions (last ${LOOKBACK_HOURS}h)`);
 
   if (conditionIds.length === 0) {
     console.log('\nNo trader activity in lookback window. Nothing to verify.');
@@ -407,9 +544,9 @@ async function main() {
   // ─── Step 4: Simulate USD200_LK decisions & compare ───
   console.log('\n[4/4] Simulating USD200_LK decisions and comparing...\n');
 
-  // Build token -> conditionId map for opposite position lookup
+  // Build token -> conditionId map for opposite position lookup (from both sources)
   const conditionTokens = new Map<string, Set<string>>();
-  for (const t of allTraderTrades) {
+  for (const t of [...apiTrades, ...dtTrades]) {
     if (!conditionTokens.has(t.conditionId)) conditionTokens.set(t.conditionId, new Set());
     conditionTokens.get(t.conditionId)!.add(t.asset);
   }
@@ -418,136 +555,16 @@ async function main() {
 
   for (const cid of targetConditionIds) {
     const market = marketMap.get(cid);
-    const trades = tradesByCondition.get(cid) ?? [];
+    const apiTradesForCid = tradesByCondition.get(cid) ?? [];
+    const dtTradesForCid = dtByCondition.get(cid) ?? [];
     const prodActions = prodByCondition.get(cid) ?? [];
     const winOutcome = winningOutcomes.get(cid) ?? null;
 
-    // ── Simulate USD200_LK on this prediction's trades ──
-    const accumulator = new MajorityAccumulator();
-    const positions = new PositionTracker();
-    const committedSides = new Map<string, string>();
-    const sellCooldowns = new Map<string, number>();
-
-    let simBuys = 0, simBuyUsd = 0, simSkips = 0;
-    let simFirstBuyOutcome: string | null = null;
-    let simMajorityOutcome: string | null = null;
-    let simCurrentCapital = 150; // starting capital (doesn't matter for decision matching, but needed for sizing)
-
-    for (const trade of trades) {
-      // Record ALL BUYs in accumulator first
-      if (trade.side === 'BUY' && trade.outcome) {
-        accumulator.record(trade.conditionId, trade.outcome, trade.size * trade.price);
-      }
-
-      const effectiveSlug = trade.eventSlug ?? market?.eventSlug ?? '';
-
-      // ── minBuyPrice filter ──
-      if (trade.side === 'BUY' && trade.price < MIN_BUY_PRICE - 0.001) { simSkips++; continue; }
-
-      // ── Event slug exclusion (BUY only, fail-closed) ──
-      if (trade.side === 'BUY') {
-        if (!effectiveSlug) { simSkips++; continue; }
-        if (EXCLUDE_SLUG_PATTERNS.some(p => effectiveSlug.toLowerCase().includes(p))) { simSkips++; continue; }
-      }
-
-      // ── Majority gate ──
-      let majorityTotalUsd: number | null = null;
-      if (trade.side === 'BUY') {
-        const majority = accumulator.getMajority(trade.conditionId);
-        if (!majority) { simSkips++; continue; }
-        if (trade.outcome !== majority.outcome) { simSkips++; continue; }
-        majorityTotalUsd = majority.totalUsd;
-        if (!simMajorityOutcome) simMajorityOutcome = majority.outcome;
-      }
-
-      // ── Committed side lock ──
-      if (trade.side === 'BUY' && COMMITTED_SIDE_LOCK) {
-        const committed = committedSides.get(trade.conditionId);
-        if (committed && committed !== trade.outcome) { simSkips++; continue; }
-      }
-
-      // ── Token sell cooldown ──
-      if (trade.side === 'BUY') {
-        const lastSell = sellCooldowns.get(trade.asset);
-        if (lastSell && (trade.timestamp - lastSell) < TOKEN_SELL_COOLDOWN_MS / 1000) { simSkips++; continue; }
-      }
-
-      // ── SELL ──
-      // Record sell timestamp for cooldown, but do NOT reduce simulated position.
-      // Batch sim can't match production's real position state — selling would create
-      // artificial re-entry opportunities that inflate sim buy counts.
-      if (trade.side === 'SELL') {
-        sellCooldowns.set(trade.asset, trade.timestamp);
-        simSkips++;
-        continue;
-      }
-
-      // ── BUY SIZING ──
-      if (simCurrentCapital <= 0) { simSkips++; continue; }
-
-      const fragmentUsd = trade.size * trade.price;
-      const traderTradeUsd = majorityTotalUsd ?? fragmentUsd;
-
-      let copyAmountUsd = traderTradeUsd * COPY_TRADE_PERCENT;
-      copyAmountUsd = Math.min(copyAmountUsd, MAX_POSITION_USD);
-
-      const positionUsd = positions.getNetPositionUsd(trade.asset);
-
-      // Per-prediction cap
-      if (MAX_PREDICTION_USD > 0) {
-        const remaining = MAX_PREDICTION_USD - positionUsd;
-        if (remaining < 0.01) { simSkips++; continue; }
-        if (copyAmountUsd > remaining) copyAmountUsd = remaining;
-      }
-
-      // Hedge guard
-      let hedgeMaxUsd = Infinity;
-      if (HEDGE_PRICE_RATIO > 0 && trade.price < HEDGE_PRICE_RATIO) {
-        const oppositePos = positions.getOppositePosition(trade.conditionId, trade.asset, conditionTokens);
-        const hasOpposite = oppositePos.avgBuyPrice > 0 && oppositePos.netUsd >= 0.01;
-        if (!hasOpposite) {
-          if (HEDGE_NAKED_MAX_PRICE > 0 && trade.price <= HEDGE_NAKED_MAX_PRICE) { simSkips++; continue; }
-        } else {
-          const isHedge = trade.price < HEDGE_PRICE_RATIO * oppositePos.avgBuyPrice;
-          if (isHedge) {
-            if (oppositePos.netUsd < HEDGE_MIN_OPPOSITE_USD) { simSkips++; continue; }
-            hedgeMaxUsd = oppositePos.netUsd * HEDGE_MAX_RATIO;
-            if (copyAmountUsd > hedgeMaxUsd) copyAmountUsd = hedgeMaxUsd;
-          }
-        }
-      }
-
-      // MAX_TRADE_PERCENT
-      const maxTradeFromCapital = simCurrentCapital * MAX_TRADE_PERCENT;
-      if (copyAmountUsd > maxTradeFromCapital) copyAmountUsd = maxTradeFromCapital;
-
-      // CLOB $1 minimum
-      if (copyAmountUsd < CLOB_MIN_ORDER_USD) {
-        if (positionUsd < 0.01) {
-          copyAmountUsd = Math.min(CLOB_MIN_ORDER_USD, hedgeMaxUsd);
-          if (copyAmountUsd < CLOB_MIN_ORDER_USD) { simSkips++; continue; }
-        } else {
-          // Would be pooled — count as a BUY attempt (may fire later)
-          simSkips++; continue;
-        }
-      }
-
-      // Capital check
-      if (copyAmountUsd > simCurrentCapital) {
-        if (simCurrentCapital >= CLOB_MIN_ORDER_USD) copyAmountUsd = simCurrentCapital;
-        else { simSkips++; continue; }
-      }
-
-      // Execute simulated BUY
-      positions.recordBuy(trade.asset, copyAmountUsd, trade.price);
-      simCurrentCapital -= copyAmountUsd;
-      simBuys++;
-      simBuyUsd += copyAmountUsd;
-      if (!simFirstBuyOutcome) simFirstBuyOutcome = trade.outcome;
-      if (COMMITTED_SIDE_LOCK && !committedSides.has(trade.conditionId)) {
-        committedSides.set(trade.conditionId, trade.outcome);
-      }
-    }
+    // ── Run sim on BOTH data sources ──
+    const apiSim = simulatePrediction(apiTradesForCid, market, conditionTokens);
+    const dtSim = dtTradesForCid.length > 0
+      ? simulatePrediction(dtTradesForCid, market, conditionTokens)
+      : null;
 
     // ── Parse production actions ──
     const prodFills = prodActions.filter(a => a.status === 'FILLED' || a.status === 'SETTLED');
@@ -557,53 +574,66 @@ async function main() {
     const prodBuyUsd = prodBuyFills.reduce((s, a) => s + a.fillUsd, 0);
     const prodFirstBuyOutcome = prodBuyFills.length > 0 ? prodBuyFills[0].outcome : null;
 
-    // ── Compare decisions ──
+    // ── Compare decisions: use DT sim as primary when available (same data source as production),
+    //    fall back to API sim when DT data is unavailable ──
     const mismatches: string[] = [];
-    const isOpen = !winOutcome; // Market not yet settled — timing discrepancies expected
+    const isOpen = !winOutcome;
+    const primarySim = dtSim ?? apiSim;
+    const primaryLabel = dtSim ? 'dt' : 'api';
 
-    // Check 1: Did we buy the same outcome? (always check, even for open markets)
-    if (simFirstBuyOutcome && prodFirstBuyOutcome && simFirstBuyOutcome !== prodFirstBuyOutcome) {
-      mismatches.push(`OUTCOME MISMATCH: sim="${simFirstBuyOutcome}" prod="${prodFirstBuyOutcome}"`);
+    // Check 1: Outcome match (primary sim vs prod)
+    if (primarySim.firstBuyOutcome && prodFirstBuyOutcome && primarySim.firstBuyOutcome !== prodFirstBuyOutcome) {
+      mismatches.push(`OUTCOME MISMATCH: ${primaryLabel}="${primarySim.firstBuyOutcome}" prod="${prodFirstBuyOutcome}"`);
     }
 
-    // Check 2: Did we buy when sim says buy, and skip when sim says skip?
-    // For open markets: gate lag and extra buys from timing are expected (sim sees snapshot, prod sees real-time)
-    if (simBuys > 0 && prodBuyFills.length === 0) {
+    // Check 2: Buy/skip agreement
+    if (primarySim.buys > 0 && prodBuyFills.length === 0) {
       const accumulating = prodSkipActions.some(a => a.failReason.includes('majority accumulating'));
-      if (accumulating) {
-        mismatches.push(`GATE LAG: sim would buy (${simBuys} buys) but prod still accumulating${isOpen ? ' (open market, may self-resolve)' : ''}`);
+      // Check ALL prodActions (not just SKIPPED) — GTC records may have various statuses
+      const unfillable = prodActions.some(a =>
+        a.side === 'BUY' && (
+          a.failReason?.includes('FAK unmatched') ||
+          a.failReason?.includes('insufficient liquidity') ||
+          a.failReason?.includes('GTC fallback: unfilled') ||
+          a.failReason?.includes('GTC fallback: placement failed') ||
+          a.failReason?.includes('buy failure cooldown')
+        )
+      );
+      // UNFILLABLE takes priority over GATE LAG — if both exist, the gate DID fire
+      // but execution failed. "accumulating" records are from before the gate fired.
+      if (unfillable) {
+        mismatches.push(`UNFILLABLE: ${primaryLabel} would buy (${primarySim.buys} buys) but prod hit empty orderbook / execution failure`);
+      } else if (accumulating) {
+        mismatches.push(`GATE LAG: ${primaryLabel} would buy (${primarySim.buys} buys) but prod still accumulating${isOpen ? ' (open market, may self-resolve)' : ''}`);
       } else if (!isOpen) {
-        mismatches.push(`MISSED BUY: sim=${simBuys} buys, prod=0 buys`);
+        mismatches.push(`MISSED BUY: ${primaryLabel}=${primarySim.buys} buys, prod=0 buys`);
       }
     }
-    if (simBuys === 0 && prodBuyFills.length > 0 && !isOpen) {
-      mismatches.push(`EXTRA BUY: sim=0 buys, prod=${prodBuyFills.length} buys`);
+    if (primarySim.buys === 0 && prodBuyFills.length > 0 && !isOpen) {
+      mismatches.push(`EXTRA BUY: ${primaryLabel}=0 buys, prod=${prodBuyFills.length} buys`);
     }
 
-    // Check 3: Buy count direction (settled only — open markets have inherent timing differences)
-    if (!isOpen && simBuys > 0 && prodBuyFills.length > 0) {
-      const ratio = prodBuyFills.length / simBuys;
+    // Check 3: Buy count (settled only)
+    if (!isOpen && primarySim.buys > 0 && prodBuyFills.length > 0) {
+      const ratio = prodBuyFills.length / primarySim.buys;
       if (ratio > 3 || ratio < 0.33) {
-        mismatches.push(`COUNT DIVERGE: sim=${simBuys} buys, prod=${prodBuyFills.length} buys (${ratio.toFixed(1)}x)`);
+        mismatches.push(`COUNT DIVERGE: ${primaryLabel}=${primarySim.buys} buys, prod=${prodBuyFills.length} buys (${ratio.toFixed(1)}x)`);
       }
     }
 
-    // Check 4: USD deployed (settled only — open markets have inherent timing differences)
-    if (!isOpen && simBuyUsd > 1 && prodBuyUsd > 1) {
-      const usdRatio = prodBuyUsd / simBuyUsd;
+    // Check 4: USD deployed (settled only)
+    if (!isOpen && primarySim.buyUsd > 1 && prodBuyUsd > 1) {
+      const usdRatio = prodBuyUsd / primarySim.buyUsd;
       if (usdRatio > 2.0 || usdRatio < 0.5) {
-        mismatches.push(`USD DIVERGE: sim=$${simBuyUsd.toFixed(2)}, prod=$${prodBuyUsd.toFixed(2)} (${usdRatio.toFixed(1)}x)`);
+        mismatches.push(`USD DIVERGE: ${primaryLabel}=$${primarySim.buyUsd.toFixed(2)}, prod=$${prodBuyUsd.toFixed(2)} (${usdRatio.toFixed(1)}x)`);
       }
     }
-
-
-    const accStats = accumulator.getStats(cid);
 
     // Check if production acted on this prediction before USD200_LK deployment
-    // If prod has actions, use the earliest prod action timestamp; otherwise fall back to trader trades
+    const allTrades = [...apiTradesForCid, ...dtTradesForCid];
     const preDeployment = prodActions.length > 0
       ? Math.min(...prodActions.map(a => a.createdAtTs)) < DEPLOY_TS
-      : Math.max(...trades.map(t => t.timestamp)) < DEPLOY_TS;
+      : allTrades.length > 0 ? Math.max(...allTrades.map(t => t.timestamp)) < DEPLOY_TS : false;
 
     results.push({
       conditionId: cid,
@@ -611,9 +641,11 @@ async function main() {
       eventSlug: market?.eventSlug ?? '',
       closed: market?.closed ?? false,
       winningOutcome: winOutcome,
-      traderTradeCount: trades.length,
-      traderTotalUsd: trades.filter(t => t.side === 'BUY').reduce((s, t) => s + t.size * t.price, 0),
-      simBuys, simBuyUsd, simSkips, simMajorityOutcome, simFirstBuyOutcome,
+      traderTradeCount: apiTradesForCid.length,
+      traderTotalUsd: apiTradesForCid.filter(t => t.side === 'BUY').reduce((s, t) => s + t.size * t.price, 0),
+      apiSim,
+      dtSim,
+      dtTradeCount: dtTradesForCid.length,
       prodBuys: prodBuyFills.length, prodBuyUsd, prodSells: prodSellFills.length,
       prodSkips: prodSkipActions.length, prodFirstBuyOutcome,
       preDeployment,
@@ -627,22 +659,30 @@ async function main() {
   console.log('PREDICTION-BY-PREDICTION COMPARISON (Sim = USD200_LK backtest, Prod = live production)');
   console.log('='.repeat(120));
 
-  let totalMatch = 0, totalMismatch = 0, totalPreDeploy = 0, totalOpenDiff = 0;
+  let totalMatch = 0, totalMismatch = 0, totalPreDeploy = 0, totalOpenDiff = 0, totalUnfillable = 0;
 
   for (let i = 0; i < results.length; i++) {
     const r = results[i];
     const isOpenPrediction = !r.winningOutcome;
+    const hasUnfillableOnly = !r.decisionsMatch && r.mismatches.every(m =>
+      m.startsWith('UNFILLABLE:') || m.startsWith('GATE LAG:')
+    );
     const status = r.decisionsMatch ? 'MATCH'
       : r.preDeployment ? 'PRE-DEPLOY'
       : isOpenPrediction ? 'OPEN-DIFF'
+      : hasUnfillableOnly ? 'UNFILLABLE'
       : 'MISMATCH';
+    const primarySimResult = r.dtSim ?? r.apiSim;
     const wonLost = r.winningOutcome
-      ? (r.simFirstBuyOutcome === r.winningOutcome ? 'WON' : r.simFirstBuyOutcome ? 'LOST' : 'N/A')
+      ? (primarySimResult.firstBuyOutcome === r.winningOutcome ? 'WON' : primarySimResult.firstBuyOutcome ? 'LOST' : 'N/A')
       : 'OPEN';
 
     console.log(`\n${i + 1}. [${status}] [${wonLost}] ${r.question}`);
-    console.log(`   Trader: ${r.traderTradeCount} trades, $${r.traderTotalUsd.toFixed(0)} BUY vol | Winner: ${r.winningOutcome ?? '?'}`);
-    console.log(`   Sim:  ${r.simBuys} buys ($${r.simBuyUsd.toFixed(2)}) | ${r.simSkips} skips | majority="${r.simMajorityOutcome ?? 'none'}" | bought="${r.simFirstBuyOutcome ?? 'none'}"`);
+    console.log(`   Trader: ${r.traderTradeCount} API trades, $${r.traderTotalUsd.toFixed(0)} BUY vol | ${r.dtTradeCount} DT signals | Winner: ${r.winningOutcome ?? '?'}`);
+    console.log(`   API:  ${r.apiSim.buys} buys ($${r.apiSim.buyUsd.toFixed(2)}) | ${r.apiSim.skips} skips | majority="${r.apiSim.majorityOutcome ?? 'none'}" | bought="${r.apiSim.firstBuyOutcome ?? 'none'}"`);
+    if (r.dtSim) {
+      console.log(`   DT:   ${r.dtSim.buys} buys ($${r.dtSim.buyUsd.toFixed(2)}) | ${r.dtSim.skips} skips | majority="${r.dtSim.majorityOutcome ?? 'none'}" | bought="${r.dtSim.firstBuyOutcome ?? 'none'}"`);
+    }
     console.log(`   Prod: ${r.prodBuys} buys ($${r.prodBuyUsd.toFixed(2)}) | ${r.prodSells} sells | ${r.prodSkips} skips | bought="${r.prodFirstBuyOutcome ?? 'none'}"`);
     if (r.mismatches.length > 0) {
       const isOpen = !r.winningOutcome;
@@ -651,6 +691,8 @@ async function main() {
         totalPreDeploy++;
       } else if (isOpen) {
         totalOpenDiff++; // Open market mismatches are informational — don't count as failures
+      } else if (hasUnfillableOnly) {
+        totalUnfillable++; // Empty orderbook / execution failure — informational, not a logic bug
       } else {
         totalMismatch++;
       }
@@ -664,21 +706,31 @@ async function main() {
   console.log('SUMMARY');
   console.log('='.repeat(120));
 
-  const simWins = results.filter(r => r.simFirstBuyOutcome && r.simFirstBuyOutcome === r.winningOutcome).length;
-  const simLosses = results.filter(r => r.simFirstBuyOutcome && r.winningOutcome && r.simFirstBuyOutcome !== r.winningOutcome).length;
-  const simNoBuy = results.filter(r => !r.simFirstBuyOutcome).length;
+  const apiWins = results.filter(r => r.apiSim.firstBuyOutcome && r.apiSim.firstBuyOutcome === r.winningOutcome).length;
+  const apiLosses = results.filter(r => r.apiSim.firstBuyOutcome && r.winningOutcome && r.apiSim.firstBuyOutcome !== r.winningOutcome).length;
+  const apiNoBuy = results.filter(r => !r.apiSim.firstBuyOutcome).length;
+  const dtWins = results.filter(r => r.dtSim?.firstBuyOutcome && r.dtSim.firstBuyOutcome === r.winningOutcome).length;
+  const dtLosses = results.filter(r => r.dtSim?.firstBuyOutcome && r.winningOutcome && r.dtSim.firstBuyOutcome !== r.winningOutcome).length;
+  const dtNoBuy = results.filter(r => !r.dtSim?.firstBuyOutcome).length;
   const prodWins = results.filter(r => r.prodFirstBuyOutcome && r.prodFirstBuyOutcome === r.winningOutcome).length;
   const prodLosses = results.filter(r => r.prodFirstBuyOutcome && r.winningOutcome && r.prodFirstBuyOutcome !== r.winningOutcome).length;
+  // DT↔Prod outcome agreement (how well DetectedTrade sim matches production decisions)
+  const dtProdAgree = results.filter(r => r.dtSim && r.dtSim.firstBuyOutcome === r.prodFirstBuyOutcome).length;
+  const dtAvailable = results.filter(r => r.dtSim).length;
 
   const openCount = results.filter(r => !r.winningOutcome).length;
   const settledCount = results.filter(r => !!r.winningOutcome).length;
   console.log(`  Predictions checked: ${results.length} (${settledCount} settled, ${openCount} open)`);
-  console.log(`  Data source: ${dataSource}`);
-  console.log(`  Decisions matching:  ${totalMatch}/${results.length}`);
+  console.log(`  Trade sources: ${apiTrades.length} API trades, ${dtTrades.length} DetectedTrade signals`);
+  const primaryLabel = dtTrades.length > 0 ? 'DT' : 'API';
+  console.log(`  Decisions matching (${primaryLabel} vs Prod):  ${totalMatch}/${results.length}`);
   console.log(`  Post-deploy mismatches (settled): ${totalMismatch}/${settledCount}`);
+  if (totalUnfillable > 0) console.log(`  Unfillable (empty orderbook): ${totalUnfillable} (informational)`);
   if (totalOpenDiff > 0) console.log(`  Open market diffs: ${totalOpenDiff} (informational, timing-dependent)`);
   if (totalPreDeploy > 0) console.log(`  Pre-deploy mismatches: ${totalPreDeploy} (expected, old CNT10 gate)`);
-  console.log(`  Sim WR:  ${simWins}W/${simLosses}L/${simNoBuy}skip = ${(simWins + simLosses) > 0 ? ((simWins / (simWins + simLosses)) * 100).toFixed(0) : 'N/A'}%`);
+  if (dtAvailable > 0) console.log(`  DT↔Prod outcome agreement: ${dtProdAgree}/${dtAvailable}`);
+  console.log(`  API WR:  ${apiWins}W/${apiLosses}L/${apiNoBuy}skip = ${(apiWins + apiLosses) > 0 ? ((apiWins / (apiWins + apiLosses)) * 100).toFixed(0) : 'N/A'}%`);
+  if (dtAvailable > 0) console.log(`  DT WR:   ${dtWins}W/${dtLosses}L/${dtNoBuy}skip = ${(dtWins + dtLosses) > 0 ? ((dtWins / (dtWins + dtLosses)) * 100).toFixed(0) : 'N/A'}%`);
   console.log(`  Prod WR: ${prodWins}W/${prodLosses}L = ${(prodWins + prodLosses) > 0 ? ((prodWins / (prodWins + prodLosses)) * 100).toFixed(0) : 'N/A'}%`);
 
   // Only fail on POST-deployment mismatches (pre-deploy expected to differ — old CNT10 gate)

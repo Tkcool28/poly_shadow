@@ -291,12 +291,14 @@ async function resolveGtcFallback(
           filledSize: sizeMatched,
           filledPrice: orderPrice,
           requestedAmount: sizeMatched * orderPrice,
+          estimatedFee: 0, // GTC fills are maker orders — 0% fee on Polymarket
           failReason: `[gtc-fallback-filled] restMs=${config.GTC_FALLBACK_REST_MS}`,
           filledAt: new Date(),
         },
       });
       log.info('GTC fallback: FILLED', {
         copyTradeId, orderId, sizeMatched, orderPrice,
+        estimatedFee: 0,
         restMs: config.GTC_FALLBACK_REST_MS,
       });
       await correctCapital(allocationId);

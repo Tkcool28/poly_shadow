@@ -158,14 +158,18 @@ export async function reconcileSkippedGhostFills(): Promise<void> {
     where: {
       status: 'SKIPPED',
       orderId: { not: null },
-      failReason: { contains: 'FAK unmatched' },
+      OR: [
+        { failReason: { contains: 'FAK unmatched' } },
+        { failReason: { contains: 'GTC fallback: unfilled' } },
+        { failReason: { contains: 'GTC fallback: placement failed' } },
+      ],
       isPaper: false,
       createdAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
     },
   });
 
   if (skippedWithOrderId.length === 0) return;
-  log.info(`Ghost fill reconciliation: checking ${skippedWithOrderId.length} SKIPPED FAK trades`);
+  log.info(`Ghost fill reconciliation: checking ${skippedWithOrderId.length} SKIPPED FAK/GTC trades`);
 
   const client = getClient();
   if (!client) {
@@ -199,7 +203,7 @@ export async function reconcileSkippedGhostFills(): Promise<void> {
               status: 'FILLED',
               filledSize: sizeMatched,
               filledPrice: recoveredPrice,
-              failReason: `[ghost-fill-recovered] original: SKIPPED FAK unmatched, orderPrice=${orderPrice}`,
+              failReason: `[ghost-fill-recovered] original: SKIPPED ${record.failReason?.includes('GTC') ? 'GTC' : 'FAK'}, orderPrice=${orderPrice}`,
               filledAt: record.createdAt,
               requestedAmount: sizeMatched * recoveredPrice,
             },

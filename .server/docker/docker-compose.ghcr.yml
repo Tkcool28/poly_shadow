@@ -80,10 +80,13 @@ services:
     container_name: polymarket_copy_trader
     command: ["src/jobs/copy-trader.ts"]
     stop_grace_period: 45s
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: --max-old-space-size=820
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 1024M
 
   trade-monitor:
     <<: *worker-base
