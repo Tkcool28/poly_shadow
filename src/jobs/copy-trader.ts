@@ -43,7 +43,7 @@ const MARKET_REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 min
 // ─── Pipeline infrastructure (Change 5) ───
 
 const clobLimiter = pLimit(10);
-const MAX_DRAIN_BATCH_SIZE = 20;
+const MAX_DRAIN_BATCH_SIZE = 100;
 
 // ─── DrainCache (Change 3) ───
 
@@ -1125,7 +1125,10 @@ async function main() {
       // BUYs only need wallets with buying power (filters out broke allocations)
       const allActiveAllocations = await prisma.followAllocation.findMany({
         where: { isActive: true },
-        select: { proxyWallet: true, currentCapital: true, copyMakerFills: true },
+        select: {
+          id: true, proxyWallet: true, currentCapital: true, copyMakerFills: true,
+          isPaper: true, minBuyPrice: true, excludeEventSlugPatterns: true,
+        },
       });
       const allActiveWallets = allActiveAllocations.map(a => a.proxyWallet);
       const buyEligibleWallets = allActiveAllocations
@@ -1191,6 +1194,71 @@ async function main() {
             orderBy: { detectedAt: 'asc' },
           });
         }
+      }
+
+      // ── Pre-filter makerBuys: batch-skip obvious no-ops, preserve majority accumulation ──
+      // 1. Feed recordTraderBuy() for ALL signals (majority accumulator contract)
+      // 2. Filter out signals that fail minBuyPrice / eventSlug checks
+      // 3. Batch-create SKIPPED records for filtered signals (prevents re-fetch on next drain)
+      // Qualifying signals proceed to phaseA/processCopyTrade which calls recordTraderBuy again —
+      // but that's fine because filtered signals get SKIPPED records and won't appear in future drains.
+      if (makerBuys.length > 0) {
+        const qualifying: typeof makerBuys = [];
+        const preFiltered: Array<{ trade: typeof makerBuys[0]; alloc: typeof allActiveAllocations[0] }> = [];
+
+        for (const t of makerBuys) {
+          const alloc = allActiveAllocations.find(a => a.proxyWallet === t.proxyWallet);
+          let dominated = false;
+
+          if (t.side === 'BUY' && alloc) {
+            // minBuyPrice pre-filter (covers ~74% of skips)
+            if (alloc.minBuyPrice != null && t.price < alloc.minBuyPrice - 0.001) {
+              dominated = true;
+            }
+            // eventSlug pre-filter (covers ~12% of skips) — fail-open when slug unavailable
+            if (!dominated && alloc.excludeEventSlugPatterns != null && t.eventSlug) {
+              const patterns = alloc.excludeEventSlugPatterns.split(',').map(p => p.trim().toLowerCase());
+              if (patterns.some(p => t.eventSlug!.toLowerCase().includes(p))) {
+                dominated = true;
+              }
+            }
+          }
+
+          if (dominated) {
+            // Feed majority accumulator so getMajoritySide() sees full signal volume
+            recordTraderBuy(t.proxyWallet, t.conditionId, t.outcome, t.size * t.price);
+            preFiltered.push({ trade: t, alloc: alloc! });
+          } else {
+            qualifying.push(t);
+          }
+        }
+
+        // Batch-create SKIPPED records — prevents re-fetch on next drain cycle
+        // (without this, pre-filtered signals stay copyTrade:null and get re-fetched every 7s)
+        if (preFiltered.length > 0) {
+          try {
+            await prisma.copyTrade.createMany({
+              data: preFiltered.map(({ trade: t, alloc }) => ({
+                detectedTradeId: t.id,
+                tokenId: t.asset,
+                side: t.side,
+                requestedAmount: 0,
+                requestedPrice: t.price,
+                status: 'SKIPPED',
+                isPaper: alloc.isPaper,
+                failReason: 'CHAIN_MAKER pre-filtered (price/slug)',
+                latencyMs: 0,
+                followAllocationId: alloc.id,
+              })),
+              skipDuplicates: true,
+            });
+          } catch (err: any) {
+            // Non-fatal: if batch insert fails, signals will be re-fetched and processed normally
+            log.warn(`CHAIN_MAKER pre-filter batch skip failed: ${err.message}`);
+          }
+          log.info(`CHAIN_MAKER pre-filter: ${preFiltered.length}/${makerBuys.length} batch-skipped (${qualifying.length} qualifying)`);
+        }
+        makerBuys = qualifying;
       }
 
       // SELLs first (exits are time-sensitive), then BUYs
