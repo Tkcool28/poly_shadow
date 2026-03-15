@@ -443,6 +443,12 @@ async function phaseA(
     return null;
   }
 
+  // ─── Disable SELL-copy for live trades (must mirror copy-trade-worker.ts guard) ───
+  if (!isPaper && trade.side === 'SELL') {
+    await createSkippedRecord(trade, 'live SELL-copy disabled (hold-to-settlement strategy)', allocation.id, isPaper);
+    return null;
+  }
+
   // Sizing
   let copyAmountUsd: number;
   let sellShares: number | null = null;
