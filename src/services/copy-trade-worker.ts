@@ -256,7 +256,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   let sellShares: number | null = null;
   let traderTradeUsd: number | null = null;
 
-  if (trade.side === 'SELL') {
+  if (trade.side === 'SELL') { // Paper trades only — live SELLs are skipped above
     // Short-circuit if a recent SELL on this tokenId already failed (market closed/dead)
     if (isInSellFailureCooldown(allocation.id, trade.asset)) {
       await createSkippedRecord(trade, 'sell failure cooldown active', allocation.id, isPaper);
