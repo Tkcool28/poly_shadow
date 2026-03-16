@@ -12,7 +12,7 @@ const CTF_EXCHANGE_ADDRESSES = [
 // keccak256('OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)')
 const ORDER_FILLED_TOPIC = '0xd0a08e8c493f9c94f29311604c9de1b4e8c8d4c06bd0c789af57f2d65bfec0f6';
 const INITIAL_RECONNECT_MS = 1000;
-const TAKER_DEBOUNCE_MS = 60; // debounce taker events to let MAKER events arrive first (was 200→100→60ms, phantom tracking P99=37ms, max=41ms, 19ms safety margin)
+const TAKER_DEBOUNCE_MS = 100; // debounce taker events to let MAKER events arrive first (was 200→100→60→100ms; 60ms caused 12% phantom leak rate across 208 samples, max observed 167ms)
 const BACKFILL_CHUNK_SIZE = 500; // yield to event loop every N log entries during backfill
 
 function yieldToEventLoop(): Promise<void> {
