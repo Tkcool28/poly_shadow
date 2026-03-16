@@ -7,9 +7,10 @@ export async function reconcileCapital(options: {
   verbose?: boolean;
   full?: boolean;
   claim?: boolean;
+  claimAll?: boolean;
   realign?: boolean;
 }): Promise<void> {
-  const { fix = false, verbose = false, full = false, claim = false, realign = false } = options;
+  const { fix = false, verbose = false, full = false, claim = false, claimAll = false, realign = false } = options;
 
   console.log('\n=== Capital Reconciliation ===\n');
 
@@ -123,6 +124,11 @@ export async function reconcileCapital(options: {
   // ─── Claim sweep ───
   if (claim) {
     await triggerClaimSweep();
+  }
+
+  // ─── Claim all (from API positions) ───
+  if (claimAll) {
+    await claimAllFromApi();
   }
 }
 
@@ -385,6 +391,95 @@ async function triggerClaimSweep(): Promise<void> {
     console.log('Sweep complete.');
   } catch (err: any) {
     console.log(`Sweep failed: ${err.message}`);
+  }
+}
+
+// ─── Claim All (API-based) ───────────────────────────────────────────────────────
+
+async function claimAllFromApi(): Promise<void> {
+  console.log('\n=== Claim All (API-based) ===\n');
+
+  if (!config.AUTO_CLAIM_ENABLED || !config.PRIVATE_KEY) {
+    console.log('AUTO_CLAIM_ENABLED=false or PRIVATE_KEY not set');
+    return;
+  }
+
+  if (config.SIGNATURE_TYPE === 2) {
+    console.log('SIGNATURE_TYPE=2 (Gnosis Safe) — not supported');
+    return;
+  }
+
+  const funder = config.FUNDER_ADDRESS;
+  if (!funder) {
+    console.log('FUNDER_ADDRESS not set');
+    return;
+  }
+
+  // 1. Fetch all API positions
+  const { getAllPositions } = await import('../api/data-api.js');
+  const positions = await getAllPositions(funder);
+
+  // 2. Filter to claimable (redeemable flag or price >= 0.95 with meaningful size)
+  const claimable = positions.filter(p =>
+    p.size > 0.5 && (p.redeemable || (p.curPrice != null && p.curPrice >= 0.95))
+  );
+
+  if (claimable.length === 0) {
+    console.log('No claimable positions found on API.');
+    return;
+  }
+
+  // 3. Dedupe by conditionId (on-chain redeems entire conditionId at once)
+  const byCondition = new Map<string, { conditionId: string; outcomeIndex: number; totalShares: number }>();
+  for (const p of claimable) {
+    const existing = byCondition.get(p.conditionId);
+    if (existing) {
+      existing.totalShares += p.size;
+    } else {
+      byCondition.set(p.conditionId, {
+        conditionId: p.conditionId,
+        outcomeIndex: p.outcomeIndex,
+        totalShares: p.size,
+      });
+    }
+  }
+
+  console.log(`Found ${claimable.length} claimable positions across ${byCondition.size} conditionIds\n`);
+
+  // 4. Redeem each conditionId
+  const { redeemWinningPositions } = await import('../services/position-claim.js');
+
+  const toRedeem: Array<{ conditionId: string; outcomeIndex: number; netShares: number; tokenId: string; followAllocationId: string }> = [];
+  for (const entry of byCondition.values()) {
+    toRedeem.push({
+      conditionId: entry.conditionId,
+      outcomeIndex: entry.outcomeIndex,
+      netShares: entry.totalShares,
+      tokenId: entry.conditionId, // placeholder for logging
+      followAllocationId: 'api-claim-all',
+    });
+  }
+
+  console.log(`Attempting to redeem ${toRedeem.length} conditionIds...\n`);
+
+  const claimed = await redeemWinningPositions(toRedeem).catch((err: any) => {
+    console.log(`Claim failed: ${err.message}`);
+    return [] as string[];
+  });
+
+  console.log(`\nRedeemed: ${claimed.length}/${toRedeem.length} conditionIds`);
+
+  if (claimed.length > 0) {
+    // Mark claimed in DB where applicable
+    const { markConditionsClaimed } = await import('../services/position-settlement.js');
+    await markConditionsClaimed(claimed);
+    console.log('DB records updated.');
+  }
+
+  // 5. Show new wallet balance
+  const walletUSDC = await fetchWalletUSDC();
+  if (walletUSDC != null) {
+    console.log(`\nWallet USDC after claims: $${walletUSDC.toFixed(2)}`);
   }
 }
 

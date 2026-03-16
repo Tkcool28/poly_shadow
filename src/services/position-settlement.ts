@@ -22,7 +22,7 @@ interface OpenPosition {
 // ─── Claim persistence helper ───────────────────────────────────────────────
 // Marks all CopyTrades for claimed conditionIds via DetectedTrade join,
 // correctly covering all allocations + tokenIds for the same market.
-async function markConditionsClaimed(conditionIds: string[]): Promise<void> {
+export async function markConditionsClaimed(conditionIds: string[]): Promise<void> {
   if (conditionIds.length === 0) return;
   for (const conditionId of conditionIds) {
     await prisma.$executeRaw`

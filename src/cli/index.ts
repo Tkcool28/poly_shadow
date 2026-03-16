@@ -152,7 +152,8 @@ program
   .option('--fix', 'Auto-correct capital discrepancies')
   .option('--verbose', 'Show all allocations including those without discrepancies')
   .option('--full', 'Fetch wallet USDC, API positions, unclaimed settlements, and capital equation')
-  .option('--claim', 'Trigger on-chain claim sweep for unclaimed settled wins')
+  .option('--claim', 'Trigger on-chain claim sweep for unclaimed settled wins (DB-based)')
+  .option('--claim-all', 'Claim all redeemable positions from API (bypasses DB)')
   .option('--realign', 'Set active allocation CC to actual wallet USDC balance and zero inactive allocations')
   .action(async (opts) => {
     const { reconcileCapital } = await import('./reconcile.js');
@@ -161,6 +162,7 @@ program
       verbose: opts.verbose ?? false,
       full: opts.full ?? false,
       claim: opts.claim ?? false,
+      claimAll: opts.claimAll ?? false,
       realign: opts.realign ?? false,
     });
     await prisma.$disconnect();
