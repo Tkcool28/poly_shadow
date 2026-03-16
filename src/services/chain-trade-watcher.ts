@@ -76,7 +76,10 @@ export class ChainTradeWatcher {
     side: string;
     data: ChainTradeData;
     timer: ReturnType<typeof setTimeout>;
+    createdAt: number;
   }> = new Map();
+  private phantomOverrideCount = 0;
+  private phantomOverrideTotalMs = 0;
   private heartbeatCount = 0;
 
   // Per-wallet subscription tracking: id → confirmed
@@ -424,7 +427,11 @@ export class ChainTradeWatcher {
           if (pending) {
             clearTimeout(pending.timer);
             this.pendingTakerEmits.delete(txWalletKey);
-            this.log.debug('Cancelled debounced taker phantom in favor of maker event', {
+            const phantomAgeMs = Date.now() - pending.createdAt;
+            this.phantomOverrideCount++;
+            this.phantomOverrideTotalMs += phantomAgeMs;
+            this.log.info('Phantom fill override: MAKER cancelled pending TAKER', {
+              phantomAgeMs,
               wallet: matchedWallet.slice(0, 10),
               cancelledSide: pending.side,
               makerSide: side,
@@ -459,7 +466,7 @@ export class ChainTradeWatcher {
             // No MAKER event arrived within debounce window → this taker event is real
             this.emitTrade(txWalletKey, tradeData);
           }, TAKER_DEBOUNCE_MS);
-          this.pendingTakerEmits.set(txWalletKey, { side, data: tradeData, timer });
+          this.pendingTakerEmits.set(txWalletKey, { side, data: tradeData, timer, createdAt: Date.now() });
         }
       } catch (err: any) {
         this.log.warn('Failed to decode OrderFilled data, skipping', {
@@ -800,7 +807,7 @@ export class ChainTradeWatcher {
       }
 
       // Pre-emptive backfill: if 1.5× heartbeat without response, fire eth_getLogs as insurance
-      const warningThresholdMs = config.CHAIN_HEARTBEAT_MS * 1.5;
+      const warningThresholdMs = Math.max(config.CHAIN_HEARTBEAT_MS * 0.5, 5000);
       if (effectiveAge > warningThresholdMs && this.canFirePreemptiveBackfill()) {
         this.lastPreemptiveBackfillAt = now;
         this.log.warn('Heartbeat delayed, firing pre-emptive backfill', { effectiveAgeMs: effectiveAge });
@@ -867,6 +874,9 @@ export class ChainTradeWatcher {
           eventStaleReconnects: this.eventStaleReconnectCount,
           lastWssEventAt: this.lastWssEventAt?.toISOString() ?? 'never',
           pongSupported: this.pongEverReceived,
+          phantomOverrides: this.phantomOverrideCount,
+          phantomOverrideAvgMs: this.phantomOverrideCount > 0
+            ? Math.round(this.phantomOverrideTotalMs / this.phantomOverrideCount) : 0,
           raceStats,
         });
         if (this.label === 'A') resetRaceStats();

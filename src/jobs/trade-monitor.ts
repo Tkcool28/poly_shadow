@@ -94,7 +94,21 @@ async function main() {
       );
       backup.connect();
       chainWatchers.push(backup);
-      log.info('Dual-WSS enabled: 2 independent chain watcher connections');
+      log.info('Multi-WSS: instance B enabled');
+    }
+
+    // Third WSS connection (triple-WSS for provider diversity)
+    if (config.CHAIN_DUAL_WSS && config.POLYGON_WS_RPC_URL_C !== config.POLYGON_WS_RPC_URL) {
+      const tertiary = new ChainTradeWatcher(
+        chainCallback,
+        getLiveAllocationWallets,
+        'C',
+        config.POLYGON_WS_RPC_URL_C,
+        config.POLYGON_HTTP_RPC_URL_C,
+      );
+      tertiary.connect();
+      chainWatchers.push(tertiary);
+      log.info('Multi-WSS: instance C enabled');
     }
   }
 

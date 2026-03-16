@@ -66,31 +66,50 @@ async function buildDrainCache(
   conditionIds: string[],
   batchTokenMap: Map<string, Set<string>>,
 ): Promise<DrainCache> {
-  // Query 1: Positions (FILLED + PENDING) + BUY-side cost basis for hedge ratio
-  const positionRows = await prisma.$queryRaw<Array<{
-    tokenId: string; followAllocationId: string; isPaper: boolean;
-    netShares: number; netUsd: number; buyCost: number; buyShares: number;
-  }>>`
-    SELECT "tokenId", "followAllocationId", "isPaper",
-      SUM(CASE
-        WHEN side='BUY' THEN COALESCE("filledSize", "requestedAmount" / NULLIF("requestedPrice", 0), 0)
-        ELSE -COALESCE("filledSize", "requestedAmount" / NULLIF("requestedPrice", 0), 0)
-      END)::float as "netShares",
-      SUM(CASE
-        WHEN side='BUY' THEN COALESCE("filledSize" * "filledPrice", "requestedAmount", 0)
-        ELSE -COALESCE("filledSize" * "filledPrice", "requestedAmount", 0)
-      END)::float as "netUsd",
-      SUM(CASE WHEN side='BUY' THEN COALESCE("filledSize" * "filledPrice", "requestedAmount", 0) ELSE 0 END)::float as "buyCost",
-      SUM(CASE WHEN side='BUY' THEN COALESCE("filledSize", "requestedAmount" / NULLIF("requestedPrice", 0), 0) ELSE 0 END)::float as "buyShares"
-    FROM "CopyTrade" WHERE status IN ('FILLED', 'PENDING')
-    GROUP BY "tokenId", "followAllocationId", "isPaper"
-  `;
+  // Queries 1-3: Positions, pending capital, daily spend — run in parallel (no data dependencies)
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+
+  const [positionRows, pendingCapitalRows, dailySpendRows] = await Promise.all([
+    prisma.$queryRaw<Array<{
+      tokenId: string; followAllocationId: string; isPaper: boolean;
+      netShares: number; netUsd: number; buyCost: number; buyShares: number;
+    }>>`
+      SELECT "tokenId", "followAllocationId", "isPaper",
+        SUM(CASE
+          WHEN side='BUY' THEN COALESCE("filledSize", "requestedAmount" / NULLIF("requestedPrice", 0), 0)
+          ELSE -COALESCE("filledSize", "requestedAmount" / NULLIF("requestedPrice", 0), 0)
+        END)::float as "netShares",
+        SUM(CASE
+          WHEN side='BUY' THEN COALESCE("filledSize" * "filledPrice", "requestedAmount", 0)
+          ELSE -COALESCE("filledSize" * "filledPrice", "requestedAmount", 0)
+        END)::float as "netUsd",
+        SUM(CASE WHEN side='BUY' THEN COALESCE("filledSize" * "filledPrice", "requestedAmount", 0) ELSE 0 END)::float as "buyCost",
+        SUM(CASE WHEN side='BUY' THEN COALESCE("filledSize", "requestedAmount" / NULLIF("requestedPrice", 0), 0) ELSE 0 END)::float as "buyShares"
+      FROM "CopyTrade" WHERE status IN ('FILLED', 'PENDING')
+      GROUP BY "tokenId", "followAllocationId", "isPaper"
+    `,
+    prisma.$queryRaw<Array<{
+      followAllocationId: string; pendingCapital: number;
+    }>>`
+      SELECT "followAllocationId", SUM("requestedAmount")::float as "pendingCapital"
+      FROM "CopyTrade" WHERE status = 'PENDING' AND side = 'BUY' AND "followAllocationId" IS NOT NULL
+      GROUP BY "followAllocationId"
+    `,
+    prisma.$queryRaw<Array<{
+      isPaper: boolean; dailySpend: number;
+    }>>`
+      SELECT "isPaper", SUM("requestedAmount")::float as "dailySpend"
+      FROM "CopyTrade"
+      WHERE status IN ('FILLED', 'POOLED', 'PENDING') AND side = 'BUY'
+        AND "createdAt" >= ${todayStart}
+      GROUP BY "isPaper"
+    `,
+  ]);
 
   const positionCache = new Map<string, CachedPosition>();
   for (const row of positionRows) {
     const key = `${row.tokenId}:${row.followAllocationId}:${row.isPaper}`;
-    // Round sub-penny residuals to 0: amounts < 0.01 shares/USD are unsellable
-    // on CLOB and represent floating-point accumulation artifacts.
     const clampShares = Math.max(row.netShares ?? 0, 0);
     const clampUsd = Math.max(row.netUsd ?? 0, 0);
     positionCache.set(key, {
@@ -101,33 +120,10 @@ async function buildDrainCache(
     });
   }
 
-  // Pending capital per allocation
-  const pendingCapitalRows = await prisma.$queryRaw<Array<{
-    followAllocationId: string; pendingCapital: number;
-  }>>`
-    SELECT "followAllocationId", SUM("requestedAmount")::float as "pendingCapital"
-    FROM "CopyTrade" WHERE status = 'PENDING' AND side = 'BUY' AND "followAllocationId" IS NOT NULL
-    GROUP BY "followAllocationId"
-  `;
-
   const pendingCapitalMap = new Map<string, number>();
   for (const row of pendingCapitalRows) {
     pendingCapitalMap.set(row.followAllocationId, row.pendingCapital ?? 0);
   }
-
-  // Query 2: Daily spend
-  const todayStart = new Date();
-  todayStart.setUTCHours(0, 0, 0, 0);
-
-  const dailySpendRows = await prisma.$queryRaw<Array<{
-    isPaper: boolean; dailySpend: number;
-  }>>`
-    SELECT "isPaper", SUM("requestedAmount")::float as "dailySpend"
-    FROM "CopyTrade"
-    WHERE status IN ('FILLED', 'POOLED', 'PENDING') AND side = 'BUY'
-      AND "createdAt" >= ${todayStart}
-    GROUP BY "isPaper"
-  `;
 
   const dailySpendMap = new Map<string, number>();
   for (const row of dailySpendRows) {
@@ -900,7 +896,11 @@ async function drainParallel(
     set.add(trade.asset);
     batchTokenMap.set(trade.conditionId, set);
   }
-  const drainCache = await buildDrainCache(conditionIds, batchTokenMap);
+  const uniqueTokenIds = [...new Set(pending.map(t => t.asset))].filter(Boolean);
+  const [drainCache] = await Promise.all([
+    buildDrainCache(conditionIds, batchTokenMap),
+    preWarmMetadata(uniqueTokenIds),
+  ]);
 
   // 2. Group trades by proxyWallet (preserves SELLs-first order within each group)
   const tradesByWallet = new Map<string, DetectedTradeRow[]>();
@@ -1095,7 +1095,8 @@ async function main() {
   let emptyDrainCount = 0;
 
   function scheduleDrain(source?: string) {
-    if (drainScheduled || drainRunning) return;
+    if (drainScheduled) return;
+    if (drainRunning) { drainScheduled = true; return; }
     drainScheduled = true;
     log.debug(`Drain scheduled (${source ?? 'unknown'})`);
     setImmediate(runDrain);
@@ -1344,16 +1345,15 @@ async function main() {
       }
       emptyDrainCount = 0;
 
-      // Pre-warm CLOB metadata cache for all unique tokens in this batch
-      const uniqueTokenIds = [...new Set(pending.map(t => t.asset))].filter(Boolean);
-      await preWarmMetadata(uniqueTokenIds);
-
       // Feed tokenIds to midpoint WS cache for stale-signal guard
+      const uniqueTokenIds = [...new Set(pending.map(t => t.asset))].filter(Boolean);
       if (uniqueTokenIds.length > 0) ensureSubscribed(uniqueTokenIds);
 
       if (parallelDrainEnabled) {
+        // preWarmMetadata runs inside drainParallel in parallel with buildDrainCache
         processedCount = await drainParallel(pending, () => shuttingDown || isShuttingDown(), start);
       } else {
+        await preWarmMetadata(uniqueTokenIds); // sequential fallback still pre-warms
         // Sequential fallback: existing processCopyTrade() loop
         for (const trade of pending) {
           if (shuttingDown || isShuttingDown()) break;

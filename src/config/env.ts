@@ -45,7 +45,9 @@ const envSchema = z.object({
   POLYGON_HTTP_RPC_URL: z.string().default('https://polygon-bor-rpc.publicnode.com'),
   POLYGON_WS_RPC_URL_B: z.string().default('wss://polygon-bor-rpc.publicnode.com'),
   POLYGON_HTTP_RPC_URL_B: z.string().default('https://polygon-bor-rpc.publicnode.com'),
-  CHAIN_VERIFY_INTERVAL_MS: z.coerce.number().default(60000), // periodic eth_getLogs verification (was 5 min, now 60s)
+  POLYGON_WS_RPC_URL_C: z.string().default('wss://polygon-bor-rpc.publicnode.com'),
+  POLYGON_HTTP_RPC_URL_C: z.string().default('https://polygon-bor-rpc.publicnode.com'),
+  CHAIN_VERIFY_INTERVAL_MS: z.coerce.number().default(10000), // periodic eth_getLogs verification (10s for fast stale recovery)
   CHAIN_HEARTBEAT_MS: z.coerce.number().default(10000), // WSS keepalive interval (was hardcoded 45s)
   CHAIN_STALE_MS: z.coerce.number().default(25000), // WSS stale threshold — force reconnect (was hardcoded 135s)
   CHAIN_EVENT_STALE_MS: z.coerce.number().default(90000), // 90s: force reconnect if no WSS events despite healthy connection
