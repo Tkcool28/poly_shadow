@@ -388,6 +388,74 @@ async function triggerClaimSweep(): Promise<void> {
   }
 }
 
+// ─── Inject Capital ─────────────────────────────────────────────────────────────
+
+export async function injectCapital(trader: string, amount: number): Promise<void> {
+  console.log('\n=== Inject Capital ===\n');
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    console.log('Amount must be a positive number.');
+    return;
+  }
+
+  // Resolve trader by userName or proxyWallet
+  const traderRecord = await prisma.trader.findFirst({
+    where: { userName: { equals: trader, mode: 'insensitive' } },
+  }) ?? await prisma.trader.findFirst({
+    where: { proxyWallet: trader },
+  });
+
+  if (!traderRecord) {
+    console.log(`Trader not found: ${trader}`);
+    return;
+  }
+
+  const alloc = await prisma.followAllocation.findUnique({
+    where: { proxyWallet: traderRecord.proxyWallet },
+  });
+
+  if (!alloc) {
+    console.log(`No allocation found for trader ${traderRecord.userName ?? traderRecord.proxyWallet}`);
+    return;
+  }
+
+  if (!alloc.isActive) {
+    console.log(`Allocation is inactive. Activate it first before injecting capital.`);
+    return;
+  }
+
+  if (alloc.isPaper) {
+    console.log(`Allocation is paper. Inject only works on live allocations.`);
+    return;
+  }
+
+  const newCC = alloc.currentCapital + amount;
+  const newInit = alloc.initialCapital + amount;
+
+  console.log(`Trader:    ${traderRecord.userName ?? 'N/A'} (${traderRecord.proxyWallet.slice(0, 12)}...)`);
+  console.log(`Amount:    +$${amount.toFixed(2)}`);
+  console.log(`\n  Current:  CC=$${alloc.currentCapital.toFixed(2)}  DC=$${alloc.deployedCapital.toFixed(2)}  Init=$${alloc.initialCapital.toFixed(2)}`);
+  console.log(`  After:    CC=$${newCC.toFixed(2)}  DC=$${alloc.deployedCapital.toFixed(2)}  Init=$${newInit.toFixed(2)}`);
+
+  // Rollback SQL
+  console.log('\n── Rollback SQL ──');
+  console.log(`UPDATE "FollowAllocation" SET "currentCapital"=${Number(alloc.currentCapital.toFixed(10))}, "initialCapital"=${Number(alloc.initialCapital.toFixed(10))} WHERE id='${alloc.id}';`);
+
+  // Apply
+  console.log('\nApplying...');
+  await prisma.followAllocation.update({
+    where: { id: alloc.id },
+    data: {
+      currentCapital: newCC,
+      initialCapital: newInit,
+    },
+  });
+
+  console.log(`  CC: $${alloc.currentCapital.toFixed(2)} -> $${newCC.toFixed(2)}`);
+  console.log(`  Init: $${alloc.initialCapital.toFixed(2)} -> $${newInit.toFixed(2)}`);
+  console.log('\nDone. Run `reconcile --verbose` to verify.');
+}
+
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 
 function printAuditTable(audits: AllocationAudit[], verbose: boolean): void {

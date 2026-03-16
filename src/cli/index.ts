@@ -166,4 +166,18 @@ program
     await prisma.$disconnect();
   });
 
+program
+  .command('inject <trader> <amount>')
+  .description('Inject deposited capital into a specific trader allocation')
+  .action(async (trader: string, amountStr: string) => {
+    const amount = parseFloat(amountStr);
+    if (!Number.isFinite(amount) || amount <= 0) {
+      console.error('Amount must be a positive number');
+      process.exit(1);
+    }
+    const { injectCapital } = await import('./reconcile.js');
+    await injectCapital(trader, amount);
+    await prisma.$disconnect();
+  });
+
 program.parse();
