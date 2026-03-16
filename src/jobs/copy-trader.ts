@@ -1163,7 +1163,7 @@ async function main() {
 
       // ── SELLs: never filter CHAIN_MAKER — exits are always safe ──
       // (if we don't hold shares, processCopyTrade skips with "no shares held to sell")
-      const pendingSells = await prisma.detectedTrade.findMany({
+      let pendingSells = await prisma.detectedTrade.findMany({
         where: {
           ...baseWhere,
           side: 'SELL',
@@ -1171,6 +1171,51 @@ async function main() {
         },
         orderBy: { detectedAt: 'asc' },
       });
+
+      // ── Pre-filter CHAIN_MAKER SELLs for live allocations (SELL-copy globally disabled) ──
+      // Live SELL-copy is disabled (phaseA line 446-450, copy-trade-worker line 260-269).
+      // CHAIN_MAKER SELLs for live allocations are guaranteed SKIPPED — batch-skip them here.
+      // If SELL-copy is re-enabled, remove this block. No majority accumulator concern (BUYs only).
+      {
+        const liveWallets = new Set(
+          allActiveAllocations.filter(a => !a.isPaper).map(a => a.proxyWallet),
+        );
+        const sellsToSkip: Array<{ trade: typeof pendingSells[0]; alloc: typeof allActiveAllocations[0] }> = [];
+        const keptSells: typeof pendingSells = [];
+
+        for (const t of pendingSells) {
+          if (t.detectionSource === 'CHAIN_MAKER' && liveWallets.has(t.proxyWallet)) {
+            const alloc = allActiveAllocations.find(a => a.proxyWallet === t.proxyWallet)!;
+            sellsToSkip.push({ trade: t, alloc });
+          } else {
+            keptSells.push(t);
+          }
+        }
+
+        if (sellsToSkip.length > 0) {
+          try {
+            await prisma.copyTrade.createMany({
+              data: sellsToSkip.map(({ trade: t, alloc }) => ({
+                detectedTradeId: t.id,
+                tokenId: t.asset,
+                side: t.side,
+                requestedAmount: 0,
+                requestedPrice: t.price,
+                status: 'SKIPPED',
+                isPaper: false,
+                failReason: 'CHAIN_MAKER pre-filtered (live SELL-copy disabled)',
+                latencyMs: 0,
+                followAllocationId: alloc.id,
+              })),
+              skipDuplicates: true,
+            });
+          } catch (err: any) {
+            log.warn(`CHAIN_MAKER SELL pre-filter batch skip failed: ${err.message}`);
+          }
+          log.info(`CHAIN_MAKER SELL pre-filter: ${sellsToSkip.length} batch-skipped (${keptSells.length} kept)`);
+        }
+        pendingSells = keptSells;
+      }
 
       // ── BUYs: filter CHAIN_MAKER globally, allow for copyMakerFills opt-in ──
       const buyWhere = {
@@ -1221,10 +1266,21 @@ async function main() {
             if (alloc.minBuyPrice != null && t.price < alloc.minBuyPrice - 0.001) {
               dominated = true;
             }
-            // eventSlug pre-filter (covers ~12% of skips) — fail-open when slug unavailable
-            if (!dominated && alloc.excludeEventSlugPatterns != null && t.eventSlug) {
-              const patterns = alloc.excludeEventSlugPatterns.split(',').map(p => p.trim().toLowerCase());
-              if (patterns.some(p => t.eventSlug!.toLowerCase().includes(p))) {
+            // eventSlug pre-filter — fail-closed when slug unavailable (mirrors phaseA line 376-379)
+            if (!dominated && alloc.excludeEventSlugPatterns != null) {
+              if (!t.eventSlug) {
+                dominated = true;  // fail-closed: can't verify exclusion without slug
+              } else {
+                const patterns = alloc.excludeEventSlugPatterns.split(',').map(p => p.trim().toLowerCase());
+                if (patterns.some(p => t.eventSlug!.toLowerCase().includes(p))) {
+                  dominated = true;
+                }
+              }
+            }
+            // Signal age pre-filter (live BUYs only) — mirrors phaseA line 305
+            if (!dominated && !alloc.isPaper && config.MAX_SIGNAL_AGE_MS > 0) {
+              const signalAgeMs = Date.now() - (t.realTimestamp ?? t.timestamp) * 1000;
+              if (signalAgeMs > config.MAX_SIGNAL_AGE_MS) {
                 dominated = true;
               }
             }
