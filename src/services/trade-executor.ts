@@ -1,10 +1,24 @@
 import pLimit from 'p-limit';
+import axios from 'axios';
 import { AssetType, ClobClient, OrderType, Side, SignatureType } from '@polymarket/clob-client';
 import type { ApiKeyCreds, TickSize } from '@polymarket/clob-client';
 import { Wallet } from '@ethersproject/wallet';
 import { createJobLogger } from '../lib/logger';
 import { config } from '../config/env';
 import { getMidFromCache, getBBAFromCache } from './midpoint-cache';
+
+// Strip auth headers from axios error responses to prevent credential leakage.
+// The @polymarket/clob-client library's errorHandling() calls JSON.stringify on
+// err.response.config which includes POLY_API_KEY, POLY_PASSPHRASE, and TLS session data.
+// Only fires on CLOB requests (guarded by POLY_API_KEY presence).
+const SENSITIVE_HEADERS = ['POLY_ADDRESS', 'POLY_SIGNATURE', 'POLY_TIMESTAMP', 'POLY_API_KEY', 'POLY_PASSPHRASE'];
+axios.interceptors.response.use(undefined, (error: any) => {
+  if (error?.config?.headers?.['POLY_API_KEY']) {
+    for (const h of SENSITIVE_HEADERS) delete error.config.headers[h];
+    if (error.config.httpsAgent) error.config.httpsAgent = '[redacted]';
+  }
+  return Promise.reject(error);
+});
 
 const log = createJobLogger('trade-executor');
 
@@ -423,6 +437,7 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
       totalMs: t2 - t0,
       side,
       tokenId: tokenId.slice(0, 20) + '...',
+      retried: params._isRetry ?? false,
     });
 
     // Detect CLOB client error response (HTTP 4xx/5xx returns {error, status} instead of throwing)
@@ -822,8 +837,9 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
     // a transient network failure. Retry once, then SKIPPED (not FAILED).
     if (msg.includes('Converting circular structure to JSON')) {
       if (!params._isRetry) {
+        const firstAttemptMs = Date.now() - t0;
         log.warn('CLOB client circular JSON crash (transient network error), retrying in 1s...', {
-          tokenId: tokenId.slice(0, 20), side, amount,
+          tokenId: tokenId.slice(0, 20), side, amount, firstAttemptMs,
         });
         await new Promise((r) => setTimeout(r, 1000));
         try {

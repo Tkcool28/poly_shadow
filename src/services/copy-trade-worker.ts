@@ -61,7 +61,7 @@ export function recordSellFailure(allocationId: string, tokenId: string): void {
 
 // ─── Per-token BUY failure cool-down: prevents rapid FAK retries on illiquid markets ───
 const buyFailedAt = new Map<string, number>();
-const BUY_FAILURE_COOLDOWN_MS = 30_000; // 30s — shorter than SELL (60s) since BUY signals are time-sensitive
+const BUY_FAILURE_COOLDOWN_MS = 15_000; // 15s — reduced from 30s after monitoring showed 5.3x cascade ratio per FAK failure
 
 export function isInBuyFailureCooldown(allocationId: string, tokenId: string): boolean {
   const key = sellCooldownKey(allocationId, tokenId);

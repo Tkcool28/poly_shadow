@@ -50,7 +50,7 @@ const envSchema = z.object({
   CHAIN_VERIFY_INTERVAL_MS: z.coerce.number().default(10000), // periodic eth_getLogs verification (10s for fast stale recovery)
   CHAIN_HEARTBEAT_MS: z.coerce.number().default(10000), // WSS keepalive interval (was hardcoded 45s)
   CHAIN_STALE_MS: z.coerce.number().default(25000), // WSS stale threshold — force reconnect (was hardcoded 135s)
-  CHAIN_EVENT_STALE_MS: z.coerce.number().default(90000), // 90s: force reconnect if no WSS events despite healthy connection
+  CHAIN_EVENT_STALE_MS: z.coerce.number().default(10000), // 10s: force reconnect if no WSS events despite healthy connection (was 90s, reduced after all-provider simultaneous stale observed)
   CHAIN_DUAL_WSS: z
     .string()
     .default('true') // two independent WSS connections for zero-gap coverage
