@@ -1447,22 +1447,26 @@ async function main() {
     try {
       const walletBal = await getWalletBalance();
       if (walletBal) {
+        // Sum CC across ALL non-paper allocations (wallet holds capital for active + inactive)
         const dbCapital = (await prisma.followAllocation.aggregate({
-          where: { isActive: true, isPaper: false },
+          where: { isPaper: false },
           _sum: { currentCapital: true },
         }))._sum.currentCapital ?? 0;
 
-        const diff = Math.abs(walletBal.balance - dbCapital);
-        if (diff > config.BALANCE_MISMATCH_THRESHOLD) {
-          log.warn('Balance mismatch: CLOB wallet vs DB capital', {
+        // Only warn on deficit (wallet < expected CC) — surplus is normal
+        // from unclaimed settlements, inactive allocation residuals, and P&L
+        const deficit = dbCapital - walletBal.balance;
+        if (deficit > config.BALANCE_MISMATCH_THRESHOLD) {
+          log.warn('Balance deficit: wallet USDC below total DB currentCapital', {
             clobBalance: walletBal.balance.toFixed(2),
-            dbCurrentCapital: dbCapital.toFixed(2),
-            diff: diff.toFixed(2),
+            dbTotalCC: dbCapital.toFixed(2),
+            deficit: deficit.toFixed(2),
           });
         } else {
           log.debug('Balance check OK', {
             clobBalance: walletBal.balance.toFixed(2),
-            dbCurrentCapital: dbCapital.toFixed(2),
+            dbTotalCC: dbCapital.toFixed(2),
+            surplus: Math.max(-deficit, 0).toFixed(2),
           });
         }
         // Any successful wallet fetch clears the balance pause.

@@ -151,9 +151,18 @@ program
   .description('Audit and reconcile allocation capital across all copy trades')
   .option('--fix', 'Auto-correct capital discrepancies')
   .option('--verbose', 'Show all allocations including those without discrepancies')
+  .option('--full', 'Fetch wallet USDC, API positions, unclaimed settlements, and capital equation')
+  .option('--claim', 'Trigger on-chain claim sweep for unclaimed settled wins')
+  .option('--realign', 'Set active allocation CC to actual wallet USDC balance and zero inactive allocations')
   .action(async (opts) => {
     const { reconcileCapital } = await import('./reconcile.js');
-    await reconcileCapital({ fix: opts.fix ?? false, verbose: opts.verbose ?? false });
+    await reconcileCapital({
+      fix: opts.fix ?? false,
+      verbose: opts.verbose ?? false,
+      full: opts.full ?? false,
+      claim: opts.claim ?? false,
+      realign: opts.realign ?? false,
+    });
     await prisma.$disconnect();
   });
 
