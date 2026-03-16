@@ -1,0 +1,263 @@
+#!/usr/bin/env tsx
+/**
+ * Post-Deploy Health Monitor
+ *
+ * Checks 9 production health metrics for the 0x8dxd allocation after deploying
+ * FAK cooldown fix + signal age fix + G175/P30/T8 config upgrade.
+ *
+ * Runs a SINGLE SSH session to production to avoid rate limiting, pipes all
+ * 9 SQL queries in one psql invocation, then parses results in Node.
+ *
+ * Usage:
+ *   npx tsx src/scripts/post-deploy-monitor.ts
+ *   # or with /loop 20m
+ *
+ * Exit codes: 0 = PASS, 1 = WARN, 2 = ALERT
+ */
+
+import { execSync } from 'child_process';
+
+const ALLOCATION_ID = 'fa_0x8dxd_live_1773336058';
+
+// ─── Run all 9 queries in a single SSH + psql session ───
+
+function runQueries(): string {
+  const sql = `
+-- Q1: FAK cooldown blocks (20min)
+SELECT 'Q1', COUNT(*) FROM "CopyTrade"
+WHERE "followAllocationId" = '${ALLOCATION_ID}'
+  AND "isPaper" = false AND "createdAt" > NOW() - INTERVAL '20 minutes'
+  AND status = 'SKIPPED' AND "failReason" = 'buy failure cooldown active';
+
+-- Q2: CLOB rate limiting (20min)
+SELECT 'Q2', COUNT(*) FROM "CopyTrade"
+WHERE "followAllocationId" = '${ALLOCATION_ID}'
+  AND "isPaper" = false AND "createdAt" > NOW() - INTERVAL '20 minutes'
+  AND "failReason" LIKE '%429%';
+
+-- Q3: WR trending (2h settled BUYs)
+SELECT 'Q3',
+       COUNT(*) FILTER (WHERE "settlementPnl" > 0),
+       COUNT(*)
+FROM "CopyTrade"
+WHERE "followAllocationId" = '${ALLOCATION_ID}'
+  AND "isPaper" = false AND status = 'SETTLED' AND side = 'BUY'
+  AND "settledAt" > NOW() - INTERVAL '2 hours';
+
+-- Q4: Capital check
+SELECT 'Q4', "currentCapital"::numeric(10,2) FROM "FollowAllocation"
+WHERE id = '${ALLOCATION_ID}';
+
+-- Q5: FAK reject spike (20min)
+SELECT 'Q5', COUNT(*) FROM "CopyTrade"
+WHERE "followAllocationId" = '${ALLOCATION_ID}'
+  AND "isPaper" = false AND "createdAt" > NOW() - INTERVAL '20 minutes'
+  AND status = 'SKIPPED' AND "failReason" LIKE 'CLOB rejected%FAK%';
+
+-- Q6: Signal age blocks (20min)
+SELECT 'Q6', COUNT(*) FROM "CopyTrade"
+WHERE "followAllocationId" = '${ALLOCATION_ID}'
+  AND "isPaper" = false AND "createdAt" > NOW() - INTERVAL '20 minutes'
+  AND status = 'SKIPPED' AND "failReason" LIKE 'signal too old%';
+
+-- Q7: Position sizing config
+SELECT 'Q7', "maxPositionUsd"::numeric(10,2), "maxPredictionPositionUsd"::numeric(10,2)
+FROM "FollowAllocation" WHERE id = '${ALLOCATION_ID}';
+
+-- Q8: Majority gate health (20min)
+SELECT 'Q8', COUNT(*) FROM "CopyTrade"
+WHERE "followAllocationId" = '${ALLOCATION_ID}'
+  AND "isPaper" = false AND "createdAt" > NOW() - INTERVAL '20 minutes'
+  AND status = 'SKIPPED' AND "failReason" LIKE 'majority accumulating%';
+
+-- Q9: Filled trades count (20min)
+SELECT 'Q9', COUNT(*) FROM "CopyTrade"
+WHERE "followAllocationId" = '${ALLOCATION_ID}'
+  AND "isPaper" = false AND "createdAt" > NOW() - INTERVAL '20 minutes'
+  AND status IN ('FILLED', 'SETTLED') AND side = 'BUY';
+`;
+
+  const result = execSync(`ssh hetzner_finland_dockerapps bash -s <<'OUTER'
+docker exec -i polymarket_postgres psql -U polymarket -d polymarket_copytrade -t -A -F'|' <<'EOSQL'
+${sql}
+EOSQL
+OUTER`, { encoding: 'utf-8', timeout: 30000 });
+
+  return result;
+}
+
+// ─── Parse results ───
+
+interface CheckResult {
+  label: string;
+  status: 'PASS' | 'WARN' | 'ALERT' | 'INFO';
+  message: string;
+}
+
+function parseResults(raw: string): CheckResult[] {
+  const lines = raw.trim().split('\n').filter(l => l.startsWith('Q'));
+  const results: CheckResult[] = [];
+
+  const getRow = (tag: string): string[] => {
+    const line = lines.find(l => l.startsWith(tag + '|'));
+    if (!line) return [];
+    return line.split('|').slice(1);
+  };
+
+  // Q1: FAK cooldown blocks
+  {
+    const count = parseInt(getRow('Q1')[0] || '0', 10);
+    let status: CheckResult['status'] = 'PASS';
+    if (count > 5) status = 'ALERT';
+    results.push({
+      label: 'FAK cooldown blocks',
+      status,
+      message: `${count} (threshold: ≤5)`,
+    });
+  }
+
+  // Q2: CLOB rate limiting
+  {
+    const count = parseInt(getRow('Q2')[0] || '0', 10);
+    let status: CheckResult['status'] = 'PASS';
+    if (count > 0) status = 'ALERT';
+    results.push({
+      label: 'CLOB rate limiting',
+      status,
+      message: `${count} (threshold: 0)`,
+    });
+  }
+
+  // Q3: WR trending
+  {
+    const row = getRow('Q3');
+    const wins = parseInt(row[0] || '0', 10);
+    const total = parseInt(row[1] || '0', 10);
+    const losses = total - wins;
+    let wr = 0;
+    if (total > 0) wr = (wins / total) * 100;
+    let status: CheckResult['status'] = 'PASS';
+    if (total > 0 && wr < 50) status = 'ALERT';
+    else if (total > 0 && wr < 55) status = 'WARN';
+    const wrStr = total > 0 ? `${wr.toFixed(1)}% (${wins}W/${losses}L)` : 'no data';
+    results.push({
+      label: 'WR (2h)',
+      status: total === 0 ? 'INFO' : status,
+      message: `${wrStr} (WARN <55%, ALERT <50%)`,
+    });
+  }
+
+  // Q4: Capital check
+  {
+    const capital = parseFloat(getRow('Q4')[0] || '0');
+    let status: CheckResult['status'] = 'PASS';
+    if (capital < 10) status = 'WARN';
+    results.push({
+      label: 'Capital',
+      status,
+      message: `$${capital.toFixed(2)} (WARN <$10)`,
+    });
+  }
+
+  // Q5: FAK reject spike
+  {
+    const count = parseInt(getRow('Q5')[0] || '0', 10);
+    let status: CheckResult['status'] = 'INFO';
+    if (count > 50) status = 'ALERT';
+    results.push({
+      label: 'FAK rejects',
+      status,
+      message: `${count} (ALERT >50)`,
+    });
+  }
+
+  // Q6: Signal age blocks
+  {
+    const count = parseInt(getRow('Q6')[0] || '0', 10);
+    results.push({
+      label: 'Signal age blocks',
+      status: 'INFO',
+      message: `${count} (was ~30/20min pre-deploy)`,
+    });
+  }
+
+  // Q7: Position sizing config
+  {
+    const row = getRow('Q7');
+    const maxTrade = parseFloat(row[0] || '0');
+    const maxPred = parseFloat(row[1] || '0');
+    const expected = maxTrade === 8.0 && maxPred === 30.0;
+    results.push({
+      label: 'Config',
+      status: expected ? 'PASS' : 'WARN',
+      message: expected
+        ? `maxTrade=$${maxTrade.toFixed(0)}, maxPred=$${maxPred.toFixed(0)} ✓`
+        : `maxTrade=$${maxTrade.toFixed(2)}, maxPred=$${maxPred.toFixed(2)} — EXPECTED $8/$30`,
+    });
+  }
+
+  // Q8: Majority gate health
+  {
+    const count = parseInt(getRow('Q8')[0] || '0', 10);
+    let status: CheckResult['status'] = 'PASS';
+    if (count > 100) status = 'WARN';
+    results.push({
+      label: 'Majority gate',
+      status,
+      message: `${count} accumulating (WARN >100)`,
+    });
+  }
+
+  // Q9: Filled trades count
+  {
+    const count = parseInt(getRow('Q9')[0] || '0', 10);
+    results.push({
+      label: 'Filled trades',
+      status: 'INFO',
+      message: `${count}`,
+    });
+  }
+
+  return results;
+}
+
+// ─── Main ───
+
+function main() {
+  const now = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
+
+  console.log('============================================================');
+  console.log(`POST-DEPLOY HEALTH CHECK — ${now} UTC`);
+  console.log(`Allocation: ${ALLOCATION_ID} | Window: 20min`);
+  console.log('============================================================');
+  console.log('');
+
+  let raw: string;
+  try {
+    raw = runQueries();
+  } catch (err: any) {
+    console.error('[ALERT] Failed to connect to production');
+    console.error(err.message || err);
+    process.exit(2);
+  }
+
+  const results = parseResults(raw);
+
+  let worstLevel = 0; // 0=PASS, 1=WARN, 2=ALERT
+
+  for (const r of results) {
+    const tag = `[${r.status}]`.padEnd(8);
+    console.log(`${tag}${r.label}: ${r.message}`);
+
+    if (r.status === 'ALERT' && worstLevel < 2) worstLevel = 2;
+    if (r.status === 'WARN' && worstLevel < 1) worstLevel = 1;
+  }
+
+  const resultLabel = worstLevel === 2 ? 'ALERT' : worstLevel === 1 ? 'WARN' : 'PASS';
+  console.log('');
+  console.log(`RESULT: ${resultLabel}`);
+
+  process.exit(worstLevel);
+}
+
+main();

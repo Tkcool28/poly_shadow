@@ -297,24 +297,6 @@ async function phaseA(
   const signalAgeMs = startMs - (trade.realTimestamp ?? trade.timestamp) * 1000;
   const isPaper = allocation.isPaper;
 
-  // ─── Signal age guard (live BUYs only) ───
-  if (!isPaper && trade.side === 'BUY' && config.MAX_SIGNAL_AGE_MS > 0 && signalAgeMs > config.MAX_SIGNAL_AGE_MS) {
-    log.warn('Signal age guard: rejecting stale live BUY', {
-      trader: trade.proxyWallet.slice(0, 10),
-      signalAgeSec: (signalAgeMs / 1000).toFixed(1),
-      maxAgeSec: (config.MAX_SIGNAL_AGE_MS / 1000).toFixed(0),
-      title: trade.title?.slice(0, 50),
-      price: trade.price,
-    });
-    await createSkippedRecord(
-      trade,
-      `signal too old: ${(signalAgeMs / 1000).toFixed(0)}s > ${(config.MAX_SIGNAL_AGE_MS / 1000).toFixed(0)}s max`,
-      allocation.id,
-      isPaper,
-    );
-    return null;
-  }
-
   const copyPercent = allocation.copyTradePercent ?? config.COPY_TRADE_PERCENT;
   const maxPerTrade = allocation.maxPositionUsd ?? config.MAX_POSITION_USD;
   const maxPerPrediction = allocation.maxPredictionPositionUsd ?? config.MAX_PREDICTION_POSITION_USD;
@@ -352,6 +334,24 @@ async function phaseA(
   // ── Majority accumulator: record every trader BUY (before per-allocation sizing/exclusion filters) ──
   if (trade.side === 'BUY') {
     recordTraderBuy(trade.proxyWallet, trade.conditionId, trade.outcome, trade.size * trade.price);
+  }
+
+  // ─── Signal age guard (live BUYs only) — AFTER accumulator recording ───
+  if (!isPaper && trade.side === 'BUY' && config.MAX_SIGNAL_AGE_MS > 0 && signalAgeMs > config.MAX_SIGNAL_AGE_MS) {
+    log.warn('Signal age guard: rejecting stale live BUY', {
+      trader: trade.proxyWallet.slice(0, 10),
+      signalAgeSec: (signalAgeMs / 1000).toFixed(1),
+      maxAgeSec: (config.MAX_SIGNAL_AGE_MS / 1000).toFixed(0),
+      title: trade.title?.slice(0, 50),
+      price: trade.price,
+    });
+    await createSkippedRecord(
+      trade,
+      `signal too old: ${(signalAgeMs / 1000).toFixed(0)}s > ${(config.MAX_SIGNAL_AGE_MS / 1000).toFixed(0)}s max`,
+      allocation.id,
+      isPaper,
+    );
+    return null;
   }
 
   // Per-allocation min buy price filter
@@ -808,7 +808,7 @@ async function batchSettle(
       // Record BUY failure to prevent FAK spam on illiquid markets
       if (res.side === 'BUY' && (result.status === 'SKIPPED' || result.status === 'FAILED')) {
         const reason = result.failReason ?? '';
-        if (reason.includes('FAK unmatched') || reason.includes('FAK order') || reason.includes('not enough balance') || reason.includes('insufficient balance')) {
+        if (reason.includes('FAK unmatched') || reason.includes('not enough balance') || reason.includes('insufficient balance')) {
           recordBuyFailure(allocation.id, res.tokenId);
         }
       }

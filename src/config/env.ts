@@ -102,7 +102,7 @@ const envSchema = z.object({
 
   // Majority Side Accumulator: wait for enough trader BUYs before copying
   MAJORITY_MIN_TRADES: z.coerce.number().min(1).max(50).default(10),       // LEGACY: count-based gate (kept for .env compat)
-  MAJORITY_MIN_USD: z.coerce.number().min(0).max(10000).default(200),      // volume-based gate: min USD across all BUYs before majority detection
+  MAJORITY_MIN_USD: z.coerce.number().min(0).max(10000).default(175),      // volume-based gate: min USD across all BUYs before majority detection
   MAJORITY_MIN_RATIO: z.coerce.number().min(0.50).max(0.95).default(0.50), // min fraction of BUYs on one side
   COMMITTED_SIDE_LOCK: z
     .string()
@@ -152,7 +152,7 @@ const envSchema = z.object({
   // Position settlement
   SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(300000), // 5 minutes
   STALE_TRADE_CUTOFF_MS: z.coerce.number().default(600000), // 10 min (was hardcoded 5 min)
-  MAX_SIGNAL_AGE_MS: z.coerce.number().default(90000), // 90s — reject live BUYs older than this (0 = disabled)
+  MAX_SIGNAL_AGE_MS: z.coerce.number().default(300000), // 300s (5 min) — reject live BUYs older than this (0 = disabled)
   MARKET_END_GATEKEEP_ENABLED: z.string().default('true').transform((v) => v === 'true'),
   SETTLEMENT_ONCHAIN_FALLBACK_ENABLED: z.string().default('true').transform((v) => v === 'true'),
   SETTLEMENT_ENDDATE_GRACE_MS: z.coerce.number().default(86400000), // 24h grace (sports endDate = game start, not close)
