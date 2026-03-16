@@ -484,6 +484,21 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
         side, tokenId: tokenId.slice(0, 20), amount,
       });
 
+      // GTC Fallback: HTTP 400 FAK unmatched is eligible for async resting limit order
+      if (config.GTC_FALLBACK_ENABLED && side === 'BUY'
+          && errorDetail.includes('no orders found to match with FAK order')) {
+        log.info('GTC fallback: eligible — HTTP 400 FAK unmatched, will place async', {
+          side, amount, detectedPrice, slippagePrice,
+          tokenId: tokenId.slice(0, 20), restMs: config.GTC_FALLBACK_REST_MS,
+        });
+        return {
+          orderId: null, status: 'DELAYED',
+          filledPrice: null, filledSize: null,
+          failReason: null, transactionHashes: [],
+          delayedReason: 'gtc_fallback',
+        };
+      }
+
       return {
         orderId: null, status: 'SKIPPED',
         filledPrice: null, filledSize: null,

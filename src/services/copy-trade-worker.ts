@@ -589,12 +589,13 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   }
 
   // ─── DELAYED: sports market 3s delay or GTC fallback — keep PENDING, poll in background ───
-  if (result.status === 'DELAYED' && result.orderId) {
+  // GTC fallback from HTTP 400 path has orderId=null (GTC poller creates its own order)
+  if (result.status === 'DELAYED' && (result.orderId || result.delayedReason === 'gtc_fallback')) {
     const reason = result.delayedReason ?? 'sports';
     await prisma.copyTrade.update({
       where: { id: copyTrade.id },
       data: {
-        orderId: result.orderId,
+        ...(result.orderId ? { orderId: result.orderId } : {}),
         failReason: `delayed matching (${reason}): background poll scheduled`,
         latencyMs,
       },
@@ -603,7 +604,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     if (result.delayedReason === 'gtc_fallback') {
       scheduleGtcFallbackPoll({
         copyTradeId: copyTrade.id,
-        orderId: result.orderId,
+        orderId: result.orderId ?? '',  // GTC fallback creates its own orderId
         allocationId: allocation.id,
         side: trade.side as 'BUY' | 'SELL',
         tokenId: trade.asset,
@@ -614,7 +615,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     } else {
       scheduleDelayedOrderPoll({
         copyTradeId: copyTrade.id,
-        orderId: result.orderId,
+        orderId: result.orderId!,
         allocationId: allocation.id,
         side: trade.side as 'BUY' | 'SELL',
         tokenId: trade.asset,
@@ -625,7 +626,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
 
     log.info(`COPY TRADE DELAYED (${reason}) — background poll scheduled`, {
       trader: trade.proxyWallet.slice(0, 10), mode: isPaper ? 'PAPER' : 'LIVE',
-      side: trade.side, orderId: result.orderId,
+      side: trade.side, orderId: result.orderId ?? '(gtc-pending)',
       copyAmountUsd: copyAmountUsd.toFixed(2),
       title: trade.title?.slice(0, 50),
     });

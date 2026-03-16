@@ -731,19 +731,20 @@ async function batchSettle(
       }
 
       // DELAYED: sports market 3s delay or GTC fallback — keep PENDING, poll in background
-      if (result.status === 'DELAYED' && result.orderId) {
+      // GTC fallback from HTTP 400 path has orderId=null (GTC poller creates its own order)
+      if (result.status === 'DELAYED' && (result.orderId || result.delayedReason === 'gtc_fallback')) {
         const reason = result.delayedReason ?? 'sports';
         await tx.copyTrade.update({
           where: { id: res.copyTradeId },
           data: {
-            orderId: result.orderId,
+            ...(result.orderId ? { orderId: result.orderId } : {}),
             failReason: `delayed matching (${reason}): background poll scheduled`,
             latencyMs,
           },
         });
         delayedPolls.push({
           copyTradeId: res.copyTradeId,
-          orderId: result.orderId,
+          orderId: result.orderId ?? '',  // GTC fallback creates its own orderId
           allocationId: allocation.id,
           side: res.side,
           tokenId: res.tokenId,
@@ -755,7 +756,7 @@ async function batchSettle(
         const mode = res.isPaper ? 'PAPER' : 'LIVE';
         log.info(`COPY TRADE DELAYED (${reason}) — background poll scheduled [${mode}]`, {
           trader: res.tradeInfo.proxyWallet.slice(0, 10),
-          side: res.side, orderId: result.orderId,
+          side: res.side, orderId: result.orderId ?? '(gtc-pending)',
           title: res.tradeInfo.title?.slice(0, 50),
         });
         continue;
