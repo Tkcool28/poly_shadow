@@ -1174,9 +1174,9 @@ async function main() {
         orderBy: { detectedAt: 'asc' },
       });
 
-      // ── Pre-filter CHAIN_MAKER SELLs for live allocations (SELL-copy globally disabled) ──
+      // ── Pre-filter ALL SELLs for live allocations (SELL-copy disabled, no value in drain processing) ──
       // Live SELL-copy is disabled (phaseA line 446-450, copy-trade-worker line 260-269).
-      // CHAIN_MAKER SELLs for live allocations are guaranteed SKIPPED — batch-skip them here.
+      // ALL SELLs for live allocations are guaranteed SKIPPED — batch-skip them here.
       // If SELL-copy is re-enabled, remove this block. No majority accumulator concern (BUYs only).
       {
         const liveWallets = new Set(
@@ -1186,7 +1186,7 @@ async function main() {
         const keptSells: typeof pendingSells = [];
 
         for (const t of pendingSells) {
-          if (t.detectionSource === 'CHAIN_MAKER' && liveWallets.has(t.proxyWallet)) {
+          if (liveWallets.has(t.proxyWallet)) {
             const alloc = allActiveAllocations.find(a => a.proxyWallet === t.proxyWallet)!;
             sellsToSkip.push({ trade: t, alloc });
           } else {
@@ -1205,16 +1205,16 @@ async function main() {
                 requestedPrice: t.price,
                 status: 'SKIPPED',
                 isPaper: false,
-                failReason: 'CHAIN_MAKER pre-filtered (live SELL-copy disabled)',
+                failReason: 'pre-filtered (live SELL-copy disabled)',
                 latencyMs: 0,
                 followAllocationId: alloc.id,
               })),
               skipDuplicates: true,
             });
           } catch (err: any) {
-            log.warn(`CHAIN_MAKER SELL pre-filter batch skip failed: ${err.message}`);
+            log.warn(`SELL pre-filter batch skip failed: ${err.message}`);
           }
-          log.info(`CHAIN_MAKER SELL pre-filter: ${sellsToSkip.length} batch-skipped (${keptSells.length} kept)`);
+          log.info(`SELL pre-filter: ${sellsToSkip.length} batch-skipped for live wallets (${keptSells.length} kept for paper)`);
         }
         pendingSells = keptSells;
       }

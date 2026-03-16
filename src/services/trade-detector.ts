@@ -100,9 +100,9 @@ export async function refreshTrackedWallets(): Promise<void> {
   userNameCache = names;
   logger.debug(`Refreshed tracked wallets cache: ${wallets.size} wallets (all COMPLETED traders)`);
 
-  // Also refresh live-allocation wallet set for ChainTradeWatcher
+  // Also refresh live-allocation wallet set for RAPID_POLL (excludes copyMakerFills — they use CHAIN_MAKER)
   const liveAllocs = await prisma.followAllocation.findMany({
-    where: { isPaper: false, isActive: true },
+    where: { isPaper: false, isActive: true, copyMakerFills: { not: true } },
     select: { proxyWallet: true },
   });
   liveAllocationWallets = new Set(liveAllocs.map(a => a.proxyWallet.toLowerCase()));

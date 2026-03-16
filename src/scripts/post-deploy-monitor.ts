@@ -75,6 +75,21 @@ SELECT 'Q9', COUNT(*) FROM "CopyTrade"
 WHERE "followAllocationId" = '${ALLOCATION_ID}'
   AND "isPaper" = false AND "createdAt" > NOW() - INTERVAL '20 minutes'
   AND status IN ('FILLED', 'SETTLED') AND side = 'BUY';
+
+-- Q10: SELL drain waste — any SELLs leaking past pre-filter?
+SELECT 'Q10',
+  COUNT(*) FILTER (WHERE side = 'SELL' AND "failReason" NOT LIKE 'pre-filtered%' AND "failReason" NOT LIKE 'CHAIN_MAKER pre-filtered%') as leaked,
+  COUNT(*) FILTER (WHERE side = 'SELL' AND ("failReason" LIKE 'pre-filtered%' OR "failReason" LIKE 'CHAIN_MAKER pre-filtered%')) as batch_skipped
+FROM "CopyTrade"
+WHERE "followAllocationId" = '${ALLOCATION_ID}'
+  AND "isPaper" = false AND "createdAt" > NOW() - INTERVAL '20 minutes'
+  AND status = 'SKIPPED';
+
+-- Q11: RAPID_POLL disabled? (should be zero for copyMakerFills wallets)
+SELECT 'Q11', COUNT(*) FROM "DetectedTrade"
+WHERE "proxyWallet" = '0x63ce342161250d705dc0b16df89036c8e5f9ba9a'
+  AND "detectionSource" = 'RAPID_POLL'
+  AND "detectedAt" > NOW() - INTERVAL '20 minutes';
 `;
 
   const result = execSync(`ssh hetzner_finland_dockerapps bash -s <<'OUTER'
@@ -215,6 +230,32 @@ function parseResults(raw: string): CheckResult[] {
       label: 'Filled trades',
       status: 'INFO',
       message: `${count}`,
+    });
+  }
+
+  // Q10: SELL drain waste
+  {
+    const row = getRow('Q10');
+    const leaked = parseInt(row[0] || '0', 10);
+    const batchSkipped = parseInt(row[1] || '0', 10);
+    results.push({
+      label: 'SELL drain leak',
+      status: leaked > 0 ? 'WARN' : 'PASS',
+      message: leaked > 0
+        ? `${leaked} SELLs leaked past pre-filter (${batchSkipped} batch-skipped)`
+        : `0 leaked, ${batchSkipped} batch-skipped ✓`,
+    });
+  }
+
+  // Q11: RAPID_POLL disabled
+  {
+    const count = parseInt(getRow('Q11')[0] || '0', 10);
+    results.push({
+      label: 'RAPID_POLL disabled',
+      status: count > 0 ? 'ALERT' : 'PASS',
+      message: count > 0
+        ? `${count} RAPID_POLL signals detected — should be 0`
+        : `0 signals ✓`,
     });
   }
 
