@@ -292,6 +292,7 @@ async function phaseA(
     majorityOnlyMode: boolean },
   cache: DrainCache,
   drainStartMs: number,
+  preRecorded?: boolean,
 ): Promise<PhaseAResult | null> {
   const startMs = Date.now();
   const signalAgeMs = startMs - (trade.realTimestamp ?? trade.timestamp) * 1000;
@@ -332,7 +333,8 @@ async function phaseA(
   }
 
   // ── Majority accumulator: record every trader BUY (before per-allocation sizing/exclusion filters) ──
-  if (trade.side === 'BUY') {
+  // Skip when preRecorded=true (drain pre-pass already recorded all batch signals)
+  if (trade.side === 'BUY' && !preRecorded) {
     recordTraderBuy(trade.proxyWallet, trade.conditionId, trade.outcome, trade.size * trade.price);
   }
 
@@ -393,14 +395,24 @@ async function phaseA(
   }
 
   // ── Majority gate (opt-in per allocation) ──
+  // Self-exclusion: subtract current signal's USD so it can't tip its own majority check.
+  // Both-sides: require signals from both outcomes before opening the gate.
   let majorityTotalUsd: number | null = null;
   if (trade.side === 'BUY' && allocation.majorityOnlyMode) {
+    const tradeUsd = trade.size * trade.price;
     const majority = getMajoritySide(
       trade.proxyWallet, trade.conditionId,
       config.MAJORITY_MIN_USD, config.MAJORITY_MIN_RATIO,
+      { outcome: trade.outcome, usd: tradeUsd },
     );
     if (!majority) {
       await createSkippedRecord(trade, 'majority accumulating: insufficient signal', allocation.id, isPaper);
+      return null;
+    }
+    if (majority.numOutcomes < 2) {
+      await createSkippedRecord(trade,
+        `majority gate: only ${majority.numOutcomes} outcome(s) seen ($${majority.totalUsd.toFixed(0)}) — waiting for both sides`,
+        allocation.id, isPaper);
       return null;
     }
     if (trade.outcome !== majority.outcome) {
@@ -410,7 +422,7 @@ async function phaseA(
       return null;
     }
     majorityTotalUsd = majority.totalUsd;
-    log.debug(`Majority confirmed: copying "${trade.outcome}" (${(majority.ratio * 100).toFixed(0)}% of $${majority.totalUsd.toFixed(0)}, ${majority.totalTrades} trades)`, {
+    log.debug(`Majority confirmed: "${trade.outcome}" (${(majority.ratio * 100).toFixed(0)}% of $${majority.totalUsd.toFixed(0)}, ${majority.numOutcomes} outcomes)`, {
       conditionId: trade.conditionId, proxyWallet: trade.proxyWallet,
     });
   }
@@ -930,10 +942,8 @@ async function drainParallel(
   }
 
   if (posLimitSkips.length > 0) {
-    // Feed majority accumulator for ALL skipped signals (contract: every BUY must be recorded)
-    for (const { trade } of posLimitSkips) {
-      recordTraderBuy(trade.proxyWallet, trade.conditionId, trade.outcome, trade.size * trade.price);
-    }
+    // Note: majority accumulator recording already handled by drain pre-pass
+    // (all pending BUYs recorded before drainParallel is called).
     try {
       await prisma.copyTrade.createMany({
         data: posLimitSkips.map(({ trade, allocId }) => ({
@@ -990,7 +1000,7 @@ async function drainParallel(
             excludeEventSlugPatterns: allocation.excludeEventSlugPatterns,
             excludeTitlePatterns: allocation.excludeTitlePatterns,
             majorityOnlyMode: allocation.majorityOnlyMode,
-          }, drainCache, drainStartMs),
+          }, drainCache, drainStartMs, true),  // preRecorded=true: drain pre-pass already recorded
         );
         if (result) {
           // Fire CLOB immediately (non-blocking, bounded by pLimit(10))
@@ -1373,6 +1383,16 @@ async function main() {
 
       // SELLs first (exits are time-sensitive), then BUYs
       const pending = [...pendingSells, ...pendingBuys, ...makerBuys];
+
+      // Pre-pass: record ALL pending BUYs into accumulator before any phaseA
+      // majority check. This ensures the accumulator sees full batch data
+      // (CHAIN + CHAIN_MAKER), matching backtest behavior (chronological single-pass).
+      // Runs BEFORE batch cap so even capped-out signals feed the accumulator.
+      for (const t of pending) {
+        if (t.side === 'BUY') {
+          recordTraderBuy(t.proxyWallet, t.conditionId, t.outcome, t.size * t.price);
+        }
+      }
 
       if (pending.length > MAX_DRAIN_BATCH_SIZE) {
         log.info(`Drain batch capped: ${pending.length} pending, processing first ${MAX_DRAIN_BATCH_SIZE}`);

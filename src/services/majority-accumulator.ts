@@ -26,29 +26,42 @@ export function recordTraderBuy(proxyWallet: string, conditionId: string, outcom
   outcomes.set(outcome, stats);
 }
 
-/** Returns the majority outcome (by USD volume) if detection threshold met, else null. */
+/**
+ * Returns the majority outcome (by USD volume) if detection threshold met, else null.
+ * @param excludeUsd — subtract this amount from the given outcome before checking.
+ *   Prevents the current signal from counting toward its own majority check
+ *   (avoids "majority flip" where a single large trade tips the balance).
+ */
 export function getMajoritySide(
   proxyWallet: string, conditionId: string,
   minUsd: number, minRatio: number,
-): { outcome: string; ratio: number; totalTrades: number; totalUsd: number } | null {
+  excludeUsd?: { outcome: string; usd: number },
+): { outcome: string; ratio: number; totalTrades: number; totalUsd: number; numOutcomes: number } | null {
   const outcomes = accumulator.get(`${proxyWallet}:${conditionId}`);
   if (!outcomes) return null;
   let totalCount = 0;
   let totalUsd = 0;
   let maxUsd = 0;
   let majorityOutcome = '';
+  let numOutcomes = 0;
   for (const [outcome, stats] of outcomes) {
+    let adjUsd = stats.totalUsd;
+    // Subtract the current signal's contribution so it doesn't vote for itself
+    if (excludeUsd && outcome === excludeUsd.outcome) {
+      adjUsd = Math.max(0, adjUsd - excludeUsd.usd);
+    }
     totalCount += stats.count;
-    totalUsd += stats.totalUsd;
-    if (stats.totalUsd > maxUsd) {
-      maxUsd = stats.totalUsd;
+    totalUsd += adjUsd;
+    if (adjUsd > 0) numOutcomes++;
+    if (adjUsd > maxUsd) {
+      maxUsd = adjUsd;
       majorityOutcome = outcome;
     }
   }
   if (totalUsd < minUsd) return null;             // volume-based timing gate
   const ratio = totalUsd > 0 ? maxUsd / totalUsd : 0;
   if (ratio < minRatio) return null;
-  return { outcome: majorityOutcome, ratio, totalTrades: totalCount, totalUsd };
+  return { outcome: majorityOutcome, ratio, totalTrades: totalCount, totalUsd, numOutcomes };
 }
 
 /** Prune stale entries. Default 25h — covers daily-timeframe markets. */

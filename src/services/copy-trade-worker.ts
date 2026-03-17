@@ -208,14 +208,23 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   }
 
   // ── Majority gate (opt-in per allocation) ──
+  // Self-exclusion + both-sides requirement — mirrors phaseA logic
   let majorityTotalUsd: number | null = null;
   if (trade.side === 'BUY' && allocation.majorityOnlyMode) {
+    const tradeUsd = trade.size * trade.price;
     const majority = getMajoritySide(
       trade.proxyWallet, trade.conditionId,
       config.MAJORITY_MIN_USD, config.MAJORITY_MIN_RATIO,
+      { outcome: trade.outcome, usd: tradeUsd },
     );
     if (!majority) {
       await createSkippedRecord(trade, 'majority accumulating: insufficient signal', allocation.id, isPaper);
+      return;
+    }
+    if (majority.numOutcomes < 2) {
+      await createSkippedRecord(trade,
+        `majority gate: only ${majority.numOutcomes} outcome(s) seen ($${majority.totalUsd.toFixed(0)}) — waiting for both sides`,
+        allocation.id, isPaper);
       return;
     }
     if (trade.outcome !== majority.outcome) {
