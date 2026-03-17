@@ -74,6 +74,12 @@ enum BackfillStatus {
   SCREENED_OUT
 }
 
+enum ExecutionMethod {
+  FAK
+  GTC
+  POOL
+}
+
 // ─── Market (cached from Gamma API) ───
 
 model Market {
@@ -398,6 +404,7 @@ model CopyTrade {
   settlementPnl      Float?
   settledAt          DateTime?
   claimedAt          DateTime?               // Set after on-chain CTF redemption succeeds
+  executionMethod    ExecutionMethod?        // FAK, GTC, or POOL — set at fill time, survives settlement
 
   @@index([status])
   @@index([createdAt(sort: Desc)])

@@ -107,6 +107,7 @@ async function resolveDelayedOrder(ctx: DelayedOrderContext, attempt: number): P
           requestedAmount: sizeMatched * recoveredPrice,
           failReason: `[delayed-poll-resolved] attempt=${attempt + 1}, orderPrice=${orderPrice}`,
           filledAt: new Date(),
+          executionMethod: 'FAK',
         },
       });
 
@@ -294,6 +295,7 @@ async function resolveGtcFallback(
           estimatedFee: 0, // GTC fills are maker orders — 0% fee on Polymarket
           failReason: `[gtc-fallback-filled] restMs=${config.GTC_FALLBACK_REST_MS}`,
           filledAt: new Date(),
+          executionMethod: 'GTC',
         },
       });
       log.info('GTC fallback: FILLED', {

@@ -648,6 +648,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
         estimatedFee: result.estimatedFee ?? null,
         latencyMs,
         filledAt: result.status === 'FILLED' ? new Date() : null,
+        executionMethod: result.executionMethod ?? undefined,
         // FAK partial fills: update requestedAmount to actual USD so daily spend tracking is accurate
         requestedAmount: (result.status === 'FILLED' && result.filledSize && result.filledPrice)
           ? result.filledSize * result.filledPrice

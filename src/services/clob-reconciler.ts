@@ -64,6 +64,7 @@ export async function reconcileStalePending(): Promise<void> {
             failReason: null,
             latencyMs: Date.now() - record.createdAt.getTime(),
             filledAt: new Date(),
+            executionMethod: 'FAK',
           },
         });
 
@@ -206,6 +207,7 @@ export async function reconcileSkippedGhostFills(): Promise<void> {
               failReason: `[ghost-fill-recovered] original: SKIPPED ${record.failReason?.includes('GTC') ? 'GTC' : 'FAK'}, orderPrice=${orderPrice}`,
               filledAt: record.createdAt,
               requestedAmount: sizeMatched * recoveredPrice,
+              executionMethod: record.failReason?.includes('GTC') ? 'GTC' : 'FAK',
             },
           });
 

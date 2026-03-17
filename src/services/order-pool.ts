@@ -376,6 +376,7 @@ async function fireBucket(bucket: PoolBucket): Promise<void> {
           filledAt: result.status === 'FILLED' ? new Date() : null,
           // Update requestedAmount to bumped proportion so daily spend limit counts actual USD committed
           requestedAmount: executorAmount * proportion,
+          executionMethod: result.status === 'FILLED' ? 'POOL' : undefined,
         },
       });
     }

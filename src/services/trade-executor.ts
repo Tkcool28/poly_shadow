@@ -41,6 +41,7 @@ export interface ExecuteOrderResult {
   transactionHashes: string[];
   estimatedFee?: number; // paper trades only: estimated fee in USD
   delayedReason?: 'sports' | 'gtc_fallback'; // distinguishes DELAYED cause for caller routing
+  executionMethod?: 'FAK' | 'GTC' | 'POOL'; // set at fill time, survives settlement
 }
 
 // Market metadata cache (tickSize + negRisk don't change per market)
@@ -819,6 +820,7 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
       failReason: null,
       transactionHashes: txHashes,
       estimatedFee,
+      executionMethod: 'FAK',
     };
   } catch (err: any) {
     const tErr = Date.now();
