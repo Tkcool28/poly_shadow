@@ -1,4 +1,5 @@
 mod config;
+mod filter;
 mod state;
 mod wss;
 
