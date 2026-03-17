@@ -27,7 +27,7 @@ import type { TradeData, GammaMarketData } from '../api/types';
 const TRADER_PROXY = '0x63ce342161250d705dc0b16df89036c8e5f9ba9a';
 const ALLOC_ID = 'fa_0x8dxd_live_1773336058';
 const LOOKBACK_HOURS = parseInt(process.env.LOOKBACK_HOURS ?? '24', 10); // look at predictions with trader activity in last N hours
-const MAX_PREDICTIONS = 10;     // check at most N settled predictions
+const MAX_PREDICTIONS = parseInt(process.env.MAX_PREDICTIONS ?? '10', 10); // 0 = all predictions
 const DEPLOY_TS = 1773473040;   // 2026-03-14T07:24:00Z — USD200_LK deployed (commit c383819)
 
 // USD200_LK production config — fetched from production at runtime (Phase 0)
@@ -746,7 +746,7 @@ async function main() {
   const sortedCandidates = [...byRecency(nonExcludedSettled), ...byRecency(nonExcludedOpen), ...byRecency(excludedSettled)];
   console.log(`  Non-excluded: ${nonExcludedSettled.length} settled + ${nonExcludedOpen.length} open | Excluded settled: ${excludedSettled.length}`);
 
-  const targetConditionIds = sortedCandidates.slice(0, MAX_PREDICTIONS);
+  const targetConditionIds = MAX_PREDICTIONS > 0 ? sortedCandidates.slice(0, MAX_PREDICTIONS) : sortedCandidates;
 
   // ─── Step 3: Fetch production CopyTrade records from DB ───
   console.log('\n[3/4] Fetching production CopyTrade records via SSH...');

@@ -1,0 +1,54 @@
+[package]
+name = "polymarket-copier"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full", "test-util"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Concurrent data structures
+dashmap = "6"
+parking_lot = "0.12"
+lru = "0.12"
+
+# Ethereum / Polygon
+alloy-primitives = "0.8"
+alloy-sol-types = "0.8"
+ethers = { version = "2", features = ["eip712"] }
+
+# CLOB API authentication
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Config
+envy = "0.4"
+
+# Misc
+rand = "0.8"
+chrono = "0.4"
+url = "2"
+futures-util = "0.3"
+hex = "0.4"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
