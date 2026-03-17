@@ -266,7 +266,8 @@ function estimateEndFromSlug(slug: string): number | null {
     if (dur === '15m') return startTs + 900;
     if (dur === '1h') return startTs + 3600;
   }
-  const hourlyMatch = slug.match(/up-or-down-(?:march|april)-(\d+)-(\d+)(am|pm)-et$/i);
+  // Handles both old format (march-14-6am-et) and new format with year (march-16-2026-6am-et)
+  const hourlyMatch = slug.match(/up-or-down-(?:march|april)-(\d+)-(?:\d{4}-)?(\d+)(am|pm)-et$/i);
   if (hourlyMatch) {
     const day = parseInt(hourlyMatch[1], 10);
     let hour = parseInt(hourlyMatch[2], 10);
@@ -278,7 +279,8 @@ function estimateEndFromSlug(slug: string): number | null {
     const date = new Date(Date.UTC(2026, month, day, utcHour, 0, 0));
     return Math.floor(date.getTime() / 1000) + 3600;
   }
-  const match12 = slug.match(/(\d+)-12(am|pm)-et$/i);
+  // 12am/12pm edge case (both formats)
+  const match12 = slug.match(/(\d+)-(?:\d{4}-)?12(am|pm)-et$/i);
   if (match12) {
     const day = parseInt(match12[1], 10);
     let hour = 12;
