@@ -4,14 +4,14 @@
 
 export interface GameEvent {
   matchId: string;
-  game: 'cs2' | 'dota2' | 'lol' | 'val' | 'atp' | 'wta';
-  eventType: 'map_win' | 'series_end' | 'baron_kill' | 'elder_dragon';
+  game: 'cs2' | 'dota2' | 'lol' | 'val' | 'atp' | 'wta' | 'nba' | 'soccer';
+  eventType: 'map_win' | 'series_end' | 'baron_kill' | 'elder_dragon' | 'roshan_kill' | 'barracks_destroyed' | 'gold_lead_shift' | 'lead_change' | 'scoring_run' | 'goal' | 'red_card';
   winner: string;
   loser: string;
   seriesScore: [number, number];
   seriesFormat: 'bo1' | 'bo3' | 'bo5';
   isSeriesDecisive: boolean;
-  mapNumber: number; // 1, 2, 3 for map wins; 0 for series_end
+  mapNumber: number; // 1, 2, 3 for map wins; 0 for series_end; period for NBA
   timestamp: Date;
   rawData?: Record<string, unknown>;
 }
@@ -61,7 +61,7 @@ export interface GameFeed {
   isHealthy(): boolean;
 }
 
-export type ScalpGame = 'cs2' | 'dota2' | 'lol' | 'val' | 'atp' | 'wta';
+export type ScalpGame = 'cs2' | 'dota2' | 'lol' | 'val' | 'atp' | 'wta' | 'nba' | 'soccer';
 
 // Slug prefixes for discovering esports/tennis markets
 export const GAME_SLUG_PREFIXES: Record<ScalpGame, string> = {
@@ -71,6 +71,8 @@ export const GAME_SLUG_PREFIXES: Record<ScalpGame, string> = {
   val: 'val-',
   atp: 'atp-',
   wta: 'wta-',
+  nba: 'nba-',
+  soccer: 'epl-',
 };
 
 // Slug pattern for series winner: {game}-{team1}-{team2}-{YYYY-MM-DD} with no further suffix
@@ -140,7 +142,7 @@ function binomialCoeff(n: number, k: number): number {
  * fixed estimates: non-decisive ~40% dampening, decisive game = full game shift.
  */
 export function estimateInGameProbShift(
-  eventType: 'baron_kill' | 'elder_dragon',
+  eventType: 'baron_kill' | 'elder_dragon' | 'roshan_kill' | 'barracks_destroyed' | 'gold_lead_shift' | 'lead_change' | 'scoring_run' | 'goal' | 'red_card',
   isDecisiveGame: boolean,
 ): number {
   if (eventType === 'baron_kill') {
@@ -150,6 +152,43 @@ export function estimateInGameProbShift(
   if (eventType === 'elder_dragon') {
     // Elder Dragon: +10-20% game win probability → ~4-8% series shift
     return isDecisiveGame ? 0.08 : 0.04;
+  }
+  if (eventType === 'roshan_kill') {
+    // Roshan: Aegis of the Immortal (+second life for carry), ~60-70% game win correlation
+    // Similar impact to Baron Nashor. 8-10 min respawn, teams fight over it.
+    return isDecisiveGame ? 0.15 : 0.08;
+  }
+  if (eventType === 'barracks_destroyed') {
+    // Barracks (rax): mega creeps at 3/3, each rax gives permanent lane advantage
+    // First rax ~+15-20% game win; stacks multiplicatively toward mega creeps
+    return isDecisiveGame ? 0.20 : 0.10;
+  }
+  if (eventType === 'gold_lead_shift') {
+    // Net worth lead swing of ≥5K gold: indicates teamfight win or major objective
+    // Moderate signal — gold leads are informative but reversible
+    return isDecisiveGame ? 0.08 : 0.04;
+  }
+  if (eventType === 'lead_change') {
+    // NBA Q4/OT lead change: the team that was behind takes the lead
+    // Q4 lead changes are among the biggest NBA probability shifters (10-30%)
+    // "Decisive" here means close game (score margin was small before the change)
+    return isDecisiveGame ? 0.20 : 0.10;
+  }
+  if (eventType === 'scoring_run') {
+    // NBA scoring run: one team scores 10+ unanswered points
+    // Indicates momentum shift, typically 5-15% probability change
+    return isDecisiveGame ? 0.10 : 0.05;
+  }
+  if (eventType === 'goal') {
+    // Soccer goal: massive probability shift, especially go-ahead goals.
+    // "Decisive" here means go-ahead or insurance goal (not equalizer).
+    // Go-ahead goals shift win probability by 25-40%; other goals by 15-25%.
+    return isDecisiveGame ? 0.25 : 0.15;
+  }
+  if (eventType === 'red_card') {
+    // Soccer red card: playing with 10 men for remainder of match.
+    // Significant disadvantage, ~15% shift for decisive situations, ~8% otherwise.
+    return isDecisiveGame ? 0.15 : 0.08;
   }
   return 0;
 }

@@ -5,6 +5,7 @@ import { scalpExecuteOrder, scalpGetOrderBook } from './scalp-executor';
 import {
   getMarketByTeamPair,
   getMarketByTokenId,
+  getMarketForSoccerTeam,
 } from './scalp-market-discovery';
 import { ScalpExitManager } from './scalp-exit-manager';
 import { estimateSeriesFairValue, estimateInGameProbShift, type GameEvent, type BotSignal, type EnhancedBotSignal, type ScalpSignal } from './scalp-types';
@@ -24,6 +25,12 @@ export class ScalpEngine {
    * Handle a game API event (map_win, series_end).
    */
   async onGameEvent(event: GameEvent): Promise<void> {
+    // Soccer goals use single-team win markets (3-outcome: Win/Draw/Win)
+    // instead of the standard 2-outcome team pair markets.
+    if (event.game === 'soccer' && event.eventType === 'goal') {
+      return this.onSoccerGoal(event);
+    }
+
     const market = getMarketByTeamPair(event.winner, event.loser);
     if (!market) {
       log.debug('No market found for game event', {
@@ -34,8 +41,8 @@ export class ScalpEngine {
       return;
     }
 
-    // Only trade series markets in Phase 1
-    if (market.marketType !== 'series') return;
+    // Only trade series and moneyline markets
+    if (market.marketType !== 'series' && market.marketType !== 'moneyline') return;
 
     // Find the winning team's token
     const tokenInfo = resolveWinnerToken(market, event.winner);
@@ -80,10 +87,11 @@ export class ScalpEngine {
     }
 
     let fairValue: number;
-    if (event.eventType === 'baron_kill' || event.eventType === 'elder_dragon') {
+    const inGameEventTypes = ['baron_kill', 'elder_dragon', 'roshan_kill', 'barracks_destroyed', 'gold_lead_shift', 'lead_change', 'scoring_run', 'goal', 'red_card'] as const;
+    if ((inGameEventTypes as readonly string[]).includes(event.eventType)) {
       // In-game event: additive probability shift model
       const isDecisiveGame = (event.rawData?.isDecisiveGame as boolean) ?? false;
-      const shift = estimateInGameProbShift(event.eventType, isDecisiveGame);
+      const shift = estimateInGameProbShift(event.eventType as (typeof inGameEventTypes)[number], isDecisiveGame);
       fairValue = Math.max(Math.min(currentPrice + shift, 0.95), 0.05);
     } else {
       // Series-level event (map_win / series_end): binomial model
@@ -125,7 +133,7 @@ export class ScalpEngine {
     const market = getMarketByTokenId(signal.tokenId);
     if (!market) return;
 
-    if (market.marketType !== 'series') return;
+    if (market.marketType !== 'series' && market.marketType !== 'moneyline') return;
 
     // Find which outcome this token is
     const tokenInfo = resolveTokenOutcome(market, signal.tokenId);
@@ -205,6 +213,93 @@ export class ScalpEngine {
       estimatedEdge,
       timestamp: signal.timestamp,
       confidenceScore: 'confidenceScore' in signal ? (signal as EnhancedBotSignal).confidenceScore : undefined,
+    });
+  }
+
+  /**
+   * Handle a soccer goal event.
+   * Soccer has 3-outcome markets (Home Win, Draw, Away Win) — each as a separate
+   * binary Yes/No market. On a goal, we buy Yes on the scoring team's "Win" market.
+   */
+  private async onSoccerGoal(event: GameEvent): Promise<void> {
+    // Look up the scoring team's individual "Win" market
+    const market = getMarketForSoccerTeam(event.winner);
+    if (!market) {
+      log.debug('No soccer win market found for scoring team', {
+        scorer: event.winner,
+        conceder: event.loser,
+      });
+      return;
+    }
+
+    // Soccer win markets have outcomes like ["Yes", "No"]
+    // We want to buy "Yes" (team WILL win), which is typically the first token
+    let tokenId: string;
+    let outcomeLabel: string;
+    try {
+      const tokenIds: string[] = JSON.parse(market.clobTokenIds);
+      const outcomes: string[] = JSON.parse(market.outcomes);
+      // Find the "Yes" token
+      const yesIdx = outcomes.findIndex((o) => o.trim().toLowerCase() === 'yes');
+      if (yesIdx >= 0 && yesIdx < tokenIds.length) {
+        tokenId = tokenIds[yesIdx];
+        outcomeLabel = `${event.winner} Win`;
+      } else {
+        // Default to first token if no explicit "Yes" found
+        tokenId = tokenIds[0];
+        outcomeLabel = `${event.winner} Win`;
+      }
+    } catch {
+      log.warn('Cannot parse soccer market tokens', { slug: market.slug });
+      return;
+    }
+
+    // Check processing lock
+    const lockKey = market.slug;
+    const existingLock = processingLock.get(lockKey);
+    if (existingLock && Date.now() - existingLock.timestamp < LOCK_EXPIRY_MS) {
+      log.info('Soccer market lock exists, skipping', { slug: market.slug });
+      return;
+    }
+    processingLock.set(lockKey, { cycleId: `pending-${Date.now()}`, timestamp: Date.now() });
+
+    // Get current price
+    const currentPrice = await getCurrentPrice(tokenId);
+    if (currentPrice === null) {
+      log.warn('Cannot get current price for soccer market', { slug: market.slug });
+      processingLock.delete(lockKey);
+      return;
+    }
+
+    // Estimate fair value using the goal probability shift model
+    const isDecisiveGame = (event.rawData?.isDecisiveGame as boolean) ?? false;
+    const shift = estimateInGameProbShift('goal', isDecisiveGame);
+    const fairValue = Math.max(Math.min(currentPrice + shift, 0.95), 0.05);
+
+    await this.evaluateAndEnter({
+      matchId: event.matchId,
+      game: event.game,
+      slug: market.slug,
+      conditionId: market.conditionId,
+      tokenId,
+      outcomeLabel,
+      eventType: event.eventType,
+      eventSequence: 1,
+      eventDetail: JSON.stringify({
+        scorer: event.winner,
+        conceder: event.loser,
+        score: event.seriesScore,
+        period: event.rawData?.period,
+        minute: event.rawData?.matchMinute,
+        isGoAhead: event.rawData?.isGoAhead,
+        isEqualizer: event.rawData?.isEqualizer,
+      }),
+      signalSource: 'game_api',
+      signalConfidence: isDecisiveGame ? 'HIGH' : 'MEDIUM',
+      estimatedFairValue: fairValue,
+      currentAsk: currentPrice,
+      estimatedEdge: (fairValue - currentPrice) * 100,
+      timestamp: event.timestamp,
     });
   }
 
