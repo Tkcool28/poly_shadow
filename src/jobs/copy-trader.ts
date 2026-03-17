@@ -42,8 +42,8 @@ const MARKET_REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 min
 
 // ─── Pipeline infrastructure (Change 5) ───
 
-const clobLimiter = pLimit(10);
-const MAX_DRAIN_BATCH_SIZE = 100;
+const clobLimiter = pLimit(15);
+const MAX_DRAIN_BATCH_SIZE = 200;
 
 // ─── DrainCache (Change 3) ───
 
@@ -903,20 +903,66 @@ async function drainParallel(
     preWarmMetadata(uniqueTokenIds),
   ]);
 
-  // 2. Group trades by proxyWallet (preserves SELLs-first order within each group)
+  // 2. Fetch allocations ONCE (used by position-limit pre-filter + per-wallet processing)
+  const allWallets = [...new Set(pending.map(t => t.proxyWallet))];
+  const allocations = await prisma.followAllocation.findMany({
+    where: { proxyWallet: { in: allWallets }, isActive: true },
+  });
+  const allocationByWallet = new Map(allocations.map(a => [a.proxyWallet, a]));
+
+  // 2b. Position-limit pre-filter: batch-skip BUY signals where prediction cap is already hit.
+  // Saves ~300-500ms per signal of serial phaseA processing for guaranteed SKIPPED outcomes.
+  const posLimitSkips: Array<{ trade: DetectedTradeRow; allocId: string }> = [];
+  const posLimitKept: DetectedTradeRow[] = [];
+
+  for (const trade of pending) {
+    if (trade.side !== 'BUY') { posLimitKept.push(trade); continue; }
+    const alloc = allocationByWallet.get(trade.proxyWallet);
+    if (!alloc || alloc.isPaper) { posLimitKept.push(trade); continue; }
+    const maxPerPrediction = alloc.maxPredictionPositionUsd ?? config.MAX_PREDICTION_POSITION_USD;
+    if (maxPerPrediction <= 0) { posLimitKept.push(trade); continue; }
+    const pos = drainCache.getPosition(trade.asset, alloc.id, false);
+    if (pos.netUsd >= maxPerPrediction - 0.01) {
+      posLimitSkips.push({ trade, allocId: alloc.id });
+    } else {
+      posLimitKept.push(trade);
+    }
+  }
+
+  if (posLimitSkips.length > 0) {
+    // Feed majority accumulator for ALL skipped signals (contract: every BUY must be recorded)
+    for (const { trade } of posLimitSkips) {
+      recordTraderBuy(trade.proxyWallet, trade.conditionId, trade.outcome, trade.size * trade.price);
+    }
+    try {
+      await prisma.copyTrade.createMany({
+        data: posLimitSkips.map(({ trade, allocId }) => ({
+          detectedTradeId: trade.id,
+          tokenId: trade.asset,
+          side: trade.side,
+          requestedAmount: 0,
+          requestedPrice: trade.price,
+          status: 'SKIPPED',
+          failReason: 'pre-filtered (prediction position limit)',
+          isPaper: false,
+          followAllocationId: allocId,
+        })),
+        skipDuplicates: true,
+      });
+    } catch (err: any) {
+      log.warn(`Position-limit pre-filter batch skip failed: ${err.message}`);
+    }
+    log.info(`Position-limit pre-filter: ${posLimitSkips.length} batch-skipped (${posLimitKept.length} kept)`);
+  }
+  pending = posLimitKept;
+
+  // 3. Group trades by proxyWallet (preserves SELLs-first order within each group)
   const tradesByWallet = new Map<string, DetectedTradeRow[]>();
   for (const trade of pending) {
     const group = tradesByWallet.get(trade.proxyWallet) ?? [];
     group.push(trade);
     tradesByWallet.set(trade.proxyWallet, group);
   }
-
-  // 3. Fetch allocations ONCE per proxyWallet
-  const wallets = [...tradesByWallet.keys()];
-  const allocations = await prisma.followAllocation.findMany({
-    where: { proxyWallet: { in: wallets }, isActive: true },
-  });
-  const allocationByWallet = new Map(allocations.map(a => [a.proxyWallet, a]));
 
   let totalProcessed = 0;
 
