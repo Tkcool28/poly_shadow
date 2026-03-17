@@ -33,7 +33,7 @@ WHERE "followAllocationId" = '${ALLOCATION_ID}'
 SELECT 'Q2', COUNT(*) FROM "CopyTrade"
 WHERE "followAllocationId" = '${ALLOCATION_ID}'
   AND "isPaper" = false AND "createdAt" > NOW() - INTERVAL '20 minutes'
-  AND "failReason" LIKE '%429%';
+  AND "failReason" LIKE '%HTTP 429%';
 
 -- Q3: WR trending (2h settled BUYs)
 SELECT 'Q3',

@@ -3,7 +3,7 @@ import { isShuttingDown } from '../lib/shutdown';
 import { createJobLogger } from '../lib/logger';
 import { prisma } from '../lib/prisma';
 import { config } from '../config/env';
-import { detectNewTrades, detectRapidPollTrades, handleRealtimeTrade, startCacheRefresh, stopCacheRefresh, getLiveAllocationWallets, createDetectedTradeFromChain } from '../services/trade-detector';
+import { detectNewTrades, detectRapidPollTrades, handleRealtimeTrade, startCacheRefresh, stopCacheRefresh, getChainWatcherWallets, createDetectedTradeFromChain } from '../services/trade-detector';
 import { stopSweep as stopRaceTrackerSweep } from '../services/detection-race-tracker';
 import { RtdsTradeStream } from '../services/ws-trade-stream';
 import { ChainTradeWatcher } from '../services/chain-trade-watcher';
@@ -79,7 +79,7 @@ async function main() {
     };
 
     // Primary WSS connection (always)
-    const primary = new ChainTradeWatcher(chainCallback, getLiveAllocationWallets, 'A');
+    const primary = new ChainTradeWatcher(chainCallback, getChainWatcherWallets, 'A');
     primary.connect();
     chainWatchers.push(primary);
 
@@ -87,7 +87,7 @@ async function main() {
     if (config.CHAIN_DUAL_WSS) {
       const backup = new ChainTradeWatcher(
         chainCallback,
-        getLiveAllocationWallets,
+        getChainWatcherWallets,
         'B',
         config.POLYGON_WS_RPC_URL_B,
         config.POLYGON_HTTP_RPC_URL_B,
@@ -101,7 +101,7 @@ async function main() {
     if (config.CHAIN_DUAL_WSS && config.POLYGON_WS_RPC_URL_C !== config.POLYGON_WS_RPC_URL) {
       const tertiary = new ChainTradeWatcher(
         chainCallback,
-        getLiveAllocationWallets,
+        getChainWatcherWallets,
         'C',
         config.POLYGON_WS_RPC_URL_C,
         config.POLYGON_HTTP_RPC_URL_C,

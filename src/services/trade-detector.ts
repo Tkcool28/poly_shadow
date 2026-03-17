@@ -67,7 +67,8 @@ async function upsertToTradeTable(data: {
 // Polling fallback in detectNewTrades() uses isMonitored (= all COMPLETED traders).
 
 let trackedWallets: Set<string> = new Set();
-let liveAllocationWallets: Set<string> = new Set();
+let liveAllocationWallets: Set<string> = new Set(); // For RAPID_POLL: excludes copyMakerFills
+let chainWatcherWallets: Set<string> = new Set();   // For ChainTradeWatcher: ALL live allocations
 let scoreCache: Map<string, number> = new Map(); // proxyWallet → compositeScore
 let userNameCache: Map<string, string | null> = new Map();
 let cacheRefreshTimer: ReturnType<typeof setInterval> | null = null;
@@ -100,12 +101,20 @@ export async function refreshTrackedWallets(): Promise<void> {
   userNameCache = names;
   logger.debug(`Refreshed tracked wallets cache: ${wallets.size} wallets (all COMPLETED traders)`);
 
-  // Also refresh live-allocation wallet set for RAPID_POLL (excludes copyMakerFills — they use CHAIN_MAKER)
-  const liveAllocs = await prisma.followAllocation.findMany({
+  // Refresh live-allocation wallet sets:
+  // 1. RAPID_POLL: excludes copyMakerFills wallets (they use CHAIN_MAKER, no need for redundant polling)
+  const rapidPollAllocs = await prisma.followAllocation.findMany({
     where: { isPaper: false, isActive: true, copyMakerFills: { not: true } },
     select: { proxyWallet: true },
   });
-  liveAllocationWallets = new Set(liveAllocs.map(a => a.proxyWallet.toLowerCase()));
+  liveAllocationWallets = new Set(rapidPollAllocs.map(a => a.proxyWallet.toLowerCase()));
+
+  // 2. ChainTradeWatcher: ALL live allocations (chain events are the primary detection for copyMakerFills)
+  const allLiveAllocs = await prisma.followAllocation.findMany({
+    where: { isPaper: false, isActive: true },
+    select: { proxyWallet: true },
+  });
+  chainWatcherWallets = new Set(allLiveAllocs.map(a => a.proxyWallet.toLowerCase()));
 }
 
 export async function startCacheRefresh(intervalMs = 60000): Promise<void> {
@@ -121,9 +130,14 @@ export function stopCacheRefresh(): void {
   }
 }
 
-/** Returns the live-allocation wallet set (~7 wallets) — used by ChainTradeWatcher */
+/** Returns the RAPID_POLL wallet set (excludes copyMakerFills) */
 export function getLiveAllocationWallets(): Set<string> {
   return liveAllocationWallets;
+}
+
+/** Returns ALL live-allocation wallets — used by ChainTradeWatcher */
+export function getChainWatcherWallets(): Set<string> {
+  return chainWatcherWallets;
 }
 
 // ─── On-chain trade detection (ChainTradeWatcher path) ───
