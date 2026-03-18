@@ -135,9 +135,11 @@ async fn main() -> anyhow::Result<()> {
         let mut alloc = match shared_state.allocations.get_active_by_wallet(&trade.proxy_wallet) {
             Some(a) => a,
             None => {
-                tracing::debug!(
+                tracing::info!(
                     wallet = %&trade.proxy_wallet[..10.min(trade.proxy_wallet.len())],
-                    "no active allocation for wallet"
+                    side = ?trade.side,
+                    maker = trade.is_maker,
+                    "no active allocation"
                 );
                 continue;
             }
@@ -150,8 +152,9 @@ async fn main() -> anyhow::Result<()> {
 
         // 2. Maker fill filter (per-allocation opt-in)
         if trade.is_maker && !alloc.copy_maker_fills {
-            tracing::debug!(
+            tracing::info!(
                 wallet = %&trade.proxy_wallet[..10.min(trade.proxy_wallet.len())],
+                alloc = %alloc.id,
                 "maker fill skipped (copyMakerFills=false)"
             );
             continue;
@@ -168,8 +171,9 @@ async fn main() -> anyhow::Result<()> {
                     resolver.resolve_condition_id(&token_id).await;
                 });
             }
-            tracing::debug!(
+            tracing::info!(
                 token = %&trade.token_id[..16.min(trade.token_id.len())],
+                wallet = %&trade.proxy_wallet[..10.min(trade.proxy_wallet.len())],
                 "metadata cache miss, resolving in background"
             );
             continue;

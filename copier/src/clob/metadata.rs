@@ -48,18 +48,31 @@ impl MetadataResolver {
             return Some(cid);
         }
 
-        // Mark as in-flight
+        // Mark as in-flight (guard: always remove on exit, even on panic)
         if !self.in_flight.insert(token_id.to_string()) {
             // Already in-flight — another task is resolving
             return None;
         }
 
+        let token_short = &token_id[..20.min(token_id.len())];
+        tracing::info!(token = %token_short, "resolving conditionId via CLOB /book");
+
         // Tier 2: CLOB /book
         let result = self.fetch_condition_from_clob(token_id).await;
 
-        if let Some(ref cid) = result {
-            // Tier 3: Gamma full metadata (fire-and-forget — populates cache)
-            self.resolve_and_cache_full(token_id, cid).await;
+        match &result {
+            Some(cid) => {
+                tracing::info!(
+                    token = %token_short,
+                    condition = %&cid[..16.min(cid.len())],
+                    "conditionId resolved, fetching full metadata"
+                );
+                // Tier 3: Gamma full metadata — populates cache
+                self.resolve_and_cache_full(token_id, cid).await;
+            }
+            None => {
+                tracing::warn!(token = %token_short, "conditionId resolution failed (CLOB /book returned nothing)");
+            }
         }
 
         // Remove from in-flight
@@ -120,7 +133,17 @@ impl MetadataResolver {
             }
         };
 
+        let token_count = meta.tokens.len();
+        let has_gamma = meta.event_slug.is_some();
+        let ts = meta.tick_size.clone();
         self.markets.upsert(condition_id, meta);
+        tracing::info!(
+            condition = %&condition_id[..16.min(condition_id.len())],
+            tokens = token_count,
+            gamma = has_gamma,
+            tick_size = %ts,
+            "market metadata cached"
+        );
         Some(())
     }
 
