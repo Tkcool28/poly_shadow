@@ -1,16 +1,19 @@
 #!/usr/bin/env tsx
 /**
  * Batch Backtest Pipeline — Backtests ALL completed traders from DB
- * 
+ *
+ * Uses INDIVIDUAL TRADES (not aggregated ClosedPositions) to match production behavior.
+ * Processes fills sequentially in timestamp order with self-exclusion in majority gate.
+ *
  * Connects to Hetzner DB via SSH tunnel (localhost:15438).
  * For each trader: simulates copy-trade at 10% sizing with fees/slippage.
  * Outputs ranked results.
- * 
+ *
  * Usage:
  *   # Start SSH tunnel first:
  *   ssh -f -N -L 15438:localhost:5438 hetzner_finland_dockerapps
  *   # Then run:
- *   npx tsx src/scripts/batch-backtest-traders.ts [--limit N] [--min-positions 20]
+ *   npx tsx src/scripts/batch-backtest-traders.ts [--limit N] [--min-positions 20] [--gate 175]
  */
 
 import { Client } from 'pg';
@@ -20,11 +23,13 @@ const { values: args } = parseArgs({
   options: {
     limit: { type: 'string', default: '1000' },
     'min-positions': { type: 'string', default: '20' },
+    gate: { type: 'string', default: '175' },
   },
 });
 
 const LIMIT = parseInt(args.limit ?? '1000', 10);
 const MIN_POSITIONS = parseInt(args['min-positions'] ?? '20', 10);
+const MAJORITY_GATE = parseInt(args.gate ?? '175', 10);
 
 // Copy-trade simulation constants
 const COPY_PERCENT = 0.10;
@@ -34,7 +39,7 @@ const STARTING_CAPITAL = 450;
 const FAK_FAILURE_RATE = 0.12;
 const FEE_RATE = 0.25;
 const FEE_EXPONENT = 2;
-const SLIPPAGE_FRACTION = 0.05;
+const MAX_DAILY_USD = 200;
 
 // Seeded PRNG
 function mulberry32(seed: number): () => number {
@@ -46,16 +51,26 @@ function mulberry32(seed: number): () => number {
   };
 }
 
-interface Position {
+interface TradeRow {
   conditionId: string;
   outcome: string;
-  outcomeIndex: number;
-  avgPrice: number;
-  totalBought: number;
-  realizedPnl: number;
+  outcomeIndex: number | null;
+  price: number;
+  size: number;
+  timestamp: number;
+  side: string;
   eventSlug: string;
-  endDate: string;
-  outcomePrices: string;  // JSON array e.g. '["1","0"]'
+  outcomePrices: string;
+  outcomes: string;
+}
+
+function resolveOutcomeIndex(trade: TradeRow): number | null {
+  if (trade.outcomeIndex != null) return trade.outcomeIndex;
+  try {
+    const outcomes: string[] = JSON.parse(trade.outcomes);
+    const idx = outcomes.findIndex(o => o.toLowerCase() === trade.outcome.toLowerCase());
+    return idx >= 0 ? idx : null;
+  } catch { return null; }
 }
 
 function categorize(slug: string): string {
@@ -73,7 +88,7 @@ function categorize(slug: string): string {
 interface TraderResult {
   wallet: string;
   name: string;
-  positions: number;
+  trades: number;
   traderPnl: number;
   traderBought: number;
   traderRoi: number;
@@ -100,19 +115,17 @@ interface TraderResult {
   pnlPerDay: number;
   daysActive: number;
   // Scalp detection
-  scalpPct: number;   // % of trader's profitable positions where outcome actually lost
-  holdWr: number;     // WR based on market resolution (not trader PnL)
+  scalpPct: number;   // % of sells vs buys — high = scalper
+  holdWr: number;     // WR based on market resolution (copied trades only)
   score: number;      // composite ranking score
 }
 
-function simulateCopy(positions: Position[]): Omit<TraderResult, 'wallet' | 'name' | 'positions' | 'traderPnl' | 'traderBought' | 'traderRoi' | 'traderWr'> {
+function simulateCopy(trades: TradeRow[]): Omit<TraderResult, 'wallet' | 'name' | 'trades' | 'traderPnl' | 'traderBought' | 'traderRoi' | 'traderWr'> {
   const rng = mulberry32(42);
 
-  // Sort chronologically
-  positions.sort((a, b) => (a.endDate || '').localeCompare(b.endDate || ''));
+  // Already sorted by timestamp ASC from SQL, but ensure
+  trades.sort((a, b) => a.timestamp - b.timestamp);
 
-  // Fixed capital — NO compounding (production doesn't auto-compound)
-  const capital = STARTING_CAPITAL;
   let totalDeployed = 0;
   let totalPnl = 0;
   let buyCount = 0;
@@ -121,85 +134,92 @@ function simulateCopy(positions: Position[]): Omit<TraderResult, 'wallet' | 'nam
   let maxDd = 0;
 
   const predDeployed = new Map<string, number>();
-  const committedSides = new Map<string, string>(); // conditionId → first outcome we bought
+  const committedSides = new Map<string, string>();
   const dailyPnl = new Map<string, number>();
-  let dailySpend = new Map<string, number>();
-  const MAX_DAILY_USD = 200;
+  const dailySpend = new Map<string, number>();
 
   // Category tracking
   const catCounts = new Map<string, number>();
 
-  // Scalp detection: computed on ALL positions (before guards)
-  let allScalpWins = 0, allScalpTotal = 0, allHoldWins = 0, allHoldTotal = 0;
-  // Hold WR: computed on positions we actually copy (after guards)
+  // Scalp detection: sell count vs buy count
+  let sellCount = 0, totalBuyCount = 0;
+  // Hold WR: computed on trades we actually copy (after guards)
   let holdWins = 0, holdTotal = 0;
 
   // Majority accumulator: track trader's USD per outcome per conditionId
-  const traderAccum = new Map<string, Map<string, number>>(); // cid → outcome → USD
+  const traderAccum = new Map<string, Map<string, number>>();
 
-  for (const pos of positions) {
-    const cat = categorize(pos.eventSlug);
+  for (const trade of trades) {
+    const cat = categorize(trade.eventSlug);
+    const fillUsd = trade.size * trade.price;
+
+    // Track SELLs for scalp detection, then skip
+    if (trade.side === 'SELL') {
+      sellCount++;
+      continue;
+    }
+    // Only BUY trades below this point (production only copies BUYs)
+
+    totalBuyCount++;
     catCounts.set(cat, (catCounts.get(cat) ?? 0) + 1);
 
-    // Feed majority accumulator regardless of filters
-    if (!traderAccum.has(pos.conditionId)) traderAccum.set(pos.conditionId, new Map());
-    const outcomeMap = traderAccum.get(pos.conditionId)!;
-    outcomeMap.set(pos.outcome, (outcomeMap.get(pos.outcome) ?? 0) + pos.totalBought);
+    // Feed majority accumulator with this fill's USD
+    if (!traderAccum.has(trade.conditionId)) traderAccum.set(trade.conditionId, new Map());
+    const outcomeMap = traderAccum.get(trade.conditionId)!;
+    outcomeMap.set(trade.outcome, (outcomeMap.get(trade.outcome) ?? 0) + fillUsd);
 
-    // Scalp metric: compute on ALL positions BEFORE guards (shows trader nature)
-    try {
-      const prices: string[] = JSON.parse(pos.outcomePrices);
-      const sp = parseFloat(prices[pos.outcomeIndex] ?? '0');
-      const ow = sp >= 0.95;
-      allHoldTotal++;
-      if (ow) allHoldWins++;
-      if (pos.realizedPnl > 0) { allScalpTotal++; if (!ow) allScalpWins++; }
-    } catch {}
+    // Resolve outcomeIndex for settlement check
+    const oi = resolveOutcomeIndex(trade);
+    if (oi == null) continue;
 
     // === PRODUCTION GUARDS ===
 
-    // Guard 1: Min buy price (production: 0.40 for SZ_FOLLOW, 0.60 for PROD_FAITHFUL)
-    if (pos.avgPrice < 0.40 || pos.avgPrice > 0.95) continue;
-    if (pos.totalBought < 1) continue;
+    // Guard 1: Min buy price
+    if (trade.price < 0.40 || trade.price > 0.95) continue;
+    if (fillUsd < 1) continue;
 
-    // Guard 2: Majority gate — need $175+ total volume on this conditionId
-    const totalCidVolume = [...(traderAccum.get(pos.conditionId)?.values() ?? [])].reduce((a, b) => a + b, 0);
-    if (totalCidVolume < 175) continue;
+    // Guard 2: Majority gate WITH self-exclusion (matches production getMajoritySide + excludeUsd)
+    {
+      let totalCidVol = 0;
+      let maxOutcomeVol = 0;
+      let majorityOutcome = '';
+      let numOutcomes = 0;
+      for (const [oc, vol] of outcomeMap) {
+        // Exclude current fill's USD from its own outcome (production: excludeUsd)
+        const adjVol = (oc === trade.outcome) ? Math.max(0, vol - fillUsd) : vol;
+        totalCidVol += adjVol;
+        if (adjVol > 0) numOutcomes++;
+        if (adjVol > maxOutcomeVol) { maxOutcomeVol = adjVol; majorityOutcome = oc; }
+      }
 
-    // Guard 3: Majority check — this outcome must be the majority (>50%)
-    const thisOutcomeVol = outcomeMap.get(pos.outcome) ?? 0;
-    const majorityRatio = thisOutcomeVol / totalCidVolume;
-    if (majorityRatio < 0.50) continue;
+      if (totalCidVol < MAJORITY_GATE) continue;
+      if (numOutcomes < 2) continue;                        // both-sides requirement
+      if (trade.outcome !== majorityOutcome) continue;       // skip minority side
+      if (totalCidVol > 0 && maxOutcomeVol / totalCidVol < 0.50) continue;
+    }
 
-    // Guard 4: Both-sides requirement — need at least 2 outcomes seen
-    if (outcomeMap.size < 2) continue;
+    // Guard 3: Committed side lock
+    const committed = committedSides.get(trade.conditionId);
+    if (committed && committed !== trade.outcome) continue;
 
-    // Guard 5: Committed side lock — once we buy one outcome, block the other
-    const committed = committedSides.get(pos.conditionId);
-    if (committed && committed !== pos.outcome) continue;
-
-    // Guard 6: Daily spend limit ($200/day)
-    const day = (pos.endDate || '').slice(0, 10);
+    // Guard 4: Daily spend limit
+    const day = new Date(trade.timestamp * 1000).toISOString().slice(0, 10);
     const daySpent = dailySpend.get(day) ?? 0;
     if (daySpent >= MAX_DAILY_USD) continue;
 
-    // Guard 7: Available capital (non-compounding: use fixed pool minus total deployed in open positions)
-    // Simplified: just check we haven't deployed more than starting capital
-    const availableCapital = capital - totalDeployed + totalPnl; // rough available
-    if (availableCapital < 1) continue;
+    // Guard 5: Available capital
+    const available = STARTING_CAPITAL - totalDeployed + totalPnl;
+    if (available < 1) continue;
 
-    // Sizing: 10% of trader's position, capped at $8/trade
-    let copyAmount = Math.min(pos.totalBought * COPY_PERCENT, MAX_TRADE_USD);
+    // Sizing: based on THIS fill's USD, not total position
+    let copyAmount = Math.min(fillUsd * COPY_PERCENT, MAX_TRADE_USD);
 
     // Per-prediction cap
-    const predUsed = predDeployed.get(pos.conditionId) ?? 0;
+    const predUsed = predDeployed.get(trade.conditionId) ?? 0;
     const predRemaining = MAX_PRED_USD - predUsed;
     if (predRemaining < 1) continue;
     if (copyAmount > predRemaining) copyAmount = predRemaining;
-
-    // Cap at available capital
-    if (copyAmount > availableCapital) copyAmount = availableCapital;
-    // Cap at daily remaining
+    if (copyAmount > available) copyAmount = available;
     const dailyRemaining = MAX_DAILY_USD - daySpent;
     if (copyAmount > dailyRemaining) copyAmount = dailyRemaining;
     if (copyAmount < 1.0) continue; // CLOB $1 minimum
@@ -207,32 +227,28 @@ function simulateCopy(positions: Position[]): Omit<TraderResult, 'wallet' | 'nam
     // FAK failure simulation (12%)
     if (rng() < FAK_FAILURE_RATE) continue;
 
-    // Category-aware slippage: we enter LATER than trader, price has moved
+    // Category-aware slippage
     let slippagePct: number;
-    if (cat === '5m')       slippagePct = 0.03 + 0.05 * rng();  // 3-8% (5m moves fast)
-    else if (cat === '15m') slippagePct = 0.02 + 0.04 * rng();  // 2-6%
-    else if (cat === '1h')  slippagePct = 0.02 + 0.03 * rng();  // 2-5%
-    else                    slippagePct = 0.01 + 0.02 * rng();   // 1-3% (sports/other)
-    const fillPrice = Math.min(pos.avgPrice * (1 + slippagePct), 0.99);
+    if (cat === '5m')       slippagePct = 0.03 + 0.05 * rng();
+    else if (cat === '15m') slippagePct = 0.02 + 0.04 * rng();
+    else if (cat === '1h')  slippagePct = 0.02 + 0.03 * rng();
+    else                    slippagePct = 0.01 + 0.02 * rng();
+    const fillPrice = Math.min(trade.price * (1 + slippagePct), 0.99);
 
     // Taker fee: 0.25 × (p(1-p))^2
     const shares = copyAmount / fillPrice;
     const feeShares = shares * FEE_RATE * Math.pow(fillPrice * (1 - fillPrice), FEE_EXPONENT);
     const netShares = shares - feeShares;
 
-    // Did the OUTCOME actually win at settlement? (NOT trader's PnL)
+    // Market resolution oracle
     let outcomeWon = false;
     try {
-      const prices: string[] = JSON.parse(pos.outcomePrices);
-      const settlementPrice = parseFloat(prices[pos.outcomeIndex] ?? '0');
-      outcomeWon = settlementPrice >= 0.95;
-    } catch {
-      continue; // skip unparseable — don't fallback to realizedPnl
-    }
-    const settlementValue = outcomeWon ? netShares * 1.0 : 0;
-    const pnl = settlementValue - copyAmount;
+      const prices: string[] = JSON.parse(trade.outcomePrices);
+      outcomeWon = parseFloat(prices[oi] ?? '0') >= 0.95;
+    } catch { continue; }
 
-    // Track hold WR (guarded positions only)
+    const pnl = (outcomeWon ? netShares * 1.0 : 0) - copyAmount;
+
     holdTotal++;
     if (outcomeWon) holdWins++;
 
@@ -240,16 +256,15 @@ function simulateCopy(positions: Position[]): Omit<TraderResult, 'wallet' | 'nam
     totalDeployed += copyAmount;
     buyCount++;
     if (pnl > 0) wins++; else losses++;
-    predDeployed.set(pos.conditionId, predUsed + copyAmount);
-    if (!committed) committedSides.set(pos.conditionId, pos.outcome);
+    predDeployed.set(trade.conditionId, predUsed + copyAmount);
+    if (!committed) committedSides.set(trade.conditionId, trade.outcome);
     dailySpend.set(day, daySpent + copyAmount);
 
-    // Drawdown (on cumulative PnL, not equity — since non-compounding)
+    // Drawdown
     if (totalPnl > peakPnl) peakPnl = totalPnl;
     const dd = peakPnl - totalPnl;
     if (dd > maxDd) maxDd = dd;
 
-    // Daily PnL
     dailyPnl.set(day, (dailyPnl.get(day) ?? 0) + pnl);
   }
 
@@ -287,15 +302,15 @@ function simulateCopy(positions: Position[]): Omit<TraderResult, 'wallet' | 'nam
     if (n > maxCatCount) { maxCatCount = n; mainCat = c; }
   }
   const cryptoCount = (catCounts.get('5m') ?? 0) + (catCounts.get('15m') ?? 0) + (catCounts.get('1h') ?? 0);
-  const cryptoPct = positions.length > 0 ? cryptoCount / positions.length * 100 : 0;
+  const cryptoPct = totalBuyCount > 0 ? cryptoCount / totalBuyCount * 100 : 0;
 
-  const scalpPct = allScalpTotal > 0 ? allScalpWins / allScalpTotal * 100 : 0;
+  const scalpPct = totalBuyCount > 0 ? sellCount / totalBuyCount * 100 : 0;
   const holdWr = holdTotal > 0 ? holdWins / holdTotal * 100 : 0;
 
   // Composite score: penalize scalpers, low sample, high DD
   const score = copyPnl > 0
     ? copyRoi * (1 - scalpPct / 100) * Math.min(buyCount / 20, 1) * (1 / (1 + copyMaxDdPct / 20))
-    : -1; // unprofitable = unranked
+    : -1;
 
   return {
     copyPnl, copyDeployed: totalDeployed, copyRoi, copyWr, copyBuys: buyCount,
@@ -320,66 +335,95 @@ async function main() {
   await db.connect();
   console.log('Connected to Hetzner DB via SSH tunnel');
 
-  // Get all completed traders
+  // Get all completed traders — count from Trade table (not ClosedPosition)
   const traders = await db.query(`
-    SELECT t."proxyWallet", t."userName",
-           COUNT(cp.id) as pos_count
-    FROM "Trader" t
-    JOIN "ClosedPosition" cp ON cp."proxyWallet" = t."proxyWallet"
-    WHERE t."backfillStatus" = 'COMPLETED'
-    GROUP BY t."proxyWallet", t."userName"
-    HAVING COUNT(cp.id) >= $1
-    ORDER BY COUNT(cp.id) DESC
+    SELECT t."proxyWallet", tr."userName", tr."leaderboardPnl",
+           COUNT(*) as trade_count
+    FROM "Trade" t
+    JOIN "Trader" tr ON tr."proxyWallet" = t."proxyWallet"
+    WHERE tr."backfillStatus" = 'COMPLETED'
+    GROUP BY t."proxyWallet", tr."userName", tr."leaderboardPnl"
+    HAVING COUNT(*) >= $1
+    ORDER BY COUNT(*) DESC
     LIMIT $2
   `, [MIN_POSITIONS, LIMIT]);
 
-  console.log(`Found ${traders.rows.length} traders with >= ${MIN_POSITIONS} closed positions`);
+  console.log(`Found ${traders.rows.length} traders with >= ${MIN_POSITIONS} trades`);
 
   const results: TraderResult[] = [];
   let processed = 0;
 
   for (const trader of traders.rows) {
-    // Fetch closed positions with market resolution data
-    const posResult = await db.query(`
-      SELECT cp."conditionId", cp.outcome, cp."outcomeIndex",
-             cp."avgPrice", cp."totalBought", cp."realizedPnl",
-             cp."eventSlug", cp."endDate"::text,
-             m."outcomePrices"
-      FROM "ClosedPosition" cp
-      JOIN "Market" m ON cp."conditionId" = m."conditionId"
-      WHERE cp."proxyWallet" = $1
+    // Fetch individual trades with market resolution data
+    const tradeResult = await db.query(`
+      SELECT t."conditionId", t.outcome, t."outcomeIndex",
+             t.price, t.size, t.timestamp, t.side,
+             t."eventSlug",
+             m."outcomePrices", m.outcomes
+      FROM "Trade" t
+      JOIN "Market" m ON t."conditionId" = m."conditionId"
+      WHERE t."proxyWallet" = $1
         AND m.closed = true
-      ORDER BY cp."endDate" ASC
+      ORDER BY t.timestamp ASC
     `, [trader.proxyWallet]);
 
-    const positions: Position[] = posResult.rows.map(r => ({
+    const trades: TradeRow[] = tradeResult.rows.map(r => ({
       conditionId: r.conditionId,
       outcome: r.outcome || '',
-      outcomeIndex: parseInt(r.outcomeIndex) || 0,
-      avgPrice: parseFloat(r.avgPrice) || 0.5,
-      totalBought: parseFloat(r.totalBought) || 0,
-      realizedPnl: parseFloat(r.realizedPnl) || 0,
+      outcomeIndex: r.outcomeIndex != null ? parseInt(r.outcomeIndex) : null,
+      price: parseFloat(r.price) || 0,
+      size: parseFloat(r.size) || 0,
+      timestamp: parseInt(r.timestamp) || 0,
+      side: r.side || '',
       eventSlug: r.eventSlug || '',
-      endDate: r.endDate || '',
       outcomePrices: r.outcomePrices || '[]',
+      outcomes: r.outcomes || '[]',
     }));
 
-    // Trader stats
-    const traderWins = positions.filter(p => p.realizedPnl > 0).length;
-    const traderPnl = positions.reduce((s, p) => s + p.realizedPnl, 0);
-    const traderBought = positions.reduce((s, p) => s + p.totalBought, 0);
+    // Trader stats from Trade data
+    const buyTrades = trades.filter(t => t.side === 'BUY');
+    const traderBought = buyTrades.reduce((s, t) => s + t.size * t.price, 0);
+
+    // Trader WR: group by conditionId, find majority outcome, check if it won
+    const cidOutcomes = new Map<string, Map<string, number>>();
+    // Build lookup: conditionId:outcome → first TradeRow (for resolution data)
+    const cidOutcomeSample = new Map<string, TradeRow>();
+    for (const t of buyTrades) {
+      if (!cidOutcomes.has(t.conditionId)) cidOutcomes.set(t.conditionId, new Map());
+      const m = cidOutcomes.get(t.conditionId)!;
+      m.set(t.outcome, (m.get(t.outcome) ?? 0) + t.size * t.price);
+      const key = `${t.conditionId}:${t.outcome}`;
+      if (!cidOutcomeSample.has(key)) cidOutcomeSample.set(key, t);
+    }
+    let traderWinPredictions = 0, traderTotalPredictions = 0;
+    for (const [cid, outcomes] of cidOutcomes) {
+      let maxVol = 0, majOutcome = '';
+      for (const [oc, vol] of outcomes) { if (vol > maxVol) { maxVol = vol; majOutcome = oc; } }
+      const sample = cidOutcomeSample.get(`${cid}:${majOutcome}`);
+      if (!sample) continue;
+      const oi = resolveOutcomeIndex(sample);
+      if (oi == null) continue;
+      try {
+        const prices: string[] = JSON.parse(sample.outcomePrices);
+        const won = parseFloat(prices[oi] ?? '0') >= 0.95;
+        traderTotalPredictions++;
+        if (won) traderWinPredictions++;
+      } catch {}
+    }
+
+    const traderPnl = parseFloat(trader.leaderboardPnl) || 0;
 
     // Run copy simulation
-    const sim = simulateCopy(positions);
+    const sim = simulateCopy(trades);
 
     results.push({
       wallet: trader.proxyWallet,
       name: (trader.userName || trader.proxyWallet.slice(0, 10)).slice(0, 20),
-      positions: positions.length,
+      trades: trades.length,
       traderPnl,
       traderBought,
       traderRoi: traderBought > 0 ? traderPnl / traderBought * 100 : 0,
-      traderWr: positions.length > 0 ? traderWins / positions.length * 100 : 0,
+      traderWr: traderTotalPredictions > 0 ? traderWinPredictions / traderTotalPredictions * 100 : 0,
       ...sim,
     });
 
@@ -399,12 +443,12 @@ async function main() {
   const rpad = (s: string, n: number) => s.length >= n ? s.slice(0, n) : ' '.repeat(n - s.length) + s;
 
   // Output
-  console.log(`\n${'='.repeat(190)}`);
-  console.log(`BATCH BACKTEST — ${results.length} traders | Market resolution oracle | Copy: 10%, $8/trade, $30/pred, $450 cap, fees+slippage ON, majority gate $175`);
-  console.log(`${'='.repeat(190)}\n`);
+  console.log(`\n${'='.repeat(200)}`);
+  console.log(`BATCH BACKTEST (Trade-level) — ${results.length} traders | Per-fill sequential | Self-exclusion majority | Copy: 10%, $8/trade, $30/pred, $450 cap, fees+slippage ON, gate $${MAJORITY_GATE}`);
+  console.log(`${'='.repeat(200)}\n`);
 
   const header =
-    `${pad('Rank', 5)}${pad('Trader', 22)}${rpad('Pos', 6)}${rpad('TrROI%', 7)}${rpad('TrWR%', 7)}` +
+    `${pad('Rank', 5)}${pad('Trader', 22)}${rpad('Trd', 6)}${rpad('TrROI%', 7)}${rpad('TrWR%', 7)}` +
     `${rpad('CpPnL$', 9)}${rpad('CpROI%', 8)}${rpad('HldWR%', 7)}${rpad('CpBuys', 7)}` +
     `${rpad('MaxDD%', 8)}${rpad('Sharpe', 8)}${rpad('DayWR%', 8)}` +
     `${rpad('Scalp%', 7)}${rpad('Score', 8)}` +
@@ -412,13 +456,13 @@ async function main() {
 
   console.log(`PROFITABLE TRADERS (${profitable.length}):`);
   console.log(header);
-  console.log('-'.repeat(190));
+  console.log('-'.repeat(200));
 
   for (let i = 0; i < Math.min(profitable.length, 50); i++) {
     const r = profitable[i];
     console.log(
       `${pad(String(i + 1), 5)}${pad(r.name, 22)}` +
-      `${rpad(String(r.positions), 6)}${rpad(r.traderRoi.toFixed(1), 7)}${rpad(r.traderWr.toFixed(1), 7)}` +
+      `${rpad(String(r.trades), 6)}${rpad(r.traderRoi.toFixed(1), 7)}${rpad(r.traderWr.toFixed(1), 7)}` +
       `${rpad('$' + r.copyPnl.toFixed(0), 9)}${rpad(r.copyRoi.toFixed(1), 8)}${rpad(r.holdWr.toFixed(1), 7)}${rpad(String(r.copyBuys), 7)}` +
       `${rpad(r.copyMaxDdPct.toFixed(1), 8)}${rpad(r.copySharpe.toFixed(2), 8)}${rpad(r.dayWr.toFixed(0), 8)}` +
       `${rpad(r.scalpPct.toFixed(0), 7)}${rpad(r.score.toFixed(2), 8)}` +

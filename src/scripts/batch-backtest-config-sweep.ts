@@ -2,6 +2,9 @@
 /**
  * Config Sweep Backtest — Find optimal copy-trade parameters per trader
  *
+ * Uses INDIVIDUAL TRADES (not aggregated ClosedPositions) to match production behavior.
+ * Processes fills sequentially with self-exclusion in majority gate.
+ *
  * Connects to Hetzner DB via SSH tunnel (localhost:15438).
  * Sweeps 1,600 config combinations per trader, ranked by composite score.
  * Monte Carlo on top 3 configs for consistency validation.
@@ -57,16 +60,17 @@ interface SimConfig {
 }
 
 // ─── Data Types ───
-interface Position {
+interface TradeRow {
   conditionId: string;
   outcome: string;
-  outcomeIndex: number;
-  avgPrice: number;
-  totalBought: number;
-  realizedPnl: number;
+  outcomeIndex: number | null;
+  price: number;
+  size: number;
+  timestamp: number;
+  side: string;
   eventSlug: string;
-  endDate: string;
   outcomePrices: string;
+  outcomes: string;
 }
 
 interface SimResult {
@@ -93,6 +97,15 @@ function mulberry32(seed: number): () => number {
   };
 }
 
+function resolveOutcomeIndex(trade: TradeRow): number | null {
+  if (trade.outcomeIndex != null) return trade.outcomeIndex;
+  try {
+    const outcomes: string[] = JSON.parse(trade.outcomes);
+    const idx = outcomes.findIndex(o => o.toLowerCase() === trade.outcome.toLowerCase());
+    return idx >= 0 ? idx : null;
+  } catch { return null; }
+}
+
 function categorize(slug: string): string {
   if (!slug) return 'unknown';
   if (slug.includes('updown-5m')) return '5m';
@@ -106,15 +119,14 @@ function categorize(slug: string): string {
 }
 
 // ─── Simulation Engine (parameterized) ───
-function simulateCopy(positions: Position[], cfg: SimConfig): SimResult {
+function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
   const rng = mulberry32(cfg.seed);
 
-  positions.sort((a, b) => (a.endDate || '').localeCompare(b.endDate || ''));
-
+  // Already sorted by timestamp ASC from SQL
   let totalDeployed = 0, totalPnl = 0, buyCount = 0;
   let wins = 0, losses = 0, peakPnl = 0, maxDd = 0;
   let holdWins = 0, holdTotal = 0;
-  let allScalpWins = 0, allScalpTotal = 0;
+  let sellCount = 0, totalBuyCount = 0;
 
   const predDeployed = new Map<string, number>();
   const committedSides = new Map<string, string>();
@@ -122,50 +134,67 @@ function simulateCopy(positions: Position[], cfg: SimConfig): SimResult {
   const dailySpend = new Map<string, number>();
   const traderAccum = new Map<string, Map<string, number>>();
 
-  for (const pos of positions) {
-    const cat = categorize(pos.eventSlug);
+  for (const trade of trades) {
+    const cat = categorize(trade.eventSlug);
+    const fillUsd = trade.size * trade.price;
 
-    // Feed majority accumulator
-    if (!traderAccum.has(pos.conditionId)) traderAccum.set(pos.conditionId, new Map());
-    const outcomeMap = traderAccum.get(pos.conditionId)!;
-    outcomeMap.set(pos.outcome, (outcomeMap.get(pos.outcome) ?? 0) + pos.totalBought);
+    // Track SELLs for scalp detection, then skip
+    if (trade.side === 'SELL') {
+      sellCount++;
+      continue;
+    }
+    totalBuyCount++;
 
-    // Scalp metric (ALL positions, before guards)
-    try {
-      const prices: string[] = JSON.parse(pos.outcomePrices);
-      const sp = parseFloat(prices[pos.outcomeIndex] ?? '0');
-      if (pos.realizedPnl > 0) { allScalpTotal++; if (sp < 0.95) allScalpWins++; }
-    } catch {}
+    // Feed majority accumulator with this fill's USD
+    if (!traderAccum.has(trade.conditionId)) traderAccum.set(trade.conditionId, new Map());
+    const outcomeMap = traderAccum.get(trade.conditionId)!;
+    outcomeMap.set(trade.outcome, (outcomeMap.get(trade.outcome) ?? 0) + fillUsd);
+
+    // Resolve outcomeIndex for settlement check
+    const oi = resolveOutcomeIndex(trade);
+    if (oi == null) continue;
 
     // === PRODUCTION GUARDS ===
-    if (pos.avgPrice < cfg.minBuyPrice || pos.avgPrice > 0.95) continue;
-    if (pos.totalBought < 1) continue;
 
-    // Majority gate
+    // Guard 1: minBuyPrice
+    if (trade.price < cfg.minBuyPrice || trade.price > 0.95) continue;
+    if (fillUsd < 1) continue;
+
+    // Guard 2: Majority gate WITH self-exclusion (matches production getMajoritySide + excludeUsd)
     if (cfg.gate > 0) {
-      const totalCidVol = [...(traderAccum.get(pos.conditionId)?.values() ?? [])].reduce((a, b) => a + b, 0);
+      let totalCidVol = 0;
+      let maxOutcomeVol = 0;
+      let majorityOutcome = '';
+      let numOutcomes = 0;
+      for (const [oc, vol] of outcomeMap) {
+        const adjVol = (oc === trade.outcome) ? Math.max(0, vol - fillUsd) : vol;
+        totalCidVol += adjVol;
+        if (adjVol > 0) numOutcomes++;
+        if (adjVol > maxOutcomeVol) { maxOutcomeVol = adjVol; majorityOutcome = oc; }
+      }
+
       if (totalCidVol < cfg.gate) continue;
-      const thisVol = outcomeMap.get(pos.outcome) ?? 0;
-      if (thisVol / totalCidVol < 0.50) continue;
-      if (outcomeMap.size < 2) continue;
+      if (numOutcomes < 2) continue;
+      if (trade.outcome !== majorityOutcome) continue;
+      if (totalCidVol > 0 && maxOutcomeVol / totalCidVol < 0.50) continue;
     }
 
-    // Committed side lock
-    const committed = committedSides.get(pos.conditionId);
-    if (committed && committed !== pos.outcome) continue;
+    // Guard 3: Committed side lock
+    const committed = committedSides.get(trade.conditionId);
+    if (committed && committed !== trade.outcome) continue;
 
-    // Daily spend limit
-    const day = (pos.endDate || '').slice(0, 10);
+    // Guard 4: Daily spend limit
+    const day = new Date(trade.timestamp * 1000).toISOString().slice(0, 10);
     const daySpent = dailySpend.get(day) ?? 0;
     if (daySpent >= MAX_DAILY_USD) continue;
 
-    // Available capital
+    // Guard 5: Available capital
     const available = STARTING_CAPITAL - totalDeployed + totalPnl;
     if (available < 1) continue;
 
-    // Sizing
-    let copyAmount = Math.min(pos.totalBought * cfg.copyPercent, cfg.maxTrade);
-    const predUsed = predDeployed.get(pos.conditionId) ?? 0;
+    // Sizing: based on THIS fill's USD, not total position
+    let copyAmount = Math.min(fillUsd * cfg.copyPercent, cfg.maxTrade);
+    const predUsed = predDeployed.get(trade.conditionId) ?? 0;
     const predRemaining = cfg.maxPred - predUsed;
     if (predRemaining < 1) continue;
     if (copyAmount > predRemaining) copyAmount = predRemaining;
@@ -183,7 +212,7 @@ function simulateCopy(positions: Position[], cfg: SimConfig): SimResult {
     else if (cat === '15m') slippagePct = 0.02 + 0.04 * rng();
     else if (cat === '1h')  slippagePct = 0.02 + 0.03 * rng();
     else                    slippagePct = 0.01 + 0.02 * rng();
-    const fillPrice = Math.min(pos.avgPrice * (1 + slippagePct), 0.99);
+    const fillPrice = Math.min(trade.price * (1 + slippagePct), 0.99);
 
     // Taker fee
     const shares = copyAmount / fillPrice;
@@ -193,8 +222,8 @@ function simulateCopy(positions: Position[], cfg: SimConfig): SimResult {
     // Market resolution oracle
     let outcomeWon = false;
     try {
-      const prices: string[] = JSON.parse(pos.outcomePrices);
-      outcomeWon = parseFloat(prices[pos.outcomeIndex] ?? '0') >= 0.95;
+      const prices: string[] = JSON.parse(trade.outcomePrices);
+      outcomeWon = parseFloat(prices[oi] ?? '0') >= 0.95;
     } catch { continue; }
 
     const pnl = (outcomeWon ? netShares * 1.0 : 0) - copyAmount;
@@ -205,8 +234,8 @@ function simulateCopy(positions: Position[], cfg: SimConfig): SimResult {
     totalDeployed += copyAmount;
     buyCount++;
     if (pnl > 0) wins++; else losses++;
-    predDeployed.set(pos.conditionId, predUsed + copyAmount);
-    if (!committed) committedSides.set(pos.conditionId, pos.outcome);
+    predDeployed.set(trade.conditionId, predUsed + copyAmount);
+    if (!committed) committedSides.set(trade.conditionId, trade.outcome);
     dailySpend.set(day, daySpent + copyAmount);
 
     if (totalPnl > peakPnl) peakPnl = totalPnl;
@@ -218,7 +247,7 @@ function simulateCopy(positions: Position[], cfg: SimConfig): SimResult {
   const copyRoi = totalDeployed > 0 ? totalPnl / totalDeployed * 100 : 0;
   const maxDdPct = STARTING_CAPITAL > 0 ? maxDd / STARTING_CAPITAL * 100 : 0;
   const holdWr = holdTotal > 0 ? holdWins / holdTotal * 100 : 0;
-  const scalpPct = allScalpTotal > 0 ? allScalpWins / allScalpTotal * 100 : 0;
+  const scalpPct = totalBuyCount > 0 ? sellCount / totalBuyCount * 100 : 0;
 
   const dailyVals = [...dailyPnl.values()];
   const winDays = dailyVals.filter(v => v > 0).length;
@@ -286,34 +315,38 @@ async function main() {
       userName = res.rows[0].userName;
     }
 
-    // Fetch positions
-    const posResult = await db.query(`
-      SELECT cp."conditionId", cp.outcome, cp."outcomeIndex",
-             cp."avgPrice", cp."totalBought", cp."realizedPnl",
-             cp."eventSlug", cp."endDate"::text, m."outcomePrices"
-      FROM "ClosedPosition" cp
-      JOIN "Market" m ON cp."conditionId" = m."conditionId"
-      WHERE cp."proxyWallet" = $1 AND m.closed = true
-      ORDER BY cp."endDate" ASC
+    // Fetch individual trades with market resolution data
+    const tradeResult = await db.query(`
+      SELECT t."conditionId", t.outcome, t."outcomeIndex",
+             t.price, t.size, t.timestamp, t.side,
+             t."eventSlug",
+             m."outcomePrices", m.outcomes
+      FROM "Trade" t
+      JOIN "Market" m ON t."conditionId" = m."conditionId"
+      WHERE t."proxyWallet" = $1 AND m.closed = true
+      ORDER BY t.timestamp ASC
     `, [wallet]);
 
-    const positions: Position[] = posResult.rows.map(r => ({
+    const trades: TradeRow[] = tradeResult.rows.map(r => ({
       conditionId: r.conditionId, outcome: r.outcome || '',
-      outcomeIndex: parseInt(r.outcomeIndex) || 0,
-      avgPrice: parseFloat(r.avgPrice) || 0.5,
-      totalBought: parseFloat(r.totalBought) || 0,
-      realizedPnl: parseFloat(r.realizedPnl) || 0,
-      eventSlug: r.eventSlug || '', endDate: r.endDate || '',
+      outcomeIndex: r.outcomeIndex != null ? parseInt(r.outcomeIndex) : null,
+      price: parseFloat(r.price) || 0,
+      size: parseFloat(r.size) || 0,
+      timestamp: parseInt(r.timestamp) || 0,
+      side: r.side || '',
+      eventSlug: r.eventSlug || '',
       outcomePrices: r.outcomePrices || '[]',
+      outcomes: r.outcomes || '[]',
     }));
 
     // Category breakdown
+    const buyTrades = trades.filter(t => t.side === 'BUY');
     const cats = new Map<string, number>();
-    for (const p of positions) { const c = categorize(p.eventSlug); cats.set(c, (cats.get(c) ?? 0) + 1); }
+    for (const t of buyTrades) { const c = categorize(t.eventSlug); cats.set(c, (cats.get(c) ?? 0) + 1); }
     const catStr = [...cats.entries()].sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c}:${n}`).join(', ');
 
     console.log(`${'='.repeat(140)}`);
-    console.log(`${userName} (${wallet.slice(0, 14)}...) — ${positions.length} positions | ${catStr}`);
+    console.log(`${userName} (${wallet.slice(0, 14)}...) — ${trades.length} trades (${buyTrades.length} buys, ${trades.length - buyTrades.length} sells) | ${catStr}`);
     console.log(`${'='.repeat(140)}\n`);
 
     // Sweep all configs
@@ -323,7 +356,7 @@ async function main() {
 
     const results: SimResult[] = [];
     for (const cfg of configs) {
-      results.push(simulateCopy(positions, cfg));
+      results.push(simulateCopy(trades, cfg));
     }
 
     const elapsed = ((Date.now() - startMs) / 1000).toFixed(1);
@@ -344,10 +377,6 @@ async function main() {
     console.log(`  Unique result profiles: ${deduped.length} (from ${profitable.length} profitable configs)\n`);
 
     // Print top N
-    const header =
-      `${pad('Rank', 5)}` +
-      `${pad('── Config ──', 38)}` +
-      `${pad('── Results ──', 60)}`;
     const subheader =
       `${pad('', 5)}${rpad('minBuy', 7)}${rpad('Gate$', 6)}${rpad('MaxTr', 7)}${rpad('MaxPrd', 7)}${rpad('Copy%', 6)}  ` +
       `${rpad('PnL$', 8)}${rpad('Depld$', 8)}${rpad('ROI%', 7)}${rpad('HldWR%', 7)}${rpad('Buys', 6)}` +
@@ -374,7 +403,7 @@ async function main() {
         const mcPnls: number[] = [];
         for (let s = 0; s < 10; s++) {
           const mcCfg = { ...baseCfg, seed: BASE_SEED + s };
-          const mcResult = simulateCopy(positions, mcCfg);
+          const mcResult = simulateCopy(trades, mcCfg);
           mcPnls.push(mcResult.copyPnl);
         }
         const mean = mcPnls.reduce((a, b) => a + b, 0) / mcPnls.length;
