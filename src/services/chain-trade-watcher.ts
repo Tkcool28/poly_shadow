@@ -461,11 +461,13 @@ export class ChainTradeWatcher {
             // Different side = phantom-of-phantom, or same side accumulated above
             return;
           }
+          // Only debounce NegRisk markets (phantom complementary fills); standard CTF emits immediately
+          const debounceMs = isNegRisk ? TAKER_DEBOUNCE_MS : 0;
           const timer = setTimeout(() => {
             this.pendingTakerEmits.delete(txWalletKey);
             // No MAKER event arrived within debounce window → this taker event is real
             this.emitTrade(txWalletKey, tradeData);
-          }, TAKER_DEBOUNCE_MS);
+          }, debounceMs);
           this.pendingTakerEmits.set(txWalletKey, { side, data: tradeData, timer, createdAt: Date.now() });
         }
       } catch (err: any) {

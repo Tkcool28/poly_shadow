@@ -22,7 +22,7 @@ export interface GtcFallbackContext extends DelayedOrderContext {
   amountUsd: number; // copy trade USD amount (for shares calculation)
 }
 
-const POLL_DELAYS_MS = [4000, 8000, 15000];
+const POLL_DELAYS_MS = [4000, 8000, 15000, 30000];
 
 /**
  * Fire-and-forget background poll for delayed FAK orders (sports market 3s matching delay).

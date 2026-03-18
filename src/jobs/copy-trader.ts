@@ -41,7 +41,7 @@ const CAPITAL_AUDIT_INTERVAL_MS = 3_600_000; // 1 hour
 
 // ─── Pipeline infrastructure (Change 5) ───
 
-const clobLimiter = pLimit(15);
+const clobLimiter = pLimit(25);
 const MAX_DRAIN_BATCH_SIZE = 200;
 
 // ─── DrainCache (Change 3) ───
@@ -1222,11 +1222,13 @@ async function main() {
 
       // ── SELLs: never filter CHAIN_MAKER — exits are always safe ──
       // (if we don't hold shares, processCopyTrade skips with "no shares held to sell")
+      // Always exclude RAPID_POLL/POLL — stale signals are useless for execution
       let pendingSells = await prisma.detectedTrade.findMany({
         where: {
           ...baseWhere,
           side: 'SELL',
           proxyWallet: { in: allActiveWallets },
+          detectionSource: { notIn: ['RAPID_POLL', 'POLL'] },
         },
         orderBy: { detectedAt: 'asc' },
       });
@@ -1281,8 +1283,8 @@ async function main() {
         ...baseWhere,
         side: 'BUY' as const,
         ...(config.SKIP_CHAIN_MAKER_FILLS
-          ? { detectionSource: { notIn: ['CHAIN_MAKER'] } }
-          : {}),
+          ? { detectionSource: { notIn: ['CHAIN_MAKER', 'RAPID_POLL', 'POLL'] } }
+          : { detectionSource: { notIn: ['RAPID_POLL', 'POLL'] } }),
       };
       const pendingBuys = await prisma.detectedTrade.findMany({
         where: { ...buyWhere, proxyWallet: { in: buyEligibleWallets } },
