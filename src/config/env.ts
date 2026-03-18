@@ -72,6 +72,9 @@ const envSchema = z.object({
   FUNDER_ADDRESS: z.string().optional(),
   SIGNATURE_TYPE: z.coerce.number().default(2), // 0=EOA, 1=POLY_PROXY, 2=GNOSIS_SAFE
 
+  // IPC bridge for Rust copier
+  IPC_SOCKET_PATH: z.string().default('/tmp/polymarket-copier.sock'),
+
   // Copy-trade risk controls
   COPY_TRADE_ENABLED: z
     .string()

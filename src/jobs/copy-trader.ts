@@ -1114,6 +1114,15 @@ async function main() {
     }
   }
 
+  // Start IPC bridge for Rust copier (must be before portfolio cache so Rust can connect early)
+  try {
+    const { startBridge } = await import('../services/unix-socket-bridge.js');
+    startBridge();
+    log.info('IPC bridge started for Rust copier');
+  } catch (err: any) {
+    log.warn(`IPC bridge start failed (non-fatal): ${err.message}`);
+  }
+
   // Start portfolio value cache
   try {
     await startPortfolioRefresh();
@@ -1649,6 +1658,8 @@ async function main() {
       });
     }
     closeMidpointCache();
+    // Close IPC bridge (if started)
+    try { const { closeBridge } = await import('../services/unix-socket-bridge.js'); closeBridge(); } catch {}
     await prisma.$disconnect();
     process.exit(0);
   };

@@ -63,9 +63,17 @@ fn dispatch(msg: InboundMessage, state: &SharedState) {
             settlement_prices,
         } => {
             state.markets.mark_closed(&condition_id);
+            // If Node.js didn't send token_ids, look them up from our MarketCache
+            let effective_token_ids: Vec<String> = if token_ids.is_empty() {
+                state.markets.get(&condition_id)
+                    .map(|m| m.tokens.clone())
+                    .unwrap_or_default()
+            } else {
+                token_ids
+            };
             // Release capital + clear positions for ALL active allocations
             for alloc in state.allocations.get_all_active() {
-                for (i, token_id) in token_ids.iter().enumerate() {
+                for (i, token_id) in effective_token_ids.iter().enumerate() {
                     let pos =
                         state
                             .positions
@@ -82,14 +90,14 @@ fn dispatch(msg: InboundMessage, state: &SharedState) {
                     }
                 }
                 state.positions.clear_for_condition(
-                    &token_ids,
+                    &effective_token_ids,
                     &alloc.id,
                     alloc.is_paper,
                 );
             }
             tracing::info!(
                 condition = %&condition_id[..16.min(condition_id.len())],
-                tokens = token_ids.len(),
+                tokens = effective_token_ids.len(),
                 "market settled via IPC"
             );
         }

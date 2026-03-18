@@ -463,6 +463,31 @@ async function doSweepPositionSettlements(): Promise<void> {
   });
   await markConditionsClaimed(claimedConditionIds);
 
+  // Notify Rust copier about settled markets (fire-and-forget)
+  // Send market_closed for each resolved conditionId — Rust handles capital release internally
+  // via its own position tracker + capital tracker (seeded from DB at startup).
+  if (settledCount > 0) {
+    try {
+      const { sendToRust } = await import('./unix-socket-bridge.js');
+      for (const conditionId of resolvedMarkets.keys()) {
+        // Parse outcome prices for this market
+        const marketData = resolvedMarkets.get(conditionId)!;
+        let prices: number[] = [];
+        try { prices = JSON.parse(marketData.outcomePrices).map(Number); } catch {}
+        // Rust's MarketCache knows token_ids for each conditionId. Send prices in outcome order.
+        // Rust receiver matches settlement_prices[i] to its cached token_ids[i].
+        sendToRust({
+          type: 'market_settled',
+          condition_id: conditionId,
+          token_ids: [], // Rust resolves from its MarketCache
+          settlement_prices: prices,
+        });
+      }
+    } catch {
+      // IPC bridge may not be running — non-fatal
+    }
+  }
+
   log.info('Settlement sweep complete', {
     marketsChecked: uniqueConditionIds.length,
     marketsResolved: resolvedMarkets.size,
