@@ -26,6 +26,6 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 
 COPY --from=builder /app/target/release/polymarket-copier /usr/local/bin/
 
-USER nobody:nobody
+USER nobody
 
 ENTRYPOINT ["polymarket-copier"]
