@@ -96,6 +96,7 @@ export class ChainTradeWatcher {
   private lastVerifyBlock: number | null = null;
   private backfillRecovered = 0;
   private backfillInProgress = false;
+  private lastBackfillRecoveryAt = 0;  // epoch ms when backfill last recovered wallet-matched events WSS missed
   private connectedAt = 0;
   reconnectCount = 0;
   staleDisconnectCount = 0;
@@ -171,6 +172,7 @@ export class ChainTradeWatcher {
       this.lastWssEventAt = null;  // Reset: don't carry stale timestamp from previous connection
       this.connectedAt = Date.now();
       this.lastPreemptiveBackfillAt = 0;
+      this.lastBackfillRecoveryAt = 0;
       this.log.info('Connected, subscribing to CTF Exchange OrderFilled events');
 
       this.subscribe(ws);
@@ -648,6 +650,7 @@ export class ChainTradeWatcher {
 
       if (recovered > 0) {
         this.backfillRecovered += recovered;
+        this.lastBackfillRecoveryAt = Date.now();
         this.log.info('Backfill recovered missed events', {
           fromBlock,
           logsScanned: allLogs.length,
@@ -783,28 +786,33 @@ export class ChainTradeWatcher {
       // ─── Event delivery staleness: connection alive but no events flowing ───
       // Catches providers that respond to pings but silently stop delivering
       // eth_subscription events (observed with publicnode after ~18min).
-      // Uses lastWssEventAt (not lastEventAt) to avoid being fooled by periodic
-      // verification's HTTP backfill which also calls processLogEvent().
+      // Uses lastWssEventAt (not lastEventAt — which fires for ALL exchange events
+      // before wallet matching). Additionally gated on lastBackfillRecoveryAt:
+      // only reconnect if backfill has recently recovered wallet-matched events
+      // that WSS missed. If backfill finds nothing, the market is just quiet.
       if (this.confirmedSubIds.size > 0 && this.connectedAt > 0) {
         const wssEventAge = this.lastWssEventAt
           ? now - this.lastWssEventAt.getTime()
-          : now - this.connectedAt;  // Never received any WSS event: use connection uptime
+          : now - this.connectedAt;
         if (wssEventAge > config.CHAIN_EVENT_STALE_MS) {
-          this.staleDisconnectCount++;
-          this.eventStaleReconnectCount++;
-          const neverReceived = !this.lastWssEventAt;
-          this.log.warn('Event delivery stale, forcing reconnect', {
-            wssEventAgeMs: wssEventAge,
-            eventStaleThresholdMs: config.CHAIN_EVENT_STALE_MS,
-            neverReceivedWssEvents: neverReceived,
-            lastWssEventAt: this.lastWssEventAt?.toISOString() ?? 'never',
-            lastEventAt: this.lastEventAt?.toISOString() ?? 'never',
-            eventsReceived: this.eventsReceived,
-            confirmedSubs: this.confirmedSubIds.size,
-          });
-          this.isStaleDisconnect = true;
-          ws.terminate();
-          return;
+          const recentRecovery = this.lastBackfillRecoveryAt > 0
+            && (now - this.lastBackfillRecoveryAt) < config.CHAIN_EVENT_STALE_MS;
+          if (recentRecovery) {
+            this.staleDisconnectCount++;
+            this.eventStaleReconnectCount++;
+            this.log.warn('Event delivery stale (backfill recovering events WSS missed), forcing reconnect', {
+              wssEventAgeMs: wssEventAge,
+              eventStaleThresholdMs: config.CHAIN_EVENT_STALE_MS,
+              neverReceivedWssEvents: !this.lastWssEventAt,
+              lastWssEventAt: this.lastWssEventAt?.toISOString() ?? 'never',
+              lastBackfillRecoveryAt: new Date(this.lastBackfillRecoveryAt).toISOString(),
+              eventsReceived: this.eventsReceived,
+              confirmedSubs: this.confirmedSubIds.size,
+            });
+            this.isStaleDisconnect = true;
+            ws.terminate();
+            return;
+          }
         }
       }
 
@@ -876,6 +884,8 @@ export class ChainTradeWatcher {
           eventStaleReconnects: this.eventStaleReconnectCount,
           lastWssEventAt: this.lastWssEventAt?.toISOString() ?? 'never',
           pongSupported: this.pongEverReceived,
+          lastBackfillRecoveryAt: this.lastBackfillRecoveryAt
+            ? new Date(this.lastBackfillRecoveryAt).toISOString() : 'never',
           phantomOverrides: this.phantomOverrideCount,
           phantomOverrideAvgMs: this.phantomOverrideCount > 0
             ? Math.round(this.phantomOverrideTotalMs / this.phantomOverrideCount) : 0,
