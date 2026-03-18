@@ -8,3 +8,4 @@ logs/
 .claude/
 prisma/generated/
 src/scripts/backtest-cache/
+copier/target/

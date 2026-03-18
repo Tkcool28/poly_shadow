@@ -96,3 +96,41 @@ jobs:
           echo "**Tags:** \`${{ steps.meta.outputs.tags }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Digest:** \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
           echo "**Built at:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+
+  # ─── Rust Copier Image ─────────────────────────────────────────────────────
+  # Built on self-hosted ARM64 runner (native build, no QEMU emulation).
+  # Separate image: polymarket-copier (not polymarket-copy-trade).
+  build-copier:
+    name: Build & Push Copier Image
+    runs-on: [self-hosted, polymarket-copytrade]
+    needs: quality
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    env:
+      COPIER_IMAGE: ghcr.io/${{ github.repository_owner }}/polymarket-copier
+      SHA_TAG: sha-${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute short SHA tag
+        id: tag
+        run: echo "short=sha-$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
+
+      # Note: self-hosted runner must have GHCR push access. Verify on first deploy.
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Build copier image
+        run: docker build -t "$COPIER_IMAGE:latest" -t "$COPIER_IMAGE:${{ steps.tag.outputs.short }}" ./copier
+
+      - name: Push copier image
+        run: |
+          docker push "$COPIER_IMAGE:latest"
+          docker push "$COPIER_IMAGE:${{ steps.tag.outputs.short }}"
+
+      - name: Copier build summary
+        run: |
+          echo "# Copier Image Built" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`$COPIER_IMAGE\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:** \`latest\`, \`${{ steps.tag.outputs.short }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Built at:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY

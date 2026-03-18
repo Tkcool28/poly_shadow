@@ -155,6 +155,14 @@ jobs:
           echo "Pulling image: $IMAGE"
           docker pull "$IMAGE"
           echo "Image pulled successfully"
+          # Pull copier image if copier profile is enabled
+          PROFILES="${{ inputs.profiles }}"
+          if echo "$PROFILES" | grep -q "copier"; then
+            COPIER_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_OWNER }}/polymarket-copier:${{ inputs.image_tag }}"
+            echo "Pulling copier image: $COPIER_IMAGE"
+            docker pull "$COPIER_IMAGE"
+            echo "Copier image pulled successfully"
+          fi
 
       - name: Build profile flags
         id: profiles
@@ -254,7 +262,7 @@ jobs:
             docker compose -f docker-compose.ghcr.yml stop --timeout 45 "$worker" 2>/dev/null || true
             docker compose -f docker-compose.ghcr.yml rm -f "$worker" 2>/dev/null || true
           done
-          for worker in arb-worker scalp-worker; do
+          for worker in arb-worker scalp-worker copier; do
             docker compose -f docker-compose.ghcr.yml ${{ steps.profiles.outputs.flags }} stop --timeout 45 "$worker" 2>/dev/null || true
             docker compose -f docker-compose.ghcr.yml ${{ steps.profiles.outputs.flags }} rm -f "$worker" 2>/dev/null || true
           done
@@ -275,6 +283,9 @@ jobs:
           fi
           if echo "$PROFILES" | grep -q "scalp"; then
             docker compose -f docker-compose.ghcr.yml --profile scalp up -d scalp-worker
+          fi
+          if echo "$PROFILES" | grep -q "copier"; then
+            docker compose -f docker-compose.ghcr.yml --profile copier up -d copier
           fi
           echo "Workers started"
 
@@ -317,8 +328,15 @@ jobs:
               echo "OK - $worker running"
             fi
           done
+          # Check optional profile workers
+          PROFILES="${{ inputs.profiles }}"
+          for worker in arb-worker scalp-worker copier; do
+            if docker compose -f docker-compose.ghcr.yml ${{ steps.profiles.outputs.flags }} ps "$worker" 2>/dev/null | grep -q "Up"; then
+              echo "OK - $worker running"
+            fi
+          done
           echo ""
-          docker compose -f docker-compose.ghcr.yml ps
+          docker compose -f docker-compose.ghcr.yml ${{ steps.profiles.outputs.flags }} ps
           echo ""
           echo "Deployment verification complete"
 
