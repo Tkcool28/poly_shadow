@@ -36,7 +36,7 @@ pub async fn connect_and_seed(
     // Read seed response with timeout
     let mut buf_reader = BufReader::new(&mut stream);
     let mut line = String::new();
-    let seed_timeout = Duration::from_secs(10);
+    let seed_timeout = Duration::from_secs(30); // 57K+ majority rows takes ~10s on production DB
     match tokio::time::timeout(seed_timeout, buf_reader.read_line(&mut line)).await {
         Ok(Ok(n)) if n > 0 => {
             let msg: InboundMessage = serde_json::from_str(line.trim())
