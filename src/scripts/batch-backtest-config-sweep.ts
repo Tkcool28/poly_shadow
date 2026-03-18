@@ -508,38 +508,29 @@ async function main() {
     for (const t of buyTrades) { const c = categorize(t.eventSlug); cats.set(c, (cats.get(c) ?? 0) + 1); }
     const catStr = [...cats.entries()].sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c}:${n}`).join(', ');
 
-    // Compute actual trader PnL from resolved trades (not stale leaderboardPnl)
-    const cidOutcomes = new Map<string, Map<string, number>>();
-    const cidOutcomeSample = new Map<string, TradeRow>();
-    for (const t of buyTrades) {
-      if (!cidOutcomes.has(t.conditionId)) cidOutcomes.set(t.conditionId, new Map());
-      const m = cidOutcomes.get(t.conditionId)!;
-      m.set(t.outcome, (m.get(t.outcome) ?? 0) + t.size * t.price);
-      const key = `${t.conditionId}:${t.outcome}`;
-      if (!cidOutcomeSample.has(key)) cidOutcomeSample.set(key, t);
-    }
-    const resolutionCache = new Map<string, boolean>();
-    for (const [cid, outcomes] of cidOutcomes) {
-      for (const [outcome] of outcomes) {
-        const sample = cidOutcomeSample.get(`${cid}:${outcome}`);
-        if (!sample) continue;
-        const oi = resolveOutcomeIndex(sample);
-        if (oi == null) continue;
-        try {
-          const prices: string[] = JSON.parse(sample.outcomePrices);
-          resolutionCache.set(`${cid}:${outcome}`, parseFloat(prices[oi] ?? '0') >= 0.95);
-        } catch {}
-      }
-    }
-    let actualTraderPnl = 0;
-    for (const t of buyTrades) {
-      const won = resolutionCache.get(`${t.conditionId}:${t.outcome}`);
-      if (won === undefined) continue;
-      const spent = t.size * t.price;
-      actualTraderPnl += won ? (t.size - spent) : -spent;
-    }
-    const actualTraderRoi = traderBought > 0 ? actualTraderPnl / traderBought * 100 : 0;
+    // Official Polymarket P&L from ClosedPosition + Position
+    const closedPnlResult = await db.query(`
+      SELECT COALESCE(SUM("realizedPnl"), 0) as realized_pnl,
+             COALESCE(SUM("totalBought"), 0) as total_bought,
+             COUNT(*) as num_positions
+      FROM "ClosedPosition" WHERE "proxyWallet" = $1
+    `, [wallet]);
+    const openPnlResult = await db.query(`
+      SELECT COALESCE(SUM("cashPnl"), 0) as unrealized_pnl,
+             COALESCE(SUM("initialValue"), 0) as open_capital
+      FROM "Position" WHERE "proxyWallet" = $1
+    `, [wallet]);
+    const cd = closedPnlResult.rows[0];
+    const od = openPnlResult.rows[0];
+    const realizedPnl = parseFloat(cd?.realized_pnl ?? '0');
+    const unrealizedPnl = parseFloat(od?.unrealized_pnl ?? '0');
+    const totalTraderCapital = parseFloat(cd?.total_bought ?? '0') + parseFloat(od?.open_capital ?? '0');
+    const actualTraderPnl = realizedPnl + unrealizedPnl;
+    const actualTraderRoi = totalTraderCapital > 0 ? actualTraderPnl / totalTraderCapital * 100 : 0;
     const actPnlStr = (actualTraderPnl >= 0 ? '+$' : '-$') + Math.abs(actualTraderPnl).toFixed(0);
+    if (parseInt(cd?.num_positions ?? '0') >= 10000) {
+      console.log(`WARNING: ${userName} hit 10K ClosedPosition cap — realized PnL may be incomplete`);
+    }
 
     console.log(`${'='.repeat(140)}`);
     console.log(`${userName} (${wallet.slice(0, 14)}...) — ${trades.length} trades (${buyTrades.length} buys, ${trades.length - buyTrades.length} sells) | ${catStr}`);

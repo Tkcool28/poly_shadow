@@ -526,6 +526,43 @@ async function main() {
 
   console.log(`Found ${traders.rows.length} traders with >= ${MIN_POSITIONS} trades`);
 
+  // Batch fetch official Polymarket P&L from ClosedPosition + Position tables
+  const wallets = traders.rows.map((r: any) => r.proxyWallet);
+  console.log('Fetching official Polymarket P&L from ClosedPosition + Position tables...');
+
+  const closedPnlResult = await db.query(`
+    SELECT "proxyWallet",
+           COALESCE(SUM("realizedPnl"), 0) as realized_pnl,
+           COALESCE(SUM("totalBought"), 0) as total_bought,
+           COUNT(*) as num_positions,
+           COUNT(CASE WHEN "realizedPnl" > 0 THEN 1 END) as wins
+    FROM "ClosedPosition"
+    WHERE "proxyWallet" = ANY($1::text[])
+    GROUP BY "proxyWallet"
+  `, [wallets]);
+
+  const openPnlResult = await db.query(`
+    SELECT "proxyWallet",
+           COALESCE(SUM("cashPnl"), 0) as unrealized_pnl,
+           COALESCE(SUM("initialValue"), 0) as open_capital
+    FROM "Position"
+    WHERE "proxyWallet" = ANY($1::text[])
+    GROUP BY "proxyWallet"
+  `, [wallets]);
+
+  const closedPnlMap = new Map<string, any>(
+    closedPnlResult.rows.map((r: any) => [r.proxyWallet, r])
+  );
+  const openPnlMap = new Map<string, any>(
+    openPnlResult.rows.map((r: any) => [r.proxyWallet, r])
+  );
+
+  const cappedTraders = closedPnlResult.rows.filter((r: any) => parseInt(r.num_positions) >= 10000);
+  if (cappedTraders.length > 0) {
+    console.log(`WARNING: ${cappedTraders.length} traders hit 10K ClosedPosition cap — realized PnL may be incomplete`);
+  }
+  console.log(`Loaded P&L for ${closedPnlResult.rows.length} traders (closed) + ${openPnlResult.rows.length} (open positions)`);
+
   const results: TraderResult[] = [];
   let processed = 0;
 
@@ -560,51 +597,20 @@ async function main() {
     const buyTrades = trades.filter(t => t.side === 'BUY');
     const traderBought = buyTrades.reduce((s, t) => s + t.size * t.price, 0);
 
-    const cidOutcomes = new Map<string, Map<string, number>>();
-    const cidOutcomeSample = new Map<string, TradeRow>();
-    for (const t of buyTrades) {
-      if (!cidOutcomes.has(t.conditionId)) cidOutcomes.set(t.conditionId, new Map());
-      const m = cidOutcomes.get(t.conditionId)!;
-      m.set(t.outcome, (m.get(t.outcome) ?? 0) + t.size * t.price);
-      const key = `${t.conditionId}:${t.outcome}`;
-      if (!cidOutcomeSample.has(key)) cidOutcomeSample.set(key, t);
-    }
-    // Build resolution cache: conditionId:outcome → won? (one JSON.parse per unique pair)
-    const resolutionCache = new Map<string, boolean>();
-    for (const [cid, outcomes] of cidOutcomes) {
-      for (const [outcome] of outcomes) {
-        const sample = cidOutcomeSample.get(`${cid}:${outcome}`);
-        if (!sample) continue;
-        const oi = resolveOutcomeIndex(sample);
-        if (oi == null) continue;
-        try {
-          const prices: string[] = JSON.parse(sample.outcomePrices);
-          resolutionCache.set(`${cid}:${outcome}`, parseFloat(prices[oi] ?? '0') >= 0.95);
-        } catch {}
-      }
-    }
+    // Official Polymarket P&L from ClosedPosition + Position (batch-fetched above)
+    const closedData = closedPnlMap.get(trader.proxyWallet);
+    const openData = openPnlMap.get(trader.proxyWallet);
+    const realizedPnl = parseFloat(closedData?.realized_pnl ?? '0');
+    const unrealizedPnl = parseFloat(openData?.unrealized_pnl ?? '0');
+    const totalTraderCapital = parseFloat(closedData?.total_bought ?? '0')
+                             + parseFloat(openData?.open_capital ?? '0');
+    const actualTraderPnl = realizedPnl + unrealizedPnl;
+    const actualTraderRoi = totalTraderCapital > 0
+      ? actualTraderPnl / totalTraderCapital * 100 : 0;
+    const numPositions = parseInt(closedData?.num_positions ?? '0');
+    const traderWins = parseInt(closedData?.wins ?? '0');
+    const traderWr = numPositions > 0 ? traderWins / numPositions * 100 : 0;
 
-    // Compute actual trader PnL from resolved trades (not stale leaderboardPnl)
-    let actualTraderPnl = 0;
-    for (const t of buyTrades) {
-      const won = resolutionCache.get(`${t.conditionId}:${t.outcome}`);
-      if (won === undefined) continue;
-      const spent = t.size * t.price;
-      actualTraderPnl += won ? (t.size - spent) : -spent;
-    }
-
-    // Per-prediction WR (majority outcome per conditionId)
-    let traderWinPredictions = 0, traderTotalPredictions = 0;
-    for (const [cid, outcomes] of cidOutcomes) {
-      let maxVol = 0, majOutcome = '';
-      for (const [oc, vol] of outcomes) { if (vol > maxVol) { maxVol = vol; majOutcome = oc; } }
-      const won = resolutionCache.get(`${cid}:${majOutcome}`);
-      if (won === undefined) continue;
-      traderTotalPredictions++;
-      if (won) traderWinPredictions++;
-    }
-
-    const actualTraderRoi = traderBought > 0 ? actualTraderPnl / traderBought * 100 : 0;
     const sim = simulateCopy(trades);
 
     results.push({
@@ -614,7 +620,7 @@ async function main() {
       traderPnl: actualTraderPnl,
       traderBought,
       traderRoi: actualTraderRoi,
-      traderWr: traderTotalPredictions > 0 ? traderWinPredictions / traderTotalPredictions * 100 : 0,
+      traderWr,
       ...sim,
     });
 
@@ -640,7 +646,7 @@ async function main() {
   const lockupLabel = USE_CAPITAL_LOCKUP ? 'lockup ON' : 'lockup OFF';
   const slippageLabel = empiricalSlippage ? 'empirical slippage' : 'category slippage';
   console.log(`\n${'='.repeat(200)}`);
-  console.log(`BATCH BACKTEST (Trade-level) — ${results.length} traders | ${lockupLabel} | ${slippageLabel} | FAK=${(fakFailureRate*100).toFixed(0)}%+${BUY_FAILURE_COOLDOWN_SEC}s cd | Copy: 10%, $8/trade, $30/pred, $450 cap, minBuy=$${MIN_BUY_PRICE} gate=$${MAJORITY_GATE} | minTraderROI=${MIN_TRADER_ROI}% minCpBuys=${MIN_COPY_BUYS} | slugExclude=[${EXCLUDE_SLUGS.join(',')}]`);
+  console.log(`BATCH BACKTEST (Trade-level) — ${results.length} traders | ${lockupLabel} | ${slippageLabel} | FAK=${(fakFailureRate*100).toFixed(0)}%+${BUY_FAILURE_COOLDOWN_SEC}s cd | Copy: 10%, $8/trade, $30/pred, $450 cap, minBuy=$${MIN_BUY_PRICE} gate=$${MAJORITY_GATE} | minTraderROI=${MIN_TRADER_ROI}% minCpBuys=${MIN_COPY_BUYS} | PnL=ClosedPosition+Position | slugExclude=[${EXCLUDE_SLUGS.join(',')}]`);
   console.log(`${'='.repeat(200)}\n`);
 
   const header =
