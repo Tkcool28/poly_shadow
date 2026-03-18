@@ -21,6 +21,7 @@
 
 import { Client } from 'pg';
 import { parseArgs } from 'util';
+import { writeFileSync } from 'fs';
 
 const { values: args } = parseArgs({
   options: {
@@ -31,6 +32,9 @@ const { values: args } = parseArgs({
     'exclude-slugs': { type: 'string', default: 'updown-5m,updown-15m' },
     'no-empirical-slippage': { type: 'boolean', default: false },
     'no-capital-lockup': { type: 'boolean', default: false },
+    'min-trader-roi': { type: 'string', default: '0' },
+    'min-copy-buys': { type: 'string', default: '10' },
+    output: { type: 'string', default: '' },
   },
 });
 
@@ -41,6 +45,9 @@ const MIN_BUY_PRICE = parseFloat(args['min-buy-price'] ?? '0.60');
 const EXCLUDE_SLUGS = (args['exclude-slugs'] ?? '').split(',').map(s => s.trim()).filter(Boolean);
 const USE_EMPIRICAL_SLIPPAGE = !args['no-empirical-slippage'];
 const USE_CAPITAL_LOCKUP = !args['no-capital-lockup'];
+const MIN_TRADER_ROI = parseFloat(args['min-trader-roi'] ?? '0');
+const MIN_COPY_BUYS = parseInt(args['min-copy-buys'] ?? '10', 10);
+const OUTPUT_FILE = args.output ?? '';
 
 // Copy-trade simulation constants
 const COPY_PERCENT = 0.10;
@@ -49,7 +56,6 @@ const MAX_PRED_USD = 30;
 const STARTING_CAPITAL = 450;
 const FEE_RATE = 0.25;
 const FEE_EXPONENT = 2;
-const MAX_DAILY_USD = 200;
 const FALLBACK_FAK_FAILURE_RATE = 0.12;
 const BUY_FAILURE_COOLDOWN_SEC = 15;
 const FALLBACK_LOCKUP_SEC = 7 * 24 * 60 * 60; // 7 days for markets missing endDate
@@ -181,7 +187,6 @@ function simulateCopy(trades: TradeRow[]): Omit<TraderResult, 'wallet' | 'name' 
   const committedSides = new Map<string, string>();
   const dailyPnl = new Map<string, number>();
   const dailyDeployed = new Map<string, number>();
-  const dailySpend = new Map<string, number>();
   const catCounts = new Map<string, number>();
 
   let sellCount = 0, totalBuyCount = 0;
@@ -271,12 +276,9 @@ function simulateCopy(trades: TradeRow[]): Omit<TraderResult, 'wallet' | 'name' 
     const committed = committedSides.get(trade.conditionId);
     if (committed && committed !== trade.outcome) continue;
 
-    // Guard 4: Daily spend limit
     const day = new Date(trade.timestamp * 1000).toISOString().slice(0, 10);
-    const daySpent = dailySpend.get(day) ?? 0;
-    if (daySpent >= MAX_DAILY_USD) continue;
 
-    // Guard 5: Available capital
+    // Guard 4: Available capital
     let available: number;
     if (USE_CAPITAL_LOCKUP) {
       releaseMatured(trade.timestamp);
@@ -294,8 +296,6 @@ function simulateCopy(trades: TradeRow[]): Omit<TraderResult, 'wallet' | 'name' 
     if (predRemaining < 1) continue;
     if (copyAmount > predRemaining) copyAmount = predRemaining;
     if (copyAmount > available) copyAmount = available;
-    const dailyRemaining = MAX_DAILY_USD - daySpent;
-    if (copyAmount > dailyRemaining) copyAmount = dailyRemaining;
     if (copyAmount < 1.0) continue;
 
     // Fix 4: FAK failure with cooldown
@@ -325,7 +325,6 @@ function simulateCopy(trades: TradeRow[]): Omit<TraderResult, 'wallet' | 'name' 
     // Track results
     predDeployed.set(trade.conditionId, predUsed + copyAmount);
     if (!committed) committedSides.set(trade.conditionId, trade.outcome);
-    dailySpend.set(day, daySpent + copyAmount);
     buyCount++;
 
     if (USE_CAPITAL_LOCKUP) {
@@ -426,8 +425,10 @@ function simulateCopy(trades: TradeRow[]): Omit<TraderResult, 'wallet' | 'name' 
     ? Math.max(1, Math.round((new Date(allDays[allDays.length - 1]).getTime() - new Date(allDays[0]).getTime()) / (24 * 60 * 60 * 1000)) + 1)
     : 0;
 
+  // Logarithmic sample-size penalty: reaches 1.0 at ~50 copied buys
+  const samplePenalty = Math.min(1, Math.log(1 + buyCount) / Math.log(1 + 50));
   const score = copyPnl > 0
-    ? copyRoi * (1 - scalpPct / 100) * Math.min(buyCount / 20, 1) * (1 / (1 + copyMaxDdPct / 20))
+    ? copyRoi * (1 - scalpPct / 100) * samplePenalty * (1 / (1 + copyMaxDdPct / 20))
     : -1;
 
   return {
@@ -512,12 +513,12 @@ async function main() {
 
   // Get all completed traders
   const traders = await db.query(`
-    SELECT t."proxyWallet", tr."userName", tr."leaderboardPnl",
+    SELECT t."proxyWallet", tr."userName",
            COUNT(*) as trade_count
     FROM "Trade" t
     JOIN "Trader" tr ON tr."proxyWallet" = t."proxyWallet"
     WHERE tr."backfillStatus" = 'COMPLETED'
-    GROUP BY t."proxyWallet", tr."userName", tr."leaderboardPnl"
+    GROUP BY t."proxyWallet", tr."userName"
     HAVING COUNT(*) >= $1
     ORDER BY COUNT(*) DESC
     LIMIT $2
@@ -568,32 +569,51 @@ async function main() {
       const key = `${t.conditionId}:${t.outcome}`;
       if (!cidOutcomeSample.has(key)) cidOutcomeSample.set(key, t);
     }
+    // Build resolution cache: conditionId:outcome → won? (one JSON.parse per unique pair)
+    const resolutionCache = new Map<string, boolean>();
+    for (const [cid, outcomes] of cidOutcomes) {
+      for (const [outcome] of outcomes) {
+        const sample = cidOutcomeSample.get(`${cid}:${outcome}`);
+        if (!sample) continue;
+        const oi = resolveOutcomeIndex(sample);
+        if (oi == null) continue;
+        try {
+          const prices: string[] = JSON.parse(sample.outcomePrices);
+          resolutionCache.set(`${cid}:${outcome}`, parseFloat(prices[oi] ?? '0') >= 0.95);
+        } catch {}
+      }
+    }
+
+    // Compute actual trader PnL from resolved trades (not stale leaderboardPnl)
+    let actualTraderPnl = 0;
+    for (const t of buyTrades) {
+      const won = resolutionCache.get(`${t.conditionId}:${t.outcome}`);
+      if (won === undefined) continue;
+      const spent = t.size * t.price;
+      actualTraderPnl += won ? (t.size - spent) : -spent;
+    }
+
+    // Per-prediction WR (majority outcome per conditionId)
     let traderWinPredictions = 0, traderTotalPredictions = 0;
     for (const [cid, outcomes] of cidOutcomes) {
       let maxVol = 0, majOutcome = '';
       for (const [oc, vol] of outcomes) { if (vol > maxVol) { maxVol = vol; majOutcome = oc; } }
-      const sample = cidOutcomeSample.get(`${cid}:${majOutcome}`);
-      if (!sample) continue;
-      const oi = resolveOutcomeIndex(sample);
-      if (oi == null) continue;
-      try {
-        const prices: string[] = JSON.parse(sample.outcomePrices);
-        const won = parseFloat(prices[oi] ?? '0') >= 0.95;
-        traderTotalPredictions++;
-        if (won) traderWinPredictions++;
-      } catch {}
+      const won = resolutionCache.get(`${cid}:${majOutcome}`);
+      if (won === undefined) continue;
+      traderTotalPredictions++;
+      if (won) traderWinPredictions++;
     }
 
-    const traderPnl = parseFloat(trader.leaderboardPnl) || 0;
+    const actualTraderRoi = traderBought > 0 ? actualTraderPnl / traderBought * 100 : 0;
     const sim = simulateCopy(trades);
 
     results.push({
       wallet: trader.proxyWallet,
       name: (trader.userName || trader.proxyWallet.slice(0, 10)).slice(0, 20),
       trades: trades.length,
-      traderPnl,
+      traderPnl: actualTraderPnl,
       traderBought,
-      traderRoi: traderBought > 0 ? traderPnl / traderBought * 100 : 0,
+      traderRoi: actualTraderRoi,
       traderWr: traderTotalPredictions > 0 ? traderWinPredictions / traderTotalPredictions * 100 : 0,
       ...sim,
     });
@@ -604,7 +624,12 @@ async function main() {
 
   await db.end();
 
-  const profitable = results.filter(r => r.copyPnl > 0);
+  const allCopyPositive = results.filter(r => r.copyPnl > 0);
+  const filteredOutByTraderRoi = allCopyPositive.filter(r => r.traderRoi < MIN_TRADER_ROI);
+  const filteredOutByMinBuys = allCopyPositive.filter(r => r.traderRoi >= MIN_TRADER_ROI && r.copyBuys < MIN_COPY_BUYS);
+  const profitable = allCopyPositive
+    .filter(r => r.traderRoi >= MIN_TRADER_ROI)
+    .filter(r => r.copyBuys >= MIN_COPY_BUYS);
   const unprofitable = results.filter(r => r.copyPnl <= 0);
   profitable.sort((a, b) => b.score - a.score);
   unprofitable.sort((a, b) => b.copyPnl - a.copyPnl);
@@ -615,11 +640,11 @@ async function main() {
   const lockupLabel = USE_CAPITAL_LOCKUP ? 'lockup ON' : 'lockup OFF';
   const slippageLabel = empiricalSlippage ? 'empirical slippage' : 'category slippage';
   console.log(`\n${'='.repeat(200)}`);
-  console.log(`BATCH BACKTEST (Trade-level) — ${results.length} traders | ${lockupLabel} | ${slippageLabel} | FAK=${(fakFailureRate*100).toFixed(0)}%+${BUY_FAILURE_COOLDOWN_SEC}s cd | Copy: 10%, $8/trade, $30/pred, $450 cap, minBuy=$${MIN_BUY_PRICE} gate=$${MAJORITY_GATE} | slugExclude=[${EXCLUDE_SLUGS.join(',')}]`);
+  console.log(`BATCH BACKTEST (Trade-level) — ${results.length} traders | ${lockupLabel} | ${slippageLabel} | FAK=${(fakFailureRate*100).toFixed(0)}%+${BUY_FAILURE_COOLDOWN_SEC}s cd | Copy: 10%, $8/trade, $30/pred, $450 cap, minBuy=$${MIN_BUY_PRICE} gate=$${MAJORITY_GATE} | minTraderROI=${MIN_TRADER_ROI}% minCpBuys=${MIN_COPY_BUYS} | slugExclude=[${EXCLUDE_SLUGS.join(',')}]`);
   console.log(`${'='.repeat(200)}\n`);
 
   const header =
-    `${pad('Rank', 5)}${pad('Trader', 22)}${rpad('Trd', 6)}${rpad('TrROI%', 7)}${rpad('TrWR%', 7)}` +
+    `${pad('Rank', 5)}${pad('Trader', 22)}${rpad('Trd', 6)}${rpad('TrROI%', 7)}${rpad('TrWR%', 7)}${rpad('ActPnL$', 11)}` +
     `${rpad('CpPnL$', 9)}${rpad('CpROI%', 8)}${rpad('HldWR%', 7)}${rpad('CpBuys', 7)}` +
     `${rpad('MaxDD%', 8)}${rpad('Sharpe', 8)}${rpad('DayWR%', 8)}` +
     `${rpad('Scalp%', 7)}${rpad('Score', 8)}` +
@@ -631,9 +656,10 @@ async function main() {
 
   for (let i = 0; i < Math.min(profitable.length, 50); i++) {
     const r = profitable[i];
+    const actPnlStr = (r.traderPnl >= 0 ? '+$' : '-$') + Math.abs(r.traderPnl).toFixed(0);
     console.log(
       `${pad(String(i + 1), 5)}${pad(r.name, 22)}` +
-      `${rpad(String(r.trades), 6)}${rpad(r.traderRoi.toFixed(1), 7)}${rpad(r.traderWr.toFixed(1), 7)}` +
+      `${rpad(String(r.trades), 6)}${rpad(r.traderRoi.toFixed(1), 7)}${rpad(r.traderWr.toFixed(1), 7)}${rpad(actPnlStr, 11)}` +
       `${rpad('$' + r.copyPnl.toFixed(0), 9)}${rpad(r.copyRoi.toFixed(1), 8)}${rpad(r.holdWr.toFixed(1), 7)}${rpad(String(r.copyBuys), 7)}` +
       `${rpad(r.copyMaxDdPct.toFixed(1), 8)}${rpad(r.copySharpe.toFixed(2), 8)}${rpad(r.dayWr.toFixed(0), 8)}` +
       `${rpad(r.scalpPct.toFixed(0), 7)}${rpad(r.score.toFixed(2), 8)}` +
@@ -647,12 +673,38 @@ async function main() {
   console.log(`SUMMARY`);
   console.log(`${'='.repeat(80)}`);
   console.log(`Total traders tested: ${results.length}`);
-  console.log(`Profitable (copy PnL > 0): ${profitable.length} (${(profitable.length / results.length * 100).toFixed(1)}%)`);
+  console.log(`Profitable (copyPnL>0, traderROI>=${MIN_TRADER_ROI}%, copyBuys>=${MIN_COPY_BUYS}): ${profitable.length} (${(profitable.length / results.length * 100).toFixed(1)}%)`);
+  if (filteredOutByTraderRoi.length > 0) {
+    console.log(`Filtered out (copyPnL>0 but traderROI<${MIN_TRADER_ROI}%): ${filteredOutByTraderRoi.length} traders`);
+  }
+  if (filteredOutByMinBuys.length > 0) {
+    console.log(`Filtered out (copyPnL>0 but copyBuys<${MIN_COPY_BUYS}): ${filteredOutByMinBuys.length} traders`);
+  }
   console.log(`Unprofitable: ${unprofitable.length}`);
   console.log(`Profitable crypto traders: ${cryptoProfitable.length}`);
   console.log(`\nTop 5 by composite score:`);
   for (const r of profitable.slice(0, 5)) {
-    console.log(`  ${r.name}: Score=${r.score.toFixed(2)} | CopyPnL=$${r.copyPnl.toFixed(0)} | HoldWR=${r.holdWr.toFixed(1)}% | Scalp=${r.scalpPct.toFixed(0)}% | ${r.mainCategory}`);
+    console.log(`  ${r.name}: Score=${r.score.toFixed(2)} | CopyPnL=$${r.copyPnl.toFixed(0)} | ActPnL=$${r.traderPnl.toFixed(0)} | HoldWR=${r.holdWr.toFixed(1)}% | ${r.mainCategory}`);
+  }
+
+  // CSV output
+  if (OUTPUT_FILE) {
+    const csvHeaders = [
+      'rank','name','wallet','trades','actualPnl','actualRoi','traderWr',
+      'copyPnl','copyRoi','holdWr','copyBuys','maxDdPct','sharpe','dayWr',
+      'scalpPct','score','pnlPerDay','daysActive','cryptoPct','category'
+    ];
+    const allSorted = [...profitable, ...unprofitable];
+    const csvRows = allSorted.map((r, i) => [
+      i + 1, `"${r.name}"`, r.wallet, r.trades,
+      r.traderPnl.toFixed(2), r.traderRoi.toFixed(2), r.traderWr.toFixed(1),
+      r.copyPnl.toFixed(2), r.copyRoi.toFixed(1), r.holdWr.toFixed(1),
+      r.copyBuys, r.copyMaxDdPct.toFixed(1), r.copySharpe.toFixed(2), r.dayWr.toFixed(0),
+      r.scalpPct.toFixed(0), r.score.toFixed(2), r.pnlPerDay.toFixed(2),
+      r.daysActive, r.cryptoPct.toFixed(0), r.mainCategory
+    ].join(','));
+    writeFileSync(OUTPUT_FILE, [csvHeaders.join(','), ...csvRows].join('\n'));
+    console.log(`\nResults saved to ${OUTPUT_FILE}`);
   }
 }
 

@@ -56,7 +56,6 @@ const SWEEP = {
 const STARTING_CAPITAL = 450;
 const FEE_RATE = 0.25;
 const FEE_EXPONENT = 2;
-const MAX_DAILY_USD = 200;
 const MIN_BUYS_FOR_RANKING = 10;
 const FALLBACK_FAK_FAILURE_RATE = 0.12;
 const BUY_FAILURE_COOLDOWN_SEC = 15;
@@ -180,7 +179,6 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
   const committedSides = new Map<string, string>();
   const dailyPnl = new Map<string, number>();
   const dailyDeployed = new Map<string, number>();
-  const dailySpend = new Map<string, number>();
   const traderAccum = new Map<string, Map<string, number>>();
   const buyFailureCooldown = new Map<string, number>();
 
@@ -256,12 +254,9 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
     const committed = committedSides.get(trade.conditionId);
     if (committed && committed !== trade.outcome) continue;
 
-    // Guard 4: Daily spend limit
     const day = new Date(trade.timestamp * 1000).toISOString().slice(0, 10);
-    const daySpent = dailySpend.get(day) ?? 0;
-    if (daySpent >= MAX_DAILY_USD) continue;
 
-    // Guard 5: Available capital
+    // Guard 4: Available capital
     let available: number;
     if (USE_CAPITAL_LOCKUP) {
       releaseMatured(trade.timestamp);
@@ -278,8 +273,6 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
     if (predRemaining < 1) continue;
     if (copyAmount > predRemaining) copyAmount = predRemaining;
     if (copyAmount > available) copyAmount = available;
-    const dailyRemaining = MAX_DAILY_USD - daySpent;
-    if (copyAmount > dailyRemaining) copyAmount = dailyRemaining;
     if (copyAmount < 1.0) continue;
 
     // Fix 4: FAK failure with cooldown
@@ -309,7 +302,6 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
     // Track results
     predDeployed.set(trade.conditionId, predUsed + copyAmount);
     if (!committed) committedSides.set(trade.conditionId, trade.outcome);
-    dailySpend.set(day, daySpent + copyAmount);
     buyCount++;
 
     if (USE_CAPITAL_LOCKUP) {
@@ -378,8 +370,9 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
     sharpe = variance > 0 ? mean / Math.sqrt(variance) : 0;
   }
 
+  const samplePenalty = Math.min(1, Math.log(1 + buyCount) / Math.log(1 + 50));
   const score = (copyPnl > 0 && buyCount >= MIN_BUYS_FOR_RANKING)
-    ? copyRoi * (1 - scalpPct / 100) * Math.min(buyCount / 20, 1) * (1 / (1 + maxDdPct / 20))
+    ? copyRoi * (1 - scalpPct / 100) * samplePenalty * (1 / (1 + maxDdPct / 20))
     : -1;
 
   return {
@@ -510,12 +503,47 @@ async function main() {
     trades.sort((a, b) => a.timestamp - b.timestamp);
 
     const buyTrades = trades.filter(t => t.side === 'BUY');
+    const traderBought = buyTrades.reduce((s, t) => s + t.size * t.price, 0);
     const cats = new Map<string, number>();
     for (const t of buyTrades) { const c = categorize(t.eventSlug); cats.set(c, (cats.get(c) ?? 0) + 1); }
     const catStr = [...cats.entries()].sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c}:${n}`).join(', ');
 
+    // Compute actual trader PnL from resolved trades (not stale leaderboardPnl)
+    const cidOutcomes = new Map<string, Map<string, number>>();
+    const cidOutcomeSample = new Map<string, TradeRow>();
+    for (const t of buyTrades) {
+      if (!cidOutcomes.has(t.conditionId)) cidOutcomes.set(t.conditionId, new Map());
+      const m = cidOutcomes.get(t.conditionId)!;
+      m.set(t.outcome, (m.get(t.outcome) ?? 0) + t.size * t.price);
+      const key = `${t.conditionId}:${t.outcome}`;
+      if (!cidOutcomeSample.has(key)) cidOutcomeSample.set(key, t);
+    }
+    const resolutionCache = new Map<string, boolean>();
+    for (const [cid, outcomes] of cidOutcomes) {
+      for (const [outcome] of outcomes) {
+        const sample = cidOutcomeSample.get(`${cid}:${outcome}`);
+        if (!sample) continue;
+        const oi = resolveOutcomeIndex(sample);
+        if (oi == null) continue;
+        try {
+          const prices: string[] = JSON.parse(sample.outcomePrices);
+          resolutionCache.set(`${cid}:${outcome}`, parseFloat(prices[oi] ?? '0') >= 0.95);
+        } catch {}
+      }
+    }
+    let actualTraderPnl = 0;
+    for (const t of buyTrades) {
+      const won = resolutionCache.get(`${t.conditionId}:${t.outcome}`);
+      if (won === undefined) continue;
+      const spent = t.size * t.price;
+      actualTraderPnl += won ? (t.size - spent) : -spent;
+    }
+    const actualTraderRoi = traderBought > 0 ? actualTraderPnl / traderBought * 100 : 0;
+    const actPnlStr = (actualTraderPnl >= 0 ? '+$' : '-$') + Math.abs(actualTraderPnl).toFixed(0);
+
     console.log(`${'='.repeat(140)}`);
     console.log(`${userName} (${wallet.slice(0, 14)}...) — ${trades.length} trades (${buyTrades.length} buys, ${trades.length - buyTrades.length} sells) | ${catStr}`);
+    console.log(`Actual PnL: ${actPnlStr} | ROI: ${actualTraderRoi.toFixed(1)}% | Volume: $${traderBought.toFixed(0)}`);
     console.log(`${'='.repeat(140)}\n`);
 
     const configs = generateConfigs(BASE_SEED);
