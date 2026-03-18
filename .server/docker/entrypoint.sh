@@ -9,4 +9,9 @@ set -e
 # Workers with custom handlers (trade-monitor, arb-worker, scalp-worker) also
 # close WebSocket connections and feeds before disconnecting.
 
+# Ensure IPC socket directory is writable (shared volume created as root)
+if [ -d /var/run/copier ]; then
+  chmod 777 /var/run/copier 2>/dev/null || true
+fi
+
 exec node --import tsx "$@"
