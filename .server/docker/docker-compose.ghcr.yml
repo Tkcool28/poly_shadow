@@ -196,8 +196,10 @@ services:
 volumes:
   polymarket_pgdata:
     driver: local
+    name: polymarket_pgdata
   polymarket_logs:
     driver: local
+    name: polymarket_logs
 
 # =============================================================================
 # Networks

@@ -295,6 +295,14 @@ jobs:
           CORE_WORKERS="copy-trader trade-monitor history-backfiller"
           for worker in $CORE_WORKERS; do
             if ! docker compose -f docker-compose.ghcr.yml ps "$worker" | grep -q "Up"; then
+              # Check if copy-trader exited cleanly because COPY_TRADE_ENABLED=false
+              if [ "$worker" = "copy-trader" ]; then
+                LOGS=$(docker compose -f docker-compose.ghcr.yml logs --tail=5 "$worker" 2>&1)
+                if echo "$LOGS" | grep -q "Copy trading disabled"; then
+                  echo "OK - $worker exited (COPY_TRADE_ENABLED=false)"
+                  continue
+                fi
+              fi
               echo "ERROR - $worker is not running"
               docker compose -f docker-compose.ghcr.yml logs --tail=30 "$worker"
               exit 1
