@@ -165,9 +165,10 @@ IMAGE_TAG=sha-previous docker compose -f docker-compose.ghcr.yml up -d \
 # List available backups
 ls -la ~/polymarket-copytrade/backups/
 
-# Restore from backup
-gunzip -c ~/polymarket-copytrade/backups/pre-deploy-YYYYMMDD-HHMMSS.sql.gz | \
-  docker exec -i polymarket_postgres psql -U polymarket polymarket_copytrade
+# Restore from backup (custom format)
+docker exec -i polymarket_postgres pg_restore \
+  -U polymarket -d polymarket_copytrade --clean --if-exists \
+  < ~/polymarket-copytrade/backups/pre-deploy-YYYYMMDD-HHMMSS.dump
 ```
 
 ## Migration from Native PM2

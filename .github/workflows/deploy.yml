@@ -210,15 +210,38 @@ jobs:
           echo "=== Backing up database ==="
           BACKUP_DIR="${{ env.DEPLOY_DIR }}/backups"
           mkdir -p "$BACKUP_DIR"
-          BACKUP_FILE="$BACKUP_DIR/pre-deploy-$(date +%Y%m%d-%H%M%S).sql"
-          docker exec polymarket_postgres pg_dump -U polymarket polymarket_copytrade > "$BACKUP_FILE" 2>/dev/null || true
-          if [ -s "$BACKUP_FILE" ]; then
-            gzip "$BACKUP_FILE"
-            echo "Database backed up to ${BACKUP_FILE}.gz"
-            ls -t "$BACKUP_DIR"/*.gz 2>/dev/null | tail -n +6 | xargs -r rm
+          BACKUP_FILE="$BACKUP_DIR/pre-deploy-$(date +%Y%m%d-%H%M%S).dump"
+
+          # Custom format (-Fc) = compressed + parallel restore support
+          # Exclude large append-only tables that aren't needed for rollback
+          # 5-minute hard timeout INSIDE the container to prevent workflow stalls
+          if docker exec polymarket_postgres timeout 300 pg_dump \
+            -U polymarket \
+            -Fc \
+            --exclude-table-data='Activity' \
+            --exclude-table-data='Trade' \
+            --exclude-table-data='ScalpTradeLog' \
+            --exclude-table-data='ScalpSignalLog' \
+            --exclude-table-data='TraderScoreHistory' \
+            polymarket_copytrade > "$BACKUP_FILE"; then
+
+            if [ -s "$BACKUP_FILE" ]; then
+              SIZE=$(du -h "$BACKUP_FILE" | cut -f1)
+              echo "Database backed up to $BACKUP_FILE ($SIZE)"
+              # Keep last 5 backups
+              ls -t "$BACKUP_DIR"/*.dump 2>/dev/null | tail -n +6 | xargs -r rm
+            else
+              echo "Backup file is empty (new database?)"
+              rm -f "$BACKUP_FILE"
+            fi
           else
-            echo "Backup file is empty (new database?)"
+            EXIT_CODE=$?
             rm -f "$BACKUP_FILE"
+            if [ $EXIT_CODE -eq 124 ]; then
+              echo "WARNING: Backup timed out after 5 minutes, skipping (non-blocking)"
+            else
+              echo "WARNING: Backup failed (exit $EXIT_CODE), skipping (non-blocking)"
+            fi
           fi
 
       - name: Run database migrations
