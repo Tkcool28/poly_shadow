@@ -7,13 +7,24 @@ import {
   sweepUnclaimedSettledPositions,
   sweepStaleMarkets,
 } from '../services/position-settlement.js';
+import { reconcileStalePending, reconcileSkippedGhostFills } from '../services/clob-reconciler.js';
+import { initialize as initExecutor } from '../services/trade-executor.js';
 
 const log = createJobLogger('ipc-bridge');
 const SETTLEMENT_INTERVAL_MS = 5 * 60 * 1000; // 5 min
 const MARKET_REFRESH_MS = 15 * 60 * 1000; // 15 min
+const RECONCILE_INTERVAL_MS = 60 * 1000; // 60s
 
 async function main() {
   let shuttingDown = false;
+
+  // Initialize CLOB client for reconciliation (order status queries + stale order cancellation)
+  await initExecutor();
+
+  // Declare timers before cleanup so they're in scope
+  let settlementTimer: ReturnType<typeof setInterval>;
+  let marketRefreshTimer: ReturnType<typeof setInterval>;
+  let reconcileTimer: ReturnType<typeof setInterval>;
 
   const cleanup = async (signal: string) => {
     if (shuttingDown) return;
@@ -21,6 +32,7 @@ async function main() {
     log.info(`Received ${signal}, shutting down...`);
     clearInterval(settlementTimer);
     clearInterval(marketRefreshTimer);
+    clearInterval(reconcileTimer);
     closeBridge();
     await prisma.$disconnect();
     process.exit(0);
@@ -32,7 +44,7 @@ async function main() {
   log.info('IPC bridge started');
 
   // Settlement sweep (5min) — sends market_settled to Rust for capital release
-  const settlementTimer = setInterval(async () => {
+  settlementTimer = setInterval(async () => {
     if (shuttingDown) return;
     try {
       await sweepPositionSettlements();
@@ -43,7 +55,7 @@ async function main() {
   }, SETTLEMENT_INTERVAL_MS);
 
   // Market refresh (15min) — detects resolved markets for settlement
-  const marketRefreshTimer = setInterval(async () => {
+  marketRefreshTimer = setInterval(async () => {
     if (shuttingDown) return;
     try {
       await sweepStaleMarkets();
@@ -52,6 +64,17 @@ async function main() {
     }
   }, MARKET_REFRESH_MS);
 
+  // Reconciliation sweep (60s) — recovers stale PENDING and ghost fills
+  reconcileTimer = setInterval(async () => {
+    if (shuttingDown) return;
+    try {
+      await reconcileStalePending();
+      await reconcileSkippedGhostFills();
+    } catch (err: any) {
+      log.warn(`Reconciliation sweep failed: ${err.message}`);
+    }
+  }, RECONCILE_INTERVAL_MS);
+
   // Startup sweeps
   sweepPositionSettlements()
     .then(() => sweepUnclaimedSettledPositions())
@@ -59,6 +82,9 @@ async function main() {
   sweepStaleMarkets().catch((err: any) =>
     log.warn(`Startup market refresh failed: ${err.message}`),
   );
+  reconcileStalePending()
+    .then(() => reconcileSkippedGhostFills())
+    .catch((err: any) => log.warn(`Startup reconciliation failed: ${err.message}`));
 
   log.info('IPC bridge process ready');
   await new Promise(() => {}); // keep alive forever
