@@ -97,7 +97,7 @@ pub fn run(
         && let Some(min_price) = alloc.min_buy_price
             && signal.price < min_price - 0.001 {
                 return FilterResult::Skip(format!(
-                    "price {:.2} below minBuyPrice {:.2}",
+                    "price {:.4} below minBuyPrice {:.2}",
                     signal.price, min_price
                 ));
             }

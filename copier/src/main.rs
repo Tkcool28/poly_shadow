@@ -195,8 +195,8 @@ async fn main() -> anyhow::Result<()> {
         // 7. Run filter chain
         let filter_result = filter::chain::run(&signal, &alloc, &filter_config, &shared_state);
 
-        // 8. Send TradeDetected IPC (fire-and-forget)
-        let _ = ipc_tx.try_send(OutboundMessage::TradeDetected {
+        // 8. Send TradeDetected IPC (fire-and-forget, ok to drop under load)
+        if let Err(_) = ipc_tx.try_send(OutboundMessage::TradeDetected {
             proxy_wallet: trade.proxy_wallet.clone(),
             token_id: trade.token_id.clone(),
             side: messages::side_to_string(trade.side),
@@ -220,7 +220,9 @@ async fn main() -> anyhow::Result<()> {
             }
             .to_string(),
             timestamp: chrono::Utc::now().timestamp(),
-        });
+        }) {
+            tracing::warn!("IPC TradeDetected dropped (channel full)");
+        }
 
         // 9. Execute or skip
         match filter_result {
@@ -360,8 +362,8 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
 
-                        // IPC: CopyTradeResult
-                        let _ = ipc_tx.try_send(OutboundMessage::CopyTradeResult {
+                        // IPC: CopyTradeResult — MUST persist, use blocking send with timeout
+                        let ipc_msg = OutboundMessage::CopyTradeResult {
                             detected_trade_id: Some(trade.transaction_hash.clone()),
                             allocation_id: alloc.id.clone(),
                             token_id: params.token_id.clone(),
@@ -376,7 +378,17 @@ async fn main() -> anyhow::Result<()> {
                             latency_ms,
                             fail_reason: None,
                             is_paper: alloc.is_paper,
-                        });
+                        };
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(1),
+                            ipc_tx.send(ipc_msg),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(_)) => tracing::error!("IPC channel closed, CopyTradeResult lost"),
+                            Err(_) => tracing::error!("IPC send timeout (1s), CopyTradeResult lost"),
+                        }
 
                         tracing::info!(
                             n = trade_count,

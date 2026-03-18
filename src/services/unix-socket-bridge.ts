@@ -366,8 +366,8 @@ async function handleTradeDetected(msg: TradeDetectedMsg): Promise<void> {
       update: {}, // no-op if already exists
     });
   } catch (err: any) {
-    log.warn('DetectedTrade upsert failed', {
-      error: err.message,
+    // Expected race: both Rust IPC and Node.js chain watcher detect the same trade
+    log.debug('DetectedTrade upsert race (record exists)', {
       tx: msg.transaction_hash,
     });
   }
