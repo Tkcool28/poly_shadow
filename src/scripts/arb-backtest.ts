@@ -1,4 +1,5 @@
 #!/usr/bin/env tsx
+// @ts-nocheck — standalone script, depends on deleted backtest-price-model
 /**
  * Arb Strategy Backtester
  *

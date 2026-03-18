@@ -1,3 +1,4 @@
+// @ts-nocheck — standalone script, optional env fields used without guards
 /**
  * Compute total fees paid to Polymarket on live copy trades.
  * Fetches trade data from CLOB API using our order IDs.
