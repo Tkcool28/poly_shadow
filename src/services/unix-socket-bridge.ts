@@ -89,7 +89,7 @@ export function startBridge(): net.Server {
   server.listen(SOCKET_PATH, () => {
     // Set socket permissions (owner + group read/write)
     try {
-      fs.chmodSync(SOCKET_PATH, 0o660);
+      fs.chmodSync(SOCKET_PATH, 0o666);
     } catch {
       // Ignore — may not have permission in container
     }

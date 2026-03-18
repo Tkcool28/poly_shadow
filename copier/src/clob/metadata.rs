@@ -142,7 +142,8 @@ impl MetadataResolver {
             .map(|s| s.to_string())
     }
 
-    /// CLOB API: GET /tick-size?token_id=X → bare string "0.01"
+    /// CLOB API: GET /tick-size?token_id=X
+    /// Response may be JSON `{"minimum_tick_size":0.01}` or bare string `"0.01"`.
     async fn fetch_tick_size_from_clob(&self, token_id: &str) -> Option<String> {
         let url = format!(
             "{}/tick-size?token_id={}",
@@ -153,6 +154,18 @@ impl MetadataResolver {
             return None;
         }
         let text = resp.text().await.ok()?;
+
+        // Try JSON first: {"minimum_tick_size": 0.01}
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(ts) = json.get("minimum_tick_size").and_then(|v| v.as_f64()) {
+                let ts_str = format!("{}", ts);
+                if ["0.1", "0.01", "0.001", "0.0001"].contains(&ts_str.as_str()) {
+                    return Some(ts_str);
+                }
+            }
+        }
+
+        // Fall back to bare string: "0.01"
         let ts = text.trim().trim_matches('"').to_string();
         if ["0.1", "0.01", "0.001", "0.0001"].contains(&ts.as_str()) {
             Some(ts)
