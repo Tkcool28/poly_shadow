@@ -5,14 +5,19 @@
  * Uses INDIVIDUAL TRADES (not aggregated ClosedPositions) to match production behavior.
  * Processes fills sequentially with self-exclusion in majority gate.
  *
- * Connects to Hetzner DB via SSH tunnel (localhost:15438).
- * Sweeps 1,600 config combinations per trader, ranked by composite score.
- * Monte Carlo on top 3 configs for consistency validation.
+ * Fidelity features:
+ *   - Capital lockup: capital locked until Market.endDate (not instant PnL)
+ *   - Slug exclusion: matches production allocation (default: updown-5m,updown-15m)
+ *   - Empirical slippage: calibrated from CopyTrade.slippageBps (fallback: category-based)
+ *   - Empirical FAK rate: calibrated from CopyTrade data + 15s cooldown
+ *   - Net position tracking: SELL decrements predDeployed (allows re-entry)
+ *   - Sharpe on returns: PnL/deployed, not raw dollar PnL
  *
  * Usage:
  *   ssh -f -N -L 15438:localhost:5438 hetzner_finland_dockerapps
  *   npx tsx src/scripts/batch-backtest-config-sweep.ts --trader FloatyBoi --trader LampStore
- *   npx tsx src/scripts/batch-backtest-config-sweep.ts --trader 0x38c6fd3ae5db...  # wallet also works
+ *   npx tsx src/scripts/batch-backtest-config-sweep.ts --trader 0x38c6fd3ae5db...
+ *   npx tsx src/scripts/batch-backtest-config-sweep.ts --exclude-slugs "" --no-capital-lockup  # old behavior
  */
 
 import { Client } from 'pg';
@@ -23,12 +28,18 @@ const { values: args } = parseArgs({
     trader: { type: 'string', multiple: true },
     seed: { type: 'string', default: '42' },
     top: { type: 'string', default: '20' },
+    'exclude-slugs': { type: 'string', default: 'updown-5m,updown-15m' },
+    'no-empirical-slippage': { type: 'boolean', default: false },
+    'no-capital-lockup': { type: 'boolean', default: false },
   },
 });
 
 const traderInputs = args.trader ?? ['FloatyBoi', 'LampStore'];
 const BASE_SEED = parseInt(args.seed ?? '42', 10);
 const TOP_N = parseInt(args.top ?? '20', 10);
+const EXCLUDE_SLUGS = (args['exclude-slugs'] ?? '').split(',').map(s => s.trim()).filter(Boolean);
+const USE_EMPIRICAL_SLIPPAGE = !args['no-empirical-slippage'];
+const USE_CAPITAL_LOCKUP = !args['no-capital-lockup'];
 
 const DB_PASSWORD = process.env.HETZNER_PG_PASSWORD ?? '';
 
@@ -43,11 +54,18 @@ const SWEEP = {
 
 // Fixed constants (not swept)
 const STARTING_CAPITAL = 450;
-const FAK_FAILURE_RATE = 0.12;
 const FEE_RATE = 0.25;
 const FEE_EXPONENT = 2;
 const MAX_DAILY_USD = 200;
 const MIN_BUYS_FOR_RANKING = 10;
+const FALLBACK_FAK_FAILURE_RATE = 0.12;
+const BUY_FAILURE_COOLDOWN_SEC = 15;
+const FALLBACK_LOCKUP_SEC = 7 * 24 * 60 * 60; // 7 days
+
+// Empirical calibration (populated at startup)
+interface SlippageModel { p50: number; p75: number; p90: number; }
+let empiricalSlippage: SlippageModel | null = null;
+let fakFailureRate = FALLBACK_FAK_FAILURE_RATE;
 
 // ─── Config Interface ───
 interface SimConfig {
@@ -71,6 +89,14 @@ interface TradeRow {
   eventSlug: string;
   outcomePrices: string;
   outcomes: string;
+  endDate: number | null;
+}
+
+interface LockedPosition {
+  deployedUsd: number;
+  netShares: number;
+  outcomeWon: boolean;
+  resolvesAt: number;
 }
 
 interface SimResult {
@@ -118,49 +144,97 @@ function categorize(slug: string): string {
   return 'other';
 }
 
+function computeSlippage(cat: string, rng: () => number): number {
+  if (empiricalSlippage) {
+    const u = rng();
+    const bps = u < 0.8
+      ? empiricalSlippage.p50 + (empiricalSlippage.p75 - empiricalSlippage.p50) * Math.sqrt(u / 0.8)
+      : empiricalSlippage.p75 + (empiricalSlippage.p90 - empiricalSlippage.p75) * ((u - 0.8) / 0.2);
+    return Math.max(0, bps / 10000);
+  }
+  if (cat === '5m')       return 0.03 + 0.05 * rng();
+  if (cat === '15m')      return 0.02 + 0.04 * rng();
+  if (cat === '1h')       return 0.02 + 0.03 * rng();
+  return 0.01 + 0.02 * rng();
+}
+
 // ─── Simulation Engine (parameterized) ───
 function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
   const rng = mulberry32(cfg.seed);
 
-  // Already sorted by timestamp ASC from SQL
-  let totalDeployed = 0, totalPnl = 0, buyCount = 0;
+  let buyCount = 0;
   let wins = 0, losses = 0, peakPnl = 0, maxDd = 0;
   let holdWins = 0, holdTotal = 0;
   let sellCount = 0, totalBuyCount = 0;
 
+  // Capital lockup state
+  const lockupQueue: LockedPosition[] = [];
+  let lockupReleasePtr = 0;
+  let currentlyLocked = 0;
+  let releasedPnl = 0;
+
+  // Instant-mode state
+  let totalDeployed = 0, totalPnl = 0;
+
   const predDeployed = new Map<string, number>();
   const committedSides = new Map<string, string>();
   const dailyPnl = new Map<string, number>();
+  const dailyDeployed = new Map<string, number>();
   const dailySpend = new Map<string, number>();
   const traderAccum = new Map<string, Map<string, number>>();
+  const buyFailureCooldown = new Map<string, number>();
+
+  function releaseMatured(currentTs: number) {
+    while (lockupReleasePtr < lockupQueue.length
+           && currentTs >= lockupQueue[lockupReleasePtr].resolvesAt) {
+      const pos = lockupQueue[lockupReleasePtr++];
+      const pnl = (pos.outcomeWon ? pos.netShares : 0) - pos.deployedUsd;
+      releasedPnl += pnl;
+      currentlyLocked -= pos.deployedUsd;
+      const resolveDay = new Date(pos.resolvesAt * 1000).toISOString().slice(0, 10);
+      dailyPnl.set(resolveDay, (dailyPnl.get(resolveDay) ?? 0) + pnl);
+      dailyDeployed.set(resolveDay, (dailyDeployed.get(resolveDay) ?? 0) + pos.deployedUsd);
+      holdTotal++; if (pos.outcomeWon) holdWins++;
+      if (pnl > 0) wins++; else losses++;
+      if (releasedPnl > peakPnl) peakPnl = releasedPnl;
+      const dd = peakPnl - releasedPnl;
+      if (dd > maxDd) maxDd = dd;
+    }
+  }
 
   for (const trade of trades) {
     const cat = categorize(trade.eventSlug);
     const fillUsd = trade.size * trade.price;
 
-    // Track SELLs for scalp detection, then skip
     if (trade.side === 'SELL') {
       sellCount++;
+      // Fix 5: Net position tracking
+      const predUsed = predDeployed.get(trade.conditionId) ?? 0;
+      predDeployed.set(trade.conditionId, Math.max(0, predUsed - fillUsd));
       continue;
     }
+    // Fix 2a: Slug exclusion BEFORE accumulator
+    if (EXCLUDE_SLUGS.length > 0) {
+      const slug = trade.eventSlug.toLowerCase();
+      if (EXCLUDE_SLUGS.some(p => slug.includes(p))) continue;
+    }
+
+    // Count after slug exclusion so scalpPct denominators are accurate
     totalBuyCount++;
 
-    // Feed majority accumulator with this fill's USD
+    // Feed majority accumulator (only non-excluded trades)
     if (!traderAccum.has(trade.conditionId)) traderAccum.set(trade.conditionId, new Map());
     const outcomeMap = traderAccum.get(trade.conditionId)!;
     outcomeMap.set(trade.outcome, (outcomeMap.get(trade.outcome) ?? 0) + fillUsd);
 
-    // Resolve outcomeIndex for settlement check
     const oi = resolveOutcomeIndex(trade);
     if (oi == null) continue;
 
-    // === PRODUCTION GUARDS ===
-
-    // Guard 1: minBuyPrice
+    // Guard 1: minBuyPrice (swept)
     if (trade.price < cfg.minBuyPrice || trade.price > 0.95) continue;
     if (fillUsd < 1) continue;
 
-    // Guard 2: Majority gate WITH self-exclusion (matches production getMajoritySide + excludeUsd)
+    // Guard 2: Majority gate WITH self-exclusion
     if (cfg.gate > 0) {
       let totalCidVol = 0;
       let maxOutcomeVol = 0;
@@ -172,7 +246,6 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
         if (adjVol > 0) numOutcomes++;
         if (adjVol > maxOutcomeVol) { maxOutcomeVol = adjVol; majorityOutcome = oc; }
       }
-
       if (totalCidVol < cfg.gate) continue;
       if (numOutcomes < 2) continue;
       if (trade.outcome !== majorityOutcome) continue;
@@ -189,10 +262,16 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
     if (daySpent >= MAX_DAILY_USD) continue;
 
     // Guard 5: Available capital
-    const available = STARTING_CAPITAL - totalDeployed + totalPnl;
+    let available: number;
+    if (USE_CAPITAL_LOCKUP) {
+      releaseMatured(trade.timestamp);
+      available = STARTING_CAPITAL - currentlyLocked + releasedPnl;
+    } else {
+      available = STARTING_CAPITAL - totalDeployed + totalPnl;
+    }
     if (available < 1) continue;
 
-    // Sizing: based on THIS fill's USD, not total position
+    // Sizing
     let copyAmount = Math.min(fillUsd * cfg.copyPercent, cfg.maxTrade);
     const predUsed = predDeployed.get(trade.conditionId) ?? 0;
     const predRemaining = cfg.maxPred - predUsed;
@@ -203,15 +282,16 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
     if (copyAmount > dailyRemaining) copyAmount = dailyRemaining;
     if (copyAmount < 1.0) continue;
 
-    // FAK failure
-    if (rng() < FAK_FAILURE_RATE) continue;
+    // Fix 4: FAK failure with cooldown
+    const cooldownExpiry = buyFailureCooldown.get(trade.conditionId);
+    if (cooldownExpiry && trade.timestamp < cooldownExpiry) continue;
+    if (rng() < fakFailureRate) {
+      buyFailureCooldown.set(trade.conditionId, trade.timestamp + BUY_FAILURE_COOLDOWN_SEC);
+      continue;
+    }
 
-    // Category-aware slippage
-    let slippagePct: number;
-    if (cat === '5m')       slippagePct = 0.03 + 0.05 * rng();
-    else if (cat === '15m') slippagePct = 0.02 + 0.04 * rng();
-    else if (cat === '1h')  slippagePct = 0.02 + 0.03 * rng();
-    else                    slippagePct = 0.01 + 0.02 * rng();
+    // Fix 3: Empirical or category-based slippage
+    const slippagePct = computeSlippage(cat, rng);
     const fillPrice = Math.min(trade.price * (1 + slippagePct), 0.99);
 
     // Taker fee
@@ -226,25 +306,57 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
       outcomeWon = parseFloat(prices[oi] ?? '0') >= 0.95;
     } catch { continue; }
 
-    const pnl = (outcomeWon ? netShares * 1.0 : 0) - copyAmount;
-
-    holdTotal++;
-    if (outcomeWon) holdWins++;
-    totalPnl += pnl;
-    totalDeployed += copyAmount;
-    buyCount++;
-    if (pnl > 0) wins++; else losses++;
+    // Track results
     predDeployed.set(trade.conditionId, predUsed + copyAmount);
     if (!committed) committedSides.set(trade.conditionId, trade.outcome);
     dailySpend.set(day, daySpent + copyAmount);
+    buyCount++;
 
-    if (totalPnl > peakPnl) peakPnl = totalPnl;
-    const dd = peakPnl - totalPnl;
-    if (dd > maxDd) maxDd = dd;
-    dailyPnl.set(day, (dailyPnl.get(day) ?? 0) + pnl);
+    if (USE_CAPITAL_LOCKUP) {
+      const endDateTs = trade.endDate ?? (trade.timestamp + FALLBACK_LOCKUP_SEC);
+      let lo = lockupReleasePtr, hi = lockupQueue.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (lockupQueue[mid].resolvesAt <= endDateTs) lo = mid + 1; else hi = mid;
+      }
+      lockupQueue.splice(lo, 0, { deployedUsd: copyAmount, netShares, outcomeWon, resolvesAt: endDateTs });
+      currentlyLocked += copyAmount;
+    } else {
+      const pnl = (outcomeWon ? netShares * 1.0 : 0) - copyAmount;
+      holdTotal++; if (outcomeWon) holdWins++;
+      totalPnl += pnl;
+      totalDeployed += copyAmount;
+      if (pnl > 0) wins++; else losses++;
+      if (totalPnl > peakPnl) peakPnl = totalPnl;
+      const dd = peakPnl - totalPnl;
+      if (dd > maxDd) maxDd = dd;
+      dailyPnl.set(day, (dailyPnl.get(day) ?? 0) + pnl);
+      dailyDeployed.set(day, (dailyDeployed.get(day) ?? 0) + copyAmount);
+    }
   }
 
-  const copyRoi = totalDeployed > 0 ? totalPnl / totalDeployed * 100 : 0;
+  // Flush remaining locked positions
+  if (USE_CAPITAL_LOCKUP) {
+    for (let i = lockupReleasePtr; i < lockupQueue.length; i++) {
+      const pos = lockupQueue[i];
+      const pnl = (pos.outcomeWon ? pos.netShares : 0) - pos.deployedUsd;
+      releasedPnl += pnl;
+      const resolveDay = new Date(pos.resolvesAt * 1000).toISOString().slice(0, 10);
+      dailyPnl.set(resolveDay, (dailyPnl.get(resolveDay) ?? 0) + pnl);
+      dailyDeployed.set(resolveDay, (dailyDeployed.get(resolveDay) ?? 0) + pos.deployedUsd);
+      holdTotal++; if (pos.outcomeWon) holdWins++;
+      if (pnl > 0) wins++; else losses++;
+      if (releasedPnl > peakPnl) peakPnl = releasedPnl;
+      const dd = peakPnl - releasedPnl;
+      if (dd > maxDd) maxDd = dd;
+    }
+  }
+
+  const copyPnl = USE_CAPITAL_LOCKUP ? releasedPnl : totalPnl;
+  const deployed = USE_CAPITAL_LOCKUP
+    ? lockupQueue.reduce((s, p) => s + p.deployedUsd, 0)
+    : totalDeployed;
+  const copyRoi = deployed > 0 ? copyPnl / deployed * 100 : 0;
   const maxDdPct = STARTING_CAPITAL > 0 ? maxDd / STARTING_CAPITAL * 100 : 0;
   const holdWr = holdTotal > 0 ? holdWins / holdTotal * 100 : 0;
   const scalpPct = totalBuyCount > 0 ? sellCount / totalBuyCount * 100 : 0;
@@ -253,20 +365,26 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
   const winDays = dailyVals.filter(v => v > 0).length;
   const dayWr = dailyVals.length > 0 ? winDays / dailyVals.length * 100 : 0;
 
+  // Fix 6: Sharpe on returns (PnL/deployed)
   let sharpe = 0;
-  if (dailyVals.length > 1) {
-    const mean = dailyVals.reduce((a, b) => a + b, 0) / dailyVals.length;
-    const variance = dailyVals.reduce((a, v) => a + (v - mean) ** 2, 0) / (dailyVals.length - 1);
+  const dailyReturns: number[] = [];
+  for (const [day, pnl] of dailyPnl) {
+    const dep = dailyDeployed.get(day) ?? 1;
+    dailyReturns.push(dep > 0 ? pnl / dep : 0);
+  }
+  if (dailyReturns.length > 1) {
+    const mean = dailyReturns.reduce((a, b) => a + b, 0) / dailyReturns.length;
+    const variance = dailyReturns.reduce((a, v) => a + (v - mean) ** 2, 0) / (dailyReturns.length - 1);
     sharpe = variance > 0 ? mean / Math.sqrt(variance) : 0;
   }
 
-  const score = (totalPnl > 0 && buyCount >= MIN_BUYS_FOR_RANKING)
+  const score = (copyPnl > 0 && buyCount >= MIN_BUYS_FOR_RANKING)
     ? copyRoi * (1 - scalpPct / 100) * Math.min(buyCount / 20, 1) * (1 / (1 + maxDdPct / 20))
     : -1;
 
   return {
-    config: cfg, copyPnl: totalPnl, copyRoi, holdWr, copyBuys: buyCount,
-    maxDdPct, sharpe, dayWr, scalpPct, score, totalDeployed,
+    config: cfg, copyPnl, copyRoi, holdWr, copyBuys: buyCount,
+    maxDdPct, sharpe, dayWr, scalpPct, score, totalDeployed: deployed,
   };
 }
 
@@ -291,6 +409,47 @@ function generateConfigs(seed: number): SimConfig[] {
 const pad = (s: string, n: number) => s.length >= n ? s.slice(0, n) : s + ' '.repeat(n - s.length);
 const rpad = (s: string, n: number) => s.length >= n ? s.slice(0, n) : ' '.repeat(n - s.length) + s;
 
+async function calibrateFromProduction(db: Client) {
+  if (USE_EMPIRICAL_SLIPPAGE) {
+    try {
+      const res = await db.query(`
+        SELECT COUNT(*) as n,
+          PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY "slippageBps") as p50,
+          PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY "slippageBps") as p75,
+          PERCENTILE_CONT(0.90) WITHIN GROUP (ORDER BY "slippageBps") as p90
+        FROM "CopyTrade"
+        WHERE status = 'FILLED' AND "slippageBps" IS NOT NULL AND "slippageBps" >= 0 AND side = 'BUY'
+      `);
+      const row = res.rows[0];
+      if (row && parseInt(row.n) >= 50) {
+        empiricalSlippage = { p50: parseFloat(row.p50), p75: parseFloat(row.p75), p90: parseFloat(row.p90) };
+        console.log(`Empirical slippage: p50=${empiricalSlippage.p50.toFixed(0)}bps p75=${empiricalSlippage.p75.toFixed(0)}bps p90=${empiricalSlippage.p90.toFixed(0)}bps (n=${row.n})`);
+      } else {
+        console.log(`Empirical slippage: insufficient data (n=${row?.n ?? 0}), using category-based fallback`);
+      }
+    } catch {
+      console.log(`Empirical slippage: query failed, using category-based fallback`);
+    }
+  }
+
+  try {
+    const res = await db.query(`
+      SELECT COUNT(CASE WHEN status='FILLED' THEN 1 END)::float / NULLIF(COUNT(*), 0) as fill_rate,
+             COUNT(*) as total
+      FROM "CopyTrade" WHERE "executionMethod" = 'FAK'
+    `);
+    const row = res.rows[0];
+    if (row && parseInt(row.total) >= 50 && row.fill_rate != null) {
+      fakFailureRate = 1 - parseFloat(row.fill_rate);
+      console.log(`FAK failure rate: ${(fakFailureRate * 100).toFixed(1)}% (empirical from ${row.total} attempts) + ${BUY_FAILURE_COOLDOWN_SEC}s cooldown`);
+    } else {
+      console.log(`FAK failure rate: insufficient data, using ${(FALLBACK_FAK_FAILURE_RATE * 100)}% fallback`);
+    }
+  } catch {
+    console.log(`FAK failure rate: query failed, using ${(FALLBACK_FAK_FAILURE_RATE * 100)}% fallback`);
+  }
+}
+
 // ─── Main ───
 async function main() {
   const db = new Client({
@@ -298,10 +457,18 @@ async function main() {
     password: DB_PASSWORD, database: 'polymarket_copytrade',
   });
   await db.connect();
-  console.log('Connected to Hetzner DB via SSH tunnel\n');
+  console.log('Connected to Hetzner DB via SSH tunnel');
+
+  const flags: string[] = [];
+  if (EXCLUDE_SLUGS.length > 0) flags.push(`slugExclude=[${EXCLUDE_SLUGS.join(',')}]`);
+  if (USE_CAPITAL_LOCKUP) flags.push('capitalLockup=ON'); else flags.push('capitalLockup=OFF');
+  if (USE_EMPIRICAL_SLIPPAGE) flags.push('empiricalSlippage=ON'); else flags.push('empiricalSlippage=OFF');
+  console.log(`Config: ${flags.join(' ')}`);
+
+  await calibrateFromProduction(db);
+  console.log('');
 
   for (const input of traderInputs) {
-    // Resolve trader: wallet (0x...) or userName
     let wallet: string;
     let userName: string;
     if (input.startsWith('0x')) {
@@ -315,12 +482,11 @@ async function main() {
       userName = res.rows[0].userName;
     }
 
-    // Fetch individual trades with market resolution data
     const tradeResult = await db.query(`
       SELECT t."conditionId", t.outcome, t."outcomeIndex",
              t.price, t.size, t.timestamp, t.side,
              t."eventSlug",
-             m."outcomePrices", m.outcomes
+             m."outcomePrices", m.outcomes, m."endDate"
       FROM "Trade" t
       JOIN "Market" m ON t."conditionId" = m."conditionId"
       WHERE t."proxyWallet" = $1 AND m.closed = true
@@ -337,9 +503,12 @@ async function main() {
       eventSlug: r.eventSlug || '',
       outcomePrices: r.outcomePrices || '[]',
       outcomes: r.outcomes || '[]',
+      endDate: r.endDate ? Math.floor(new Date(r.endDate).getTime() / 1000) : null,
     }));
 
-    // Category breakdown
+    // Sort once — simulateCopy will use trades in-order
+    trades.sort((a, b) => a.timestamp - b.timestamp);
+
     const buyTrades = trades.filter(t => t.side === 'BUY');
     const cats = new Map<string, number>();
     for (const t of buyTrades) { const c = categorize(t.eventSlug); cats.set(c, (cats.get(c) ?? 0) + 1); }
@@ -349,7 +518,6 @@ async function main() {
     console.log(`${userName} (${wallet.slice(0, 14)}...) — ${trades.length} trades (${buyTrades.length} buys, ${trades.length - buyTrades.length} sells) | ${catStr}`);
     console.log(`${'='.repeat(140)}\n`);
 
-    // Sweep all configs
     const configs = generateConfigs(BASE_SEED);
     console.log(`Sweeping ${configs.length} configs...`);
     const startMs = Date.now();
@@ -363,7 +531,6 @@ async function main() {
     const profitable = results.filter(r => r.score > 0);
     console.log(`  Done in ${elapsed}s — ${profitable.length}/${configs.length} profitable (>= ${MIN_BUYS_FOR_RANKING} buys)\n`);
 
-    // Rank by score, deduplicate configs with identical results
     profitable.sort((a, b) => b.score - a.score);
     const seen = new Set<string>();
     const deduped: SimResult[] = [];
@@ -376,7 +543,6 @@ async function main() {
 
     console.log(`  Unique result profiles: ${deduped.length} (from ${profitable.length} profitable configs)\n`);
 
-    // Print top N
     const subheader =
       `${pad('', 5)}${rpad('minBuy', 7)}${rpad('Gate$', 6)}${rpad('MaxTr', 7)}${rpad('MaxPrd', 7)}${rpad('Copy%', 6)}  ` +
       `${rpad('PnL$', 8)}${rpad('Depld$', 8)}${rpad('ROI%', 7)}${rpad('HldWR%', 7)}${rpad('Buys', 6)}` +
@@ -421,7 +587,7 @@ async function main() {
       }
     }
 
-    // Summary: which parameters matter most?
+    // Parameter sensitivity
     console.log(`  Parameter Sensitivity (avg PnL by parameter value, profitable configs only):\n`);
     for (const [param, values] of Object.entries(SWEEP)) {
       const row = values.map((v: number) => {
