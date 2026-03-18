@@ -19,6 +19,21 @@ pub struct Config {
 
     // Wallets to watch (lowercase, 0x-prefixed)
     pub watched_wallets: HashSet<String>,
+
+    // CLOB API
+    pub clob_base_url: String,
+    pub private_key: Option<String>,       // hex 0x-prefixed
+    pub funder_address: Option<String>,    // 0x-prefixed, may differ from signer for POLY_PROXY
+    pub clob_api_key: Option<String>,
+    pub clob_api_secret: Option<String>,   // base64-encoded
+    pub clob_passphrase: Option<String>,
+    pub signature_type: u8,                // 0=EOA, 1=POLY_PROXY
+
+    // Order execution
+    pub gtc_fallback_enabled: bool,
+    pub gtc_fallback_rest_ms: u64,
+    pub slippage_upside_fraction: f64,
+    pub slippage_min_absolute: f64,
 }
 
 impl Config {
@@ -58,6 +73,36 @@ impl Config {
             tracing::warn!("WATCHED_WALLETS is empty — no wallets will be monitored");
         }
 
+        // CLOB API config
+        let clob_base_url = std::env::var("CLOB_BASE_URL")
+            .unwrap_or_else(|_| "https://clob.polymarket.com".to_string());
+        let private_key = std::env::var("PRIVATE_KEY").ok();
+        let funder_address = std::env::var("FUNDER_ADDRESS").ok();
+        let clob_api_key = std::env::var("CLOB_API_KEY").ok();
+        let clob_api_secret = std::env::var("CLOB_API_SECRET").ok();
+        let clob_passphrase = std::env::var("CLOB_PASSPHRASE").ok();
+        let signature_type: u8 = std::env::var("SIGNATURE_TYPE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1); // POLY_PROXY
+
+        let gtc_fallback_enabled = std::env::var("GTC_FALLBACK_ENABLED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(true);
+        let gtc_fallback_rest_ms = std::env::var("GTC_FALLBACK_REST_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000);
+        let slippage_upside_fraction = std::env::var("SLIPPAGE_UPSIDE_FRACTION")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.05);
+        let slippage_min_absolute = std::env::var("SLIPPAGE_MIN_ABSOLUTE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.01);
+
         Ok(Config {
             polygon_ws_rpc_url,
             polygon_http_rpc_url,
@@ -69,6 +114,17 @@ impl Config {
             chain_stale_ms,
             chain_event_stale_ms,
             watched_wallets,
+            clob_base_url,
+            private_key,
+            funder_address,
+            clob_api_key,
+            clob_api_secret,
+            clob_passphrase,
+            signature_type,
+            gtc_fallback_enabled,
+            gtc_fallback_rest_ms,
+            slippage_upside_fraction,
+            slippage_min_absolute,
         })
     }
 

@@ -1,3 +1,4 @@
+mod clob;
 mod config;
 mod filter;
 mod state;
