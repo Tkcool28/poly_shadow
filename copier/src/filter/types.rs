@@ -101,6 +101,27 @@ impl FilterConfig {
     }
 }
 
+impl TradeSignal {
+    /// Construct a TradeSignal from a decoded WSS trade + resolved conditionId.
+    pub fn from_decoded(
+        trade: &crate::wss::DecodedTrade,
+        condition_id: Option<String>,
+    ) -> Self {
+        Self {
+            proxy_wallet: trade.proxy_wallet.clone(),
+            token_id: trade.token_id.clone(),
+            condition_id,
+            side: trade.side,
+            size: trade.size,
+            price: trade.price,
+            usd: trade.size * trade.price,
+            is_neg_risk: trade.is_neg_risk,
+            is_maker: trade.is_maker,
+            detected_at_ms: chrono::Utc::now().timestamp_millis() as u64,
+        }
+    }
+}
+
 fn parse_env<T: std::str::FromStr>(key: &str, default: T) -> T {
     std::env::var(key)
         .ok()

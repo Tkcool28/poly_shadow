@@ -1,7 +1,4 @@
-// Phase 4 filter chain — wired into main loop in Phase 5+ (CLOB client, IPC).
-#[allow(dead_code)]
 pub mod types;
-#[allow(dead_code)]
 pub mod chain;
 
 use std::sync::atomic::AtomicBool;
@@ -17,8 +14,9 @@ use crate::state::{
 };
 
 /// Shared state accessible by the filter chain.
-/// All fields are Arc for sharing between the main loop and IPC tasks (Phase 6).
-#[allow(dead_code)]
+/// All fields are Arc for sharing between the main loop, IPC tasks, and GTC fallback.
+/// Clone is cheap — just Arc ref count bumps.
+#[derive(Clone)]
 pub struct SharedState {
     pub allocations: Arc<AllocationStore>,
     pub positions: Arc<PositionTracker>,

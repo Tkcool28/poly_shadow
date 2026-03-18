@@ -10,6 +10,7 @@ pub struct MarketMeta {
     pub event_slug: Option<String>,
     pub question: Option<String>,       // Market title/question
     pub tokens: Vec<String>,            // All token IDs in this condition (usually 2)
+    pub tick_size: String,              // "0.01", "0.001", "0.0001", "0.1"
     pub fetched_at: Instant,
 }
 
@@ -126,6 +127,14 @@ impl MarketCache {
             .retain(|_, cid| self.by_condition.contains_key(cid.as_str()));
     }
 
+    /// Get tick_size for a token (reverse lookup through condition).
+    pub fn tick_size_for_token(&self, token_id: &str) -> Option<String> {
+        let cid = self.token_to_condition.get(token_id)?;
+        self.by_condition
+            .get(cid.value())
+            .map(|e| e.tick_size.clone())
+    }
+
     pub fn count(&self) -> usize {
         self.by_condition.len()
     }
@@ -142,8 +151,23 @@ mod tests {
             event_slug: Some("test-slug".to_string()),
             question: Some("Will X happen?".to_string()),
             tokens: tokens.into_iter().map(String::from).collect(),
+            tick_size: "0.01".to_string(),
             fetched_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn test_tick_size_for_token() {
+        let cache = MarketCache::new();
+        let mut meta = make_meta(vec!["tokenA", "tokenB"]);
+        meta.tick_size = "0.001".to_string();
+        cache.upsert("cond1", meta);
+
+        assert_eq!(
+            cache.tick_size_for_token("tokenA"),
+            Some("0.001".to_string())
+        );
+        assert_eq!(cache.tick_size_for_token("tokenC"), None);
     }
 
     #[test]

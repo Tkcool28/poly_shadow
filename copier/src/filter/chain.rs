@@ -488,6 +488,7 @@ mod tests {
                 event_slug: Some("will-x-happen".into()),
                 question: Some("Will X happen?".into()),
                 tokens: vec!["tokenA".into(), "tokenB".into()],
+                tick_size: "0.01".into(),
                 fetched_at: Instant::now(),
             },
         );
@@ -583,6 +584,7 @@ mod tests {
                 event_slug: Some("btc-updown-5m-round1".into()),
                 question: Some("BTC up?".into()),
                 tokens: vec!["tokenA".into(), "tokenB".into()],
+                tick_size: "0.01".into(),
                 fetched_at: Instant::now(),
             },
         );

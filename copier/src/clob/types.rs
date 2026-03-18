@@ -75,6 +75,16 @@ pub enum ExecutionMethod {
     Paper,
 }
 
+impl ExecutionMethod {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fak => "FAK",
+            Self::Gtc => "GTC",
+            Self::Paper => "PAPER",
+        }
+    }
+}
+
 // ─── Rounding ───
 
 /// Returns (price_decimals, size_decimals, amount_decimals) for a given tick size.
