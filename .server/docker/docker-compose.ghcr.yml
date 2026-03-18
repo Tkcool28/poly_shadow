@@ -55,7 +55,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 1536M
 
   # ===========================================================================
   # Database Migrations (one-shot)
@@ -127,7 +127,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 2G
+          memory: 1536M
 
   # ===========================================================================
   # Scheduled Workers (sleep-loop replicating PM2 cron_restart)
@@ -164,7 +164,7 @@ services:
     command:
       - |
         while true; do
-          node --max-old-space-size=1024 --import tsx src/jobs/score-calculator.ts
+          node --max-old-space-size=1280 --import tsx src/jobs/score-calculator.ts
           EXIT_CODE=$$?
           if [ $$EXIT_CODE -ne 0 ]; then
             echo "score-calculator failed (exit $$EXIT_CODE), retrying in 5m..."
@@ -178,7 +178,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1280M
+          memory: 1536M
 
   # ===========================================================================
   # Optional Workers (activate via --profile arb / --profile scalp)
