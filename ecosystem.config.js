@@ -60,6 +60,18 @@ module.exports = {
       },
     },
     {
+      name: 'ipc-bridge',
+      script: './node_modules/.bin/tsx',
+      args: 'src/jobs/ipc-bridge.ts',
+      autorestart: true,
+      watch: false,
+      max_restarts: 50,
+      exp_backoff_restart_delay: 1000,
+      env: {
+        NODE_ENV: 'production',
+      },
+    },
+    {
       name: 'arb-worker',
       script: './node_modules/.bin/tsx',
       args: 'src/jobs/arb-worker.ts',

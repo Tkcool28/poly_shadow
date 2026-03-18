@@ -330,24 +330,38 @@ async function main() {
     const profitable = results.filter(r => r.score > 0);
     console.log(`  Done in ${elapsed}s — ${profitable.length}/${configs.length} profitable (>= ${MIN_BUYS_FOR_RANKING} buys)\n`);
 
-    // Rank by score
+    // Rank by score, deduplicate configs with identical results
     profitable.sort((a, b) => b.score - a.score);
+    const seen = new Set<string>();
+    const deduped: SimResult[] = [];
+    for (const r of profitable) {
+      const key = `${r.copyPnl.toFixed(2)}_${r.copyBuys}_${r.holdWr.toFixed(1)}_${r.maxDdPct.toFixed(1)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(r);
+    }
+
+    console.log(`  Unique result profiles: ${deduped.length} (from ${profitable.length} profitable configs)\n`);
 
     // Print top N
     const header =
-      `${pad('Rank', 5)}${rpad('minBuy', 7)}${rpad('Gate$', 6)}${rpad('MaxTr', 6)}${rpad('MaxPr', 6)}${rpad('Copy%', 6)}` +
-      `${rpad('CpPnL$', 9)}${rpad('CpROI%', 8)}${rpad('HldWR%', 7)}${rpad('Buys', 6)}` +
+      `${pad('Rank', 5)}` +
+      `${pad('── Config ──', 38)}` +
+      `${pad('── Results ──', 60)}`;
+    const subheader =
+      `${pad('', 5)}${rpad('minBuy', 7)}${rpad('Gate$', 6)}${rpad('MaxTr', 7)}${rpad('MaxPrd', 7)}${rpad('Copy%', 6)}  ` +
+      `${rpad('PnL$', 8)}${rpad('Depld$', 8)}${rpad('ROI%', 7)}${rpad('HldWR%', 7)}${rpad('Buys', 6)}` +
       `${rpad('MaxDD%', 8)}${rpad('Sharpe', 8)}${rpad('DayWR%', 7)}${rpad('Score', 8)}`;
-    console.log(header);
-    console.log('-'.repeat(header.length));
+    console.log(subheader);
+    console.log('-'.repeat(subheader.length));
 
-    for (let i = 0; i < Math.min(profitable.length, TOP_N); i++) {
-      const r = profitable[i];
+    for (let i = 0; i < Math.min(deduped.length, TOP_N); i++) {
+      const r = deduped[i];
       const c = r.config;
       console.log(
         `${pad(String(i + 1), 5)}` +
-        `${rpad(c.minBuyPrice.toFixed(2), 7)}${rpad(String(c.gate), 6)}${rpad(String(c.maxTrade), 6)}${rpad(String(c.maxPred), 6)}${rpad((c.copyPercent * 100).toFixed(0) + '%', 6)}` +
-        `${rpad('$' + r.copyPnl.toFixed(0), 9)}${rpad(r.copyRoi.toFixed(1), 8)}${rpad(r.holdWr.toFixed(1), 7)}${rpad(String(r.copyBuys), 6)}` +
+        `${rpad(c.minBuyPrice.toFixed(2), 7)}${rpad('$' + c.gate, 6)}${rpad('$' + c.maxTrade, 7)}${rpad('$' + c.maxPred, 7)}${rpad((c.copyPercent * 100).toFixed(0) + '%', 6)}  ` +
+        `${rpad('$' + r.copyPnl.toFixed(0), 8)}${rpad('$' + r.totalDeployed.toFixed(0), 8)}${rpad(r.copyRoi.toFixed(1), 7)}${rpad(r.holdWr.toFixed(1), 7)}${rpad(String(r.copyBuys), 6)}` +
         `${rpad(r.maxDdPct.toFixed(1), 8)}${rpad(r.sharpe.toFixed(2), 8)}${rpad(r.dayWr.toFixed(0), 7)}${rpad(r.score.toFixed(2), 8)}`
       );
     }

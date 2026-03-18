@@ -38,7 +38,6 @@ import { recordTraderBuy, getMajoritySide, pruneAccumulator, seedAccumulator, cl
 const JOB_NAME = 'copy-trader';
 const log = createJobLogger(JOB_NAME);
 const CAPITAL_AUDIT_INTERVAL_MS = 3_600_000; // 1 hour
-const MARKET_REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 min
 
 // ─── Pipeline infrastructure (Change 5) ───
 
