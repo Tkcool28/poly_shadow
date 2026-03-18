@@ -238,17 +238,13 @@ impl MetadataResolver {
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
             .map(|dt| dt.timestamp());
 
-        // Extract token IDs
+        // Extract token IDs — Gamma API uses "clobTokenIds" (array of strings)
         let tokens: Vec<String> = market
-            .get("tokens")
+            .get("clobTokenIds")
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|t| {
-                        t.get("token_id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                    })
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect()
             })
             .unwrap_or_default();
