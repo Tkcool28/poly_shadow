@@ -110,7 +110,12 @@ impl MetadataResolver {
             .await
             .unwrap_or_else(|| "0.01".to_string());
 
-        let meta = if let Some((event_slug, question, end_date, tokens)) = gamma {
+        let meta = if let Some((event_slug, question, end_date, mut tokens)) = gamma {
+            // Always ensure the current tokenId is in the tokens list
+            // (Gamma may return empty clobTokenIds for some markets)
+            if !tokens.contains(&token_id.to_string()) {
+                tokens.push(token_id.to_string());
+            }
             MarketMeta {
                 closed: false,
                 end_date,
