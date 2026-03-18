@@ -111,6 +111,9 @@ services:
     container_name: polymarket_trade_monitor
     command: ["src/jobs/trade-monitor.ts"]
     stop_grace_period: 30s
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: --max-old-space-size=384
     deploy:
       resources:
         limits:
