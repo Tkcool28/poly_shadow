@@ -396,12 +396,65 @@ async function handleCopyTradeResult(msg: CopyTradeResultMsg): Promise<void> {
   }
 
   if (!dtId) {
-    log.warn('DetectedTrade not found for copy_trade_result, skipping', {
-      tx: msg.detected_trade_id,
-      status: msg.status,
-      alloc: msg.allocation_id,
-    });
-    return;
+    // Race: CopyTradeResult arrived before TradeDetected was persisted.
+    // Create synthetic DetectedTrade so the fill isn't lost.
+    if (!msg.proxy_wallet || !msg.detected_trade_id) {
+      log.warn('DetectedTrade not found and insufficient data to self-heal', {
+        tx: msg.detected_trade_id,
+        status: msg.status,
+        alloc: msg.allocation_id,
+      });
+      return;
+    }
+    try {
+      const created = await prisma.detectedTrade.create({
+        data: {
+          proxyWallet: msg.proxy_wallet,
+          side: msg.side,
+          conditionId: msg.condition_id ?? '',
+          asset: msg.token_id,
+          size: msg.requested_amount,
+          price: msg.requested_price,
+          outcome: '',
+          transactionHash: msg.detected_trade_id,
+          timestamp: Math.floor(Date.now() / 1000),
+          detectedAt: new Date(),
+          detectionSource: 'IPC_BACKFILL',
+          title: null,
+          eventSlug: null,
+        },
+      });
+      dtId = created.id;
+      log.info('Created synthetic DetectedTrade for orphaned copy_trade_result', {
+        dtId,
+        tx: msg.detected_trade_id,
+        alloc: msg.allocation_id,
+      });
+    } catch (createErr: any) {
+      if (createErr.code === 'P2002') {
+        // Unique constraint = original just arrived via TradeDetected handler. One more lookup.
+        const dt = await prisma.detectedTrade.findFirst({
+          where: { transactionHash: msg.detected_trade_id!, asset: msg.token_id },
+          select: { id: true },
+        });
+        if (dt) {
+          dtId = dt.id;
+        } else {
+          log.error('DetectedTrade P2002 but findFirst still null', {
+            tx: msg.detected_trade_id,
+            alloc: msg.allocation_id,
+          });
+          return;
+        }
+      } else {
+        log.error('DetectedTrade self-heal create failed', {
+          tx: msg.detected_trade_id,
+          alloc: msg.allocation_id,
+          error: createErr.message,
+        });
+        return;
+      }
+    }
   }
 
   // Map PAPER → null (Prisma enum only has FAK|GTC|POOL)
@@ -558,6 +611,8 @@ interface CopyTradeResultMsg {
   type: 'copy_trade_result';
   detected_trade_id: string | null;
   allocation_id: string;
+  proxy_wallet?: string;
+  condition_id?: string | null;
   token_id: string;
   side: string;
   status: string;

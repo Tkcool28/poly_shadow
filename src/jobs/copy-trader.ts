@@ -23,7 +23,7 @@ import type { DetectedTradeRow } from '../services/copy-trade-worker';
 import { addToPool } from '../services/order-pool';
 import { startPortfolioRefresh, stopPortfolioRefresh } from '../services/portfolio-cache';
 import { rehydratePool, sweepPool } from '../services/order-pool';
-import { sweepPositionSettlements, sweepUnclaimedSettledPositions, sweepStaleMarkets } from '../services/position-settlement';
+// Settlement + market refresh sweeps moved to ipc-bridge.ts
 import { reconcileStalePending, reconcileSkippedGhostFills } from '../services/clob-reconciler';
 import { sweepPreResolutionSells } from '../services/pre-resolution-seller';
 import { resolveMarkets } from '../services/market-resolver';
@@ -1114,14 +1114,7 @@ async function main() {
     }
   }
 
-  // Start IPC bridge for Rust copier (must be before portfolio cache so Rust can connect early)
-  try {
-    const { startBridge } = await import('../services/unix-socket-bridge.js');
-    startBridge();
-    log.info('IPC bridge started for Rust copier');
-  } catch (err: any) {
-    log.warn(`IPC bridge start failed (non-fatal): ${err.message}`);
-  }
+  // IPC bridge moved to standalone ipc-bridge.ts process (runs as separate container)
 
   // Start portfolio value cache
   try {
@@ -1509,14 +1502,7 @@ async function main() {
   // ─── Independent housekeeping timers ───
   // These run on their own schedules, never blocking trade processing.
 
-  const settlementTimer = setInterval(async () => {
-    if (shuttingDown || isShuttingDown()) return;
-    try {
-      await sweepPositionSettlements();
-    } catch (err: any) {
-      log.warn(`Settlement sweep failed: ${err.message}`);
-    }
-  }, config.SETTLEMENT_SWEEP_INTERVAL_MS);
+  // Settlement sweeps moved to standalone ipc-bridge.ts process
 
   const balanceTimer = isLiveReady() ? setInterval(async () => {
     if (shuttingDown || isShuttingDown()) return;
@@ -1594,8 +1580,7 @@ async function main() {
         }
       }
 
-      // Sweep unclaimed settled positions (retry claims that failed or accumulated)
-      await sweepUnclaimedSettledPositions();
+      // Unclaimed settled position sweeps moved to ipc-bridge.ts
 
       // Recover SKIPPED FAK ghost fills (catches any that slipped past inline verification)
       await reconcileSkippedGhostFills();
@@ -1613,23 +1598,11 @@ async function main() {
     }
   }, config.SETTLEMENT_SWEEP_INTERVAL_MS);
 
-  const marketRefreshTimer = setInterval(async () => {
-    if (shuttingDown || isShuttingDown()) return;
-    try {
-      await sweepStaleMarkets();
-    } catch (err: any) {
-      log.warn(`Market refresh sweep failed: ${err.message}`);
-    }
-  }, MARKET_REFRESH_INTERVAL_MS);
+  // Market refresh sweeps moved to ipc-bridge.ts
 
-  // Fire housekeeping once on startup (matches old behavior where lastX=0 triggered first cycle)
-  // Chain unclaimed sweep after settlement to avoid overlap via shared sweepRunning guard
-  sweepPositionSettlements()
-    .then(() => sweepUnclaimedSettledPositions())
-    .catch((err: any) => log.warn(`Settlement/claim sweep failed: ${err.message}`));
+  // Fire housekeeping once on startup
   auditAllAllocations({ isPaper: false, threshold: 1.0 }).catch((err: any) => log.warn(`Capital audit failed: ${err.message}`));
   sweepPreResolutionSells().catch((err: any) => log.warn(`Pre-resolution sweep failed: ${err.message}`));
-  sweepStaleMarkets().catch((err: any) => log.warn(`Market refresh sweep failed: ${err.message}`));
 
   // ─── Upgrade shutdown handler: now all resources exist ───
   process.removeAllListeners('SIGTERM');
@@ -1639,11 +1612,9 @@ async function main() {
     shuttingDown = true;
     log.info(`Received ${signal}, shutting down...`);
     clearInterval(fallbackTimer);
-    clearInterval(settlementTimer);
     if (balanceTimer) clearInterval(balanceTimer);
     clearInterval(capitalAuditTimer);
     clearInterval(preResTimer);
-    clearInterval(marketRefreshTimer);
     stopPortfolioRefresh();
     await listener.close();
     // Wait for in-flight drain to complete before disconnecting DB
@@ -1658,8 +1629,6 @@ async function main() {
       });
     }
     closeMidpointCache();
-    // Close IPC bridge (if started)
-    try { const { closeBridge } = await import('../services/unix-socket-bridge.js'); closeBridge(); } catch {}
     await prisma.$disconnect();
     process.exit(0);
   };

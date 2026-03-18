@@ -366,6 +366,8 @@ async fn main() -> anyhow::Result<()> {
                         let ipc_msg = OutboundMessage::CopyTradeResult {
                             detected_trade_id: Some(trade.transaction_hash.clone()),
                             allocation_id: alloc.id.clone(),
+                            proxy_wallet: trade.proxy_wallet.clone(),
+                            condition_id: condition_id.clone(),
                             token_id: params.token_id.clone(),
                             side: messages::side_to_string(params.side),
                             status: "FILLED".into(),
@@ -421,6 +423,9 @@ async fn main() -> anyhow::Result<()> {
                                         is_paper: alloc.is_paper,
                                         rest_ms: cfg.gtc_fallback_rest_ms,
                                         alloc_mutex: alloc_mutex.clone(),
+                                        proxy_wallet: trade.proxy_wallet.clone(),
+                                        transaction_hash: trade.transaction_hash.clone(),
+                                        condition_id: condition_id.clone(),
                                     },
                                     shared_state.capital.clone(),
                                     shared_state.positions.clone(),

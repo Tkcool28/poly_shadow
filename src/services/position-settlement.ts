@@ -126,6 +126,35 @@ async function doSweepPositionSettlements(): Promise<void> {
     );
   }
 
+  // Build tokenId→outcome map from Gamma API data (for Rust-originated trades with empty outcome)
+  const tokenOutcomeMap = new Map<string, string>();
+  for (const market of freshMarkets) {
+    const raw = market as Record<string, unknown>;
+    let tokenIds: string[] = [];
+    if (typeof raw.clobTokenIds === 'string') {
+      try { tokenIds = JSON.parse(raw.clobTokenIds as string); } catch {}
+    } else if (Array.isArray(raw.clobTokenIds)) {
+      tokenIds = (raw.clobTokenIds as unknown[]).filter((v): v is string => typeof v === 'string');
+    }
+    if (tokenIds.length === 0) continue;
+    try {
+      const outcomes: string[] = JSON.parse(market.outcomes);
+      for (let i = 0; i < Math.min(tokenIds.length, outcomes.length); i++) {
+        tokenOutcomeMap.set(tokenIds[i], outcomes[i]);
+      }
+    } catch { /* skip parse failures */ }
+  }
+
+  // Patch empty outcomes in tokenMeta using the Gamma token mapping
+  for (const [tokenId, meta] of tokenMeta.entries()) {
+    if (meta.outcome && meta.outcome.trim() !== '') continue;
+    const resolved = tokenOutcomeMap.get(tokenId);
+    if (resolved) {
+      tokenMeta.set(tokenId, { ...meta, outcome: resolved });
+      log.info('Patched empty outcome from Gamma', { tokenId: tokenId.slice(0, 20), outcome: resolved });
+    }
+  }
+
   // Build resolved market map: conditionId → market data
   const resolvedMarkets = new Map<string, { outcomes: string; outcomePrices: string }>();
   for (const market of freshMarkets) {
@@ -289,14 +318,23 @@ async function doSweepPositionSettlements(): Promise<void> {
     // Normalize before comparing — API outcome strings sometimes differ in apostrophes/quotes
     // e.g. DB: "Anyones Legend" vs API: "Anyone's Legend" → both normalize to "anyones legend"
     const normalizedOutcome = normalizeOutcome(meta.outcome);
-    const outcomeIndex = outcomes.findIndex(o => normalizeOutcome(o) === normalizedOutcome);
+    let outcomeIndex = outcomes.findIndex(o => normalizeOutcome(o) === normalizedOutcome);
+
+    // Fallback: resolve from tokenId→outcome map (handles Rust IPC trades with outcome="")
     if (outcomeIndex < 0 || outcomeIndex >= outcomePrices.length) {
-      log.warn('Settlement: outcome not found in market', {
-        outcome: meta.outcome,
-        outcomes,
-        tokenId: pos.tokenId,
-      });
-      continue;
+      const fallbackOutcome = tokenOutcomeMap.get(pos.tokenId);
+      if (fallbackOutcome) {
+        outcomeIndex = outcomes.findIndex(o => normalizeOutcome(o) === normalizeOutcome(fallbackOutcome));
+      }
+      if (outcomeIndex < 0 || outcomeIndex >= outcomePrices.length) {
+        log.warn('Settlement: outcome not found in market', {
+          outcome: meta.outcome,
+          fallbackOutcome: fallbackOutcome ?? 'none',
+          outcomes,
+          tokenId: pos.tokenId,
+        });
+        continue;
+      }
     }
 
     const settlementPrice = outcomePrices[outcomeIndex];

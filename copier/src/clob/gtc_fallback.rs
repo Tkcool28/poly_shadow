@@ -17,12 +17,15 @@ pub struct GtcFallbackParams {
     pub token_id: String,
     pub side: TradeSide,
     pub amount_usd: f64,
-    pub price: f64,     // signal price (GTC rests at fair value, no slippage)
+    pub price: f64, // signal price (GTC rests at fair value, no slippage)
     pub is_neg_risk: bool,
     pub tick_size: String,
     pub is_paper: bool,
     pub rest_ms: u64,
     pub alloc_mutex: Arc<Mutex<()>>,
+    pub proxy_wallet: String,
+    pub transaction_hash: String,
+    pub condition_id: Option<String>,
 }
 
 /// Spawn a fire-and-forget GTC fallback task.
@@ -202,8 +205,10 @@ fn send_result(
     order_id: Option<&str>,
 ) {
     let _ = ipc_tx.try_send(OutboundMessage::CopyTradeResult {
-        detected_trade_id: None,
+        detected_trade_id: Some(params.transaction_hash.clone()),
         allocation_id: params.alloc_id.clone(),
+        proxy_wallet: params.proxy_wallet.clone(),
+        condition_id: params.condition_id.clone(),
         token_id: params.token_id.clone(),
         side: messages::side_to_string(params.side),
         status: status.to_string(),

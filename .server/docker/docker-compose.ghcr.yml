@@ -83,14 +83,28 @@ services:
     environment:
       NODE_ENV: production
       NODE_OPTIONS: --max-old-space-size=820
-      IPC_SOCKET_PATH: /var/run/copier/copier.sock
-    volumes:
-      - polymarket_logs:/app/logs
-      - copier_ipc:/var/run/copier
     deploy:
       resources:
         limits:
           memory: 1024M
+
+  ipc-bridge:
+    <<: *worker-base
+    container_name: polymarket_ipc_bridge
+    command: ["src/jobs/ipc-bridge.ts"]
+    stop_grace_period: 15s
+    environment:
+      NODE_ENV: production
+      IPC_SOCKET_PATH: /var/run/copier/copier.sock
+    volumes:
+      - polymarket_logs:/app/logs
+      - copier_ipc:/var/run/copier
+    profiles:
+      - copier
+    deploy:
+      resources:
+        limits:
+          memory: 512M
 
   trade-monitor:
     <<: *worker-base
@@ -214,6 +228,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      ipc-bridge:
+        condition: service_started
     stop_grace_period: 10s
     profiles:
       - copier

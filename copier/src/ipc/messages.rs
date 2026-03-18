@@ -25,6 +25,8 @@ pub enum OutboundMessage {
     CopyTradeResult {
         detected_trade_id: Option<String>,
         allocation_id: String,
+        proxy_wallet: String,
+        condition_id: Option<String>,
         token_id: String,
         side: String,
         status: String, // "FILLED", "FAILED", "SKIPPED"
@@ -291,6 +293,8 @@ mod tests {
         let msg = OutboundMessage::CopyTradeResult {
             detected_trade_id: Some("dt_123".into()),
             allocation_id: "alloc1".into(),
+            proxy_wallet: "0xabc".into(),
+            condition_id: Some("cond1".into()),
             token_id: "token123".into(),
             side: "BUY".into(),
             status: "FILLED".into(),

@@ -262,7 +262,7 @@ jobs:
             docker compose -f docker-compose.ghcr.yml stop --timeout 45 "$worker" 2>/dev/null || true
             docker compose -f docker-compose.ghcr.yml rm -f "$worker" 2>/dev/null || true
           done
-          for worker in arb-worker scalp-worker copier; do
+          for worker in arb-worker scalp-worker copier ipc-bridge; do
             docker compose -f docker-compose.ghcr.yml ${{ steps.profiles.outputs.flags }} stop --timeout 45 "$worker" 2>/dev/null || true
             docker compose -f docker-compose.ghcr.yml ${{ steps.profiles.outputs.flags }} rm -f "$worker" 2>/dev/null || true
           done
@@ -285,7 +285,7 @@ jobs:
             docker compose -f docker-compose.ghcr.yml --profile scalp up -d scalp-worker
           fi
           if echo "$PROFILES" | grep -q "copier"; then
-            docker compose -f docker-compose.ghcr.yml --profile copier up -d copier
+            docker compose -f docker-compose.ghcr.yml --profile copier up -d ipc-bridge copier
           fi
           echo "Workers started"
 
@@ -330,7 +330,7 @@ jobs:
           done
           # Check optional profile workers
           PROFILES="${{ inputs.profiles }}"
-          for worker in arb-worker scalp-worker copier; do
+          for worker in arb-worker scalp-worker copier ipc-bridge; do
             if docker compose -f docker-compose.ghcr.yml ${{ steps.profiles.outputs.flags }} ps "$worker" 2>/dev/null | grep -q "Up"; then
               echo "OK - $worker running"
             fi
