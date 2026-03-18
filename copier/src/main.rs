@@ -28,15 +28,19 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    tracing::info!("polymarket-copier v0.2.0 starting (Phase 6: full pipeline)");
+    tracing::info!("polymarket-copier v0.2.0 starting (Phase 7: paper validation)");
 
     let cfg = config::Config::from_env()?;
     let filter_config = FilterConfig::from_env();
     tracing::info!(
         wss_providers = cfg.wss_provider_count(),
         wallets = cfg.watched_wallets.len(),
+        paper_only = cfg.paper_only,
         "config loaded"
     );
+    if cfg.paper_only {
+        tracing::warn!("PAPER_ONLY=true — all allocations forced to paper mode, no real CLOB orders");
+    }
 
     // ── State initialization ──
     let allocations = Arc::new(state::allocations::AllocationStore::new());
@@ -128,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
         let t0 = std::time::Instant::now();
 
         // 1. Look up allocation
-        let alloc = match shared_state.allocations.get_active_by_wallet(&trade.proxy_wallet) {
+        let mut alloc = match shared_state.allocations.get_active_by_wallet(&trade.proxy_wallet) {
             Some(a) => a,
             None => {
                 tracing::debug!(
@@ -138,6 +142,11 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
         };
+
+        // PAPER_ONLY safety guard: force all allocations to paper mode
+        if cfg.paper_only && !alloc.is_paper {
+            alloc.is_paper = true;
+        }
 
         // 2. Maker fill filter (per-allocation opt-in)
         if trade.is_maker && !alloc.copy_maker_fills {

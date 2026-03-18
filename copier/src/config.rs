@@ -29,6 +29,9 @@ pub struct Config {
     pub clob_passphrase: Option<String>,
     pub signature_type: u8,                // 0=EOA, 1=POLY_PROXY
 
+    // Safety guard — force all allocations to paper mode (no real CLOB orders)
+    pub paper_only: bool,
+
     // Order execution
     pub gtc_fallback_enabled: bool,
     pub gtc_fallback_rest_ms: u64,
@@ -86,6 +89,11 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1); // POLY_PROXY
 
+        let paper_only = std::env::var("PAPER_ONLY")
+            .ok()
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(true); // DEFAULT TRUE — must explicitly set PAPER_ONLY=false for live trading
+
         let gtc_fallback_enabled = std::env::var("GTC_FALLBACK_ENABLED")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -121,6 +129,7 @@ impl Config {
             clob_api_secret,
             clob_passphrase,
             signature_type,
+            paper_only,
             gtc_fallback_enabled,
             gtc_fallback_rest_ms,
             slippage_upside_fraction,
