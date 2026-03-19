@@ -159,7 +159,7 @@ fn apply_seed(msg: InboundMessage, state: &SharedState) -> Result<()> {
 /// Spawn the long-lived IPC task. Owns the outbound receiver.
 /// Accepts Option<UnixStream> — None means seed failed, start in reconnect mode.
 /// On disconnect: reconnects with exponential backoff (5s→30s cap).
-/// Does NOT re-seed on reconnect (state is authoritative in Rust after startup).
+/// Re-seeds on every reconnect to ensure allocations are always loaded.
 pub fn spawn_ipc_task(
     initial_stream: Option<UnixStream>,
     socket_path: String,
@@ -176,7 +176,7 @@ pub fn spawn_ipc_task(
                 Some(s) => s,
                 None => {
                     let mut backoff = Duration::from_secs(5);
-                    loop {
+                    let raw_stream = loop {
                         tokio::time::sleep(backoff).await;
                         match UnixStream::connect(&socket_path).await {
                             Ok(s) => {
@@ -191,6 +191,14 @@ pub fn spawn_ipc_task(
                                 );
                                 backoff = (backoff * 2).min(Duration::from_secs(30));
                             }
+                        }
+                    };
+                    // Re-seed after reconnect — critical for startup race when initial seed failed
+                    match reconnect_and_seed(raw_stream, &state).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "IPC re-seed failed after reconnect, will retry");
+                            continue; // back to reconnect loop
                         }
                     }
                 }
@@ -214,4 +222,32 @@ pub fn spawn_ipc_task(
             // maybe_stream is None, so next iteration enters reconnect loop
         }
     });
+}
+
+/// Send seed_request on an already-connected stream, wait for seed_state, apply it.
+/// Returns the stream (still connected) for reader/writer split.
+async fn reconnect_and_seed(
+    mut stream: UnixStream,
+    state: &SharedState,
+) -> Result<UnixStream> {
+    let req = serde_json::to_string(&OutboundMessage::SeedRequest)?;
+    stream.write_all(format!("{}\n", req).as_bytes()).await?;
+    stream.flush().await?;
+
+    let mut buf_reader = BufReader::new(&mut stream);
+    let mut line = String::new();
+    let seed_timeout = Duration::from_secs(30);
+    match tokio::time::timeout(seed_timeout, buf_reader.read_line(&mut line)).await {
+        Ok(Ok(n)) if n > 0 => {
+            let msg: InboundMessage = serde_json::from_str(line.trim())
+                .map_err(|e| anyhow::anyhow!("re-seed parse error: {}", e))?;
+            apply_seed(msg, state)?;
+            tracing::info!("IPC re-seeded after reconnect");
+        }
+        Ok(Ok(_)) => return Err(anyhow::anyhow!("IPC socket closed during re-seed")),
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Err(anyhow::anyhow!("IPC re-seed timeout (30s)")),
+    }
+
+    Ok(stream)
 }
