@@ -277,7 +277,7 @@ async function queryMajorityData(): Promise<
     timestamp_ms: number;
   }>
 > {
-  const cutoff = new Date(Date.now() - 25 * 60 * 60 * 1000); // 25 hours ago
+  const cutoff = new Date(Date.now() - 4 * 60 * 60 * 1000); // 4h (covers p95 accumulation time with 4.8x margin)
   const rows = await prisma.$queryRaw<
     Array<{
       wallet: string;
@@ -296,6 +296,9 @@ async function queryMajorityData(): Promise<
     FROM "DetectedTrade" dt
     WHERE dt.side = 'BUY'
       AND dt."detectedAt" > ${cutoff}
+      AND dt."proxyWallet" IN (
+        SELECT "proxyWallet" FROM "FollowAllocation" WHERE "isActive" = true
+      )
     GROUP BY dt."proxyWallet", dt."conditionId", dt.outcome
   `;
   return rows.map((r) => ({

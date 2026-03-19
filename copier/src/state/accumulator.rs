@@ -257,14 +257,14 @@ mod tests {
     fn test_prune_stale_entries() {
         let acc = MajorityAccumulator::new();
         let old = 1_700_000_000_000u64;
-        let now = old + 26 * 60 * 60 * 1000; // 26 hours later
+        let now = old + 5 * 60 * 60 * 1000; // 5 hours later
 
         acc.record_buy("0xtrader", "cond1", "Yes", 100.0, old);
         acc.record_buy("0xtrader", "cond1", "No", 50.0, old);
         acc.record_buy("0xtrader", "cond2", "Yes", 100.0, now); // Fresh
 
         assert_eq!(acc.entry_count(), 2);
-        acc.prune(25 * 60 * 60 * 1000, now); // 25h TTL
+        acc.prune(4 * 60 * 60 * 1000, now); // 4h TTL (matches seed window)
         assert_eq!(acc.entry_count(), 1); // cond1 pruned, cond2 kept
     }
 }
