@@ -111,8 +111,8 @@ export async function claimTradersForBackfill(
 }
 
 // Chunk sizes for batched DB writes
-const TRADE_BATCH_CHUNK = 500;
-const UPSERT_BATCH_CHUNK = 200;
+const TRADE_BATCH_CHUNK = 250;
+const UPSERT_BATCH_CHUNK = 100;
 
 /**
  * Backfill full trading history for a single wallet.

@@ -64,7 +64,7 @@ export async function calculateAllScores(): Promise<number> {
     markets.filter(m => m.closed).map(m => m.conditionId),
   );
 
-  // Compute individual metrics for each trader
+  // Compute individual metrics for each trader (two-pass: metrics only, closedPositions re-fetched during upsert)
   const traderScores: Array<{
     proxyWallet: string;
     profitability: ReturnType<typeof computeProfitability>;
@@ -72,7 +72,6 @@ export async function calculateAllScores(): Promise<number> {
     activity: ReturnType<typeof computeActivity>;
     risk: ReturnType<typeof computeRisk>;
     recency: ReturnType<typeof computeRecency>;
-    closedPositions: Array<{ conditionId: string; realizedPnl: number; totalBought: number; timestamp: number }>;
   }> = [];
 
   for (const { proxyWallet } of traders) {
@@ -103,12 +102,13 @@ export async function calculateAllScores(): Promise<number> {
   // Build a map for quick lookup
   const compositeMap = new Map(compositeResults.map(r => [r.proxyWallet, r]));
 
-  // Upsert scores, score history, and category scores
+  // Upsert scores, score history, and category scores (re-fetch closedPositions per trader to avoid accumulating in memory)
   for (const ts of traderScores) {
     const composite = compositeMap.get(ts.proxyWallet);
     if (!composite) continue;
 
-    await upsertScores(ts, composite, markets);
+    const closedPositions = await fetchClosedPositionsForCategory(ts.proxyWallet);
+    await upsertScores(ts, composite, markets, closedPositions);
   }
 
   // Update isMonitored: all COMPLETED traders
@@ -181,15 +181,25 @@ async function computeTraderMetrics(
   const risk = computeRisk(trades);
   const recency = computeRecency(allClosedPositions);
 
-  return { proxyWallet, profitability, consistency, activity, risk, recency, closedPositions: allClosedPositions };
+  return { proxyWallet, profitability, consistency, activity, risk, recency };
+}
+
+async function fetchClosedPositionsForCategory(
+  proxyWallet: string,
+): Promise<Array<{ conditionId: string; realizedPnl: number; totalBought: number }>> {
+  return prisma.closedPosition.findMany({
+    where: { proxyWallet, avgPrice: { lt: config.ARB_FILTER_PRICE } },
+    select: { conditionId: true, realizedPnl: true, totalBought: true },
+  });
 }
 
 async function upsertScores(
   ts: NonNullable<Awaited<ReturnType<typeof computeTraderMetrics>>>,
   composite: { compositeScore: number; rank: number },
   markets: Array<{ conditionId: string; category: string | null }>,
+  closedPositions: Array<{ conditionId: string; realizedPnl: number; totalBought: number }>,
 ) {
-  const { proxyWallet, profitability, consistency, activity, risk, recency, closedPositions } = ts;
+  const { proxyWallet, profitability, consistency, activity, risk, recency } = ts;
 
   // Upsert TraderScore
   await prisma.traderScore.upsert({
