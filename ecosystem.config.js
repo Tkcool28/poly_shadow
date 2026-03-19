@@ -107,5 +107,16 @@ module.exports = {
         NODE_ENV: 'production',
       },
     },
+    {
+      name: 'live-monitor',
+      script: './node_modules/.bin/tsx',
+      args: 'src/scripts/live-monitor.ts',
+      cron_restart: '*/5 * * * *',
+      autorestart: false,
+      watch: false,
+      env: {
+        NODE_ENV: 'production',
+      },
+    },
   ],
 };
