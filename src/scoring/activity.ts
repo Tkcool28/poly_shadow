@@ -51,9 +51,12 @@ export function computeActivity(
   const activeDays = uniqueDays.size;
 
   // Trade frequency: trades per day over the active period
-  const timestamps = trades.map(t => t.timestamp);
-  const firstTrade = Math.min(...timestamps);
-  const lastTrade = Math.max(...timestamps);
+  let firstTrade = Infinity;
+  let lastTrade = -Infinity;
+  for (const t of trades) {
+    if (t.timestamp < firstTrade) firstTrade = t.timestamp;
+    if (t.timestamp > lastTrade) lastTrade = t.timestamp;
+  }
   const daySpan = Math.max(1, (lastTrade - firstTrade) / 86400);
   const tradeFrequency = totalTrades / daySpan;
 

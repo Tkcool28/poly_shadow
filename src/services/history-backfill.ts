@@ -426,7 +426,7 @@ export async function backfillTrader(
 
     // 9. Mark backfill as completed
     const latestTradeTs = trades.length > 0
-      ? new Date(Math.max(...trades.map((t) => t.timestamp)) * 1000)
+      ? new Date(trades.reduce((max, t) => (t.timestamp > max ? t.timestamp : max), -Infinity) * 1000)
       : null;
 
     await prisma.trader.update({

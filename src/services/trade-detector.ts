@@ -514,7 +514,7 @@ async function checkTraderForNewTrades(
   // If lastSync is null (first monitor run), initialize to now and skip.
   // This avoids flooding DetectedTrade with the trader's entire history.
   if (!lastSync) {
-    const maxTimestamp = Math.max(...recentTrades.map(t => t.timestamp));
+    const maxTimestamp = recentTrades.reduce((max, t) => (t.timestamp > max ? t.timestamp : max), -Infinity);
     await prisma.trader.update({
       where: { proxyWallet },
       data: { lastTradeSync: new Date(maxTimestamp * 1000) },
@@ -598,7 +598,7 @@ async function checkTraderForNewTrades(
   }
 
   // Update lastTradeSync to the most recent trade timestamp
-  const maxTimestamp = Math.max(...newTrades.map(t => t.timestamp));
+  const maxTimestamp = newTrades.reduce((max, t) => (t.timestamp > max ? t.timestamp : max), -Infinity);
   await prisma.trader.update({
     where: { proxyWallet },
     data: { lastTradeSync: new Date(maxTimestamp * 1000) },
