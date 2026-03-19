@@ -105,7 +105,7 @@ async function main() {
 
   console.log(`\nConfig from prod DB allocation:`);
   console.log(`  copyPercent=${simConfig.copyPercent} maxTrade=$${simConfig.maxTradeUsd} maxPred=$${simConfig.maxPredUsd}`);
-  console.log(`  minBuyPrice=$${simConfig.minBuyPrice} majorityGate=$${simConfig.majorityGate} followAll=${simConfig.followAll}`);
+  console.log(`  minBuyPrice=$${simConfig.minBuyPrice} majorityGate=$${simConfig.majorityGate} bothSides=${simConfig.bothSides} followSells=${simConfig.followSells}`);
   console.log(`  excludeSlugs=[${simConfig.excludeSlugs.join(',')}] startingCapital=$${simConfig.startingCapital.toFixed(0)}`);
   console.log(`  capitalLockup=${simConfig.useCapitalLockup} seed=${simConfig.seed}`);
   console.log(`  Window: ${windowLabel}`);

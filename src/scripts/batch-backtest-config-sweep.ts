@@ -82,7 +82,8 @@ async function main() {
   if (baseConfig.excludeSlugs.length > 0) flags.push(`slugExclude=[${baseConfig.excludeSlugs.join(',')}]`);
   if (baseConfig.useCapitalLockup) flags.push('capitalLockup=ON'); else flags.push('capitalLockup=OFF');
   if (useEmpirical) flags.push('empiricalSlippage=ON'); else flags.push('empiricalSlippage=OFF');
-  if (baseConfig.followAll) flags.push('FOLLOW-ALL');
+  if (baseConfig.bothSides) flags.push('bothSides=ON');
+  if (baseConfig.followSells) flags.push('followSells=ON');
   if (timeWindow) flags.push(`window=${timeWindow.days > 0 ? `${timeWindow.days}d` : `${timeWindow.hours}h`}`);
   console.log(`Config: ${flags.join(' ')}\n`);
 

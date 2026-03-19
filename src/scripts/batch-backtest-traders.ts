@@ -4,7 +4,8 @@
  *
  * Uses the shared simulation engine (lib/backtest-engine.ts) with full fidelity:
  *   - Capital lockup, slug exclusion, empirical slippage/FAK, net position tracking
- *   - Sharpe on returns, follow-all mode, per-prediction breakdown (--verbose)
+ *   - Sharpe on returns, per-prediction breakdown (--verbose)
+ *   - Independent flags: --both-sides, --follow-sells, --no-majority (or --follow-all for all 3)
  *
  * Usage:
  *   ssh -f -N -L 15438:localhost:5438 aws_ireland_dockerapps
@@ -12,6 +13,7 @@
  *   npx tsx src/scripts/batch-backtest-traders.ts --exclude-slugs "" --min-buy-price 0.40 --no-capital-lockup
  *   npx tsx src/scripts/batch-backtest-traders.ts --trader LampStore --hours 24 --verbose
  *   npx tsx src/scripts/batch-backtest-traders.ts --follow-all --min-days 30
+ *   npx tsx src/scripts/batch-backtest-traders.ts --both-sides --follow-sells   # independent flags
  */
 
 import { parseArgs } from 'util';
@@ -75,9 +77,10 @@ async function main() {
   if (simConfig.excludeSlugs.length > 0) flags.push(`slugExclude=[${simConfig.excludeSlugs.join(',')}]`);
   if (simConfig.useCapitalLockup) flags.push('capitalLockup=ON'); else flags.push('capitalLockup=OFF');
   if (useEmpirical) flags.push('empiricalSlippage=ON'); else flags.push('empiricalSlippage=OFF');
-  if (simConfig.followAll) flags.push('FOLLOW-ALL (no gate, both sides, sells)');
+  if (simConfig.bothSides) flags.push('bothSides=ON');
+  if (simConfig.followSells) flags.push('followSells=ON');
   if (timeWindow) flags.push(`window=${timeWindow.days > 0 ? `${timeWindow.days}d` : `${timeWindow.hours}h`}`);
-  console.log(`Config: minBuyPrice=${simConfig.minBuyPrice} gate=$${simConfig.followAll ? 'OFF' : simConfig.majorityGate} ${flags.join(' ')}`);
+  console.log(`Config: minBuyPrice=${simConfig.minBuyPrice} gate=$${simConfig.majorityGate === 0 ? 'OFF' : simConfig.majorityGate} ${flags.join(' ')}`);
 
   // Get traders
   let traderQuery: string;
@@ -227,7 +230,11 @@ async function main() {
   const lockupLabel = simConfig.useCapitalLockup ? 'lockup ON' : 'lockup OFF';
   const slippageLabel = simConfig.empiricalSlippage ? 'empirical slippage' : 'category slippage';
   console.log(`\n${'='.repeat(200)}`);
-  const modeLabel = simConfig.followAll ? 'FOLLOW-ALL (no gate, both sides, sells)' : `gate=$${simConfig.majorityGate}`;
+  const modeLabel = [
+    simConfig.majorityGate === 0 ? 'gate=OFF' : `gate=$${simConfig.majorityGate}`,
+    simConfig.bothSides ? 'bothSides' : '',
+    simConfig.followSells ? 'followSells' : '',
+  ].filter(Boolean).join(' ');
   console.log(`BATCH BACKTEST (Trade-level) — ${results.length} traders | ${lockupLabel} | ${slippageLabel} | FAK=${(simConfig.fakFailureRate*100).toFixed(0)}%+15s cd | Copy: ${(simConfig.copyPercent*100).toFixed(0)}%, $${simConfig.maxTradeUsd}/trade, $${simConfig.maxPredUsd}/pred, $${simConfig.startingCapital} cap, minBuy=$${simConfig.minBuyPrice} ${modeLabel} | minTraderROI=${MIN_TRADER_ROI}% minCpBuys=${MIN_COPY_BUYS} | PnL=ClosedPosition+Position | slugExclude=[${simConfig.excludeSlugs.join(',')}]`);
   console.log(`${'='.repeat(200)}\n`);
 

@@ -43,7 +43,8 @@ export interface SimConfig {
   majorityGate: number;       // 0 = disabled
   excludeSlugs: string[];
   useCapitalLockup: boolean;
-  followAll: boolean;
+  bothSides: boolean;         // allow buying both sides of same prediction (disables committed-side lock)
+  followSells: boolean;       // track shares, realize PnL on trader SELL proportionally
   seed: number;
   // Calibration (passed in, not loaded inside engine)
   empiricalSlippage: SlippageModel | null;
@@ -189,7 +190,7 @@ export function simulateCopy(
   const {
     copyPercent, maxTradeUsd, maxPredUsd, startingCapital,
     minBuyPrice, majorityGate, excludeSlugs,
-    useCapitalLockup, followAll, seed,
+    useCapitalLockup, bothSides, followSells, seed,
     empiricalSlippage, fakFailureRate,
     includeOpenMarkets, trackPredictions,
   } = config;
@@ -290,7 +291,7 @@ export function simulateCopy(
         if (pb) { pb.traderSells++; pb.traderSellUsd += fillUsd; }
       }
 
-      if (followAll) {
+      if (followSells) {
         const posKey = `${trade.conditionId}:${trade.outcome}`;
         const held = followAllPositions.get(posKey);
         if (held && held.shares > 0) {
@@ -364,7 +365,7 @@ export function simulateCopy(
     if (trade.price < minBuyPrice || trade.price > 0.95) { skippedPrice++; continue; }
     if (fillUsd < 1) continue;
 
-    if (!followAll && majorityGate > 0) {
+    if (majorityGate > 0) {
       // Guard 2: Majority gate WITH self-exclusion
       let totalCidVol = 0, maxOutcomeVol = 0, majorityOutcome = '', numOutcomes = 0;
       for (const [oc, vol] of outcomeMap) {
@@ -378,8 +379,10 @@ export function simulateCopy(
       if (numOutcomes < 2) { skippedGate++; continue; }
       if (trade.outcome !== majorityOutcome) { skippedGate++; continue; }
       if (totalCidVol > 0 && maxOutcomeVol / totalCidVol < 0.50) { skippedGate++; continue; }
+    }
 
-      // Guard 3: Committed side lock
+    // Guard 3: Committed side lock (only when gate is active and bothSides is off)
+    if (majorityGate > 0 && !bothSides) {
       const committed = committedSides.get(trade.conditionId);
       if (committed && committed !== trade.outcome) { skippedGate++; continue; }
     }
@@ -388,7 +391,7 @@ export function simulateCopy(
 
     // Guard 4: Available capital
     let available: number;
-    if (followAll) {
+    if (followSells) {
       available = startingCapital - totalDeployed + totalPnl;
     } else if (useCapitalLockup) {
       releaseMatured(trade.timestamp);
@@ -446,7 +449,7 @@ export function simulateCopy(
 
     // Track results
     predDeployed.set(trade.conditionId, predUsed + copyAmount);
-    if (!followAll) {
+    if (majorityGate > 0 && !bothSides) {
       const committed = committedSides.get(trade.conditionId);
       if (!committed) committedSides.set(trade.conditionId, trade.outcome);
     }
@@ -462,8 +465,8 @@ export function simulateCopy(
       }
     }
 
-    // Follow-all mode: track shares for sell-side exit
-    if (followAll) {
+    // Follow-sells mode: track shares for sell-side exit
+    if (followSells) {
       const posKey = `${trade.conditionId}:${trade.outcome}`;
       const held = followAllPositions.get(posKey) ?? { shares: 0, costBasis: 0, outcomeWon: false, endDateTs: 0 };
       held.shares += netShares;
@@ -473,7 +476,7 @@ export function simulateCopy(
       followAllPositions.set(posKey, held);
     }
 
-    if (followAll) {
+    if (followSells) {
       totalDeployed += copyAmount;
       dailyPnl.set(day, (dailyPnl.get(day) ?? 0) + 0); // ensure day exists
       dailyDeployed.set(day, (dailyDeployed.get(day) ?? 0) + copyAmount);
@@ -518,8 +521,8 @@ export function simulateCopy(
     }
   }
 
-  // Follow-all: resolve remaining unsold shares at market outcome
-  if (followAll) {
+  // Follow-sells: resolve remaining unsold shares at market outcome
+  if (followSells) {
     const remaining = [...followAllPositions.entries()]
       .filter(([, h]) => h.shares > 0.001)
       .sort((a, b) => a[1].endDateTs - b[1].endDateTs);
@@ -545,7 +548,7 @@ export function simulateCopy(
   }
 
   // Flush remaining locked positions
-  if (useCapitalLockup && !followAll) {
+  if (useCapitalLockup && !followSells) {
     for (let i = lockupReleasePtr; i < lockupQueue.length; i++) {
       const pos = lockupQueue[i];
       const pnl = (pos.outcomeWon ? pos.netShares : 0) - pos.deployedUsd;
@@ -568,8 +571,8 @@ export function simulateCopy(
 
   // ─── Compute Final Metrics ───
 
-  const copyPnl = followAll ? totalPnl : (useCapitalLockup ? releasedPnl : totalPnl);
-  const copyDeployed = followAll ? totalDeployed : (useCapitalLockup
+  const copyPnl = followSells ? totalPnl : (useCapitalLockup ? releasedPnl : totalPnl);
+  const copyDeployed = followSells ? totalDeployed : (useCapitalLockup
     ? lockupQueue.reduce((s, p) => s + p.deployedUsd, 0)
     : totalDeployed);
   const copyRoi = copyDeployed > 0 ? copyPnl / copyDeployed * 100 : 0;
