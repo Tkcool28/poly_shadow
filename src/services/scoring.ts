@@ -32,7 +32,7 @@ export async function calculateAllScores(): Promise<number> {
 
   if (staleMonitored.length > 0) {
     logger.info(`Refreshing closed positions for ${staleMonitored.length} stale traders`);
-    const limiter = new Bottleneck({ maxConcurrent: 3, minTime: 200 });
+    const limiter = new Bottleneck({ maxConcurrent: 5, minTime: 100 });
     const refreshResults = await Promise.allSettled(
       staleMonitored.map((t) =>
         limiter.schedule(async () => {

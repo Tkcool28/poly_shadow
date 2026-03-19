@@ -2,7 +2,7 @@ import 'dotenv/config';
 import { createJobLogger } from '../lib/logger';
 import { prisma } from '../lib/prisma';
 import { setupGracefulShutdown, setupJobTimeout } from '../lib/shutdown';
-import { JOB_MAX_RUNTIME_MS } from '../config/constants';
+import { SCORE_CALC_MAX_RUNTIME_MS } from '../config/constants';
 import { calculateAllScores } from '../services/scoring';
 
 const JOB_NAME = 'score-calculator';
@@ -10,7 +10,7 @@ const log = createJobLogger(JOB_NAME);
 
 async function main() {
   setupGracefulShutdown(JOB_NAME);
-  setupJobTimeout(JOB_NAME, JOB_MAX_RUNTIME_MS);
+  setupJobTimeout(JOB_NAME, SCORE_CALC_MAX_RUNTIME_MS);
 
   log.info('Score calculator started');
   const startTime = Date.now();

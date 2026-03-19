@@ -116,6 +116,7 @@ export const PROXY_COOLDOWN_MS = 60 * 1000; // 60 seconds
 
 // Job timeouts
 export const JOB_MAX_RUNTIME_MS = 15 * 60 * 1000; // 15 minutes
+export const SCORE_CALC_MAX_RUNTIME_MS = 45 * 60 * 1000; // 45 minutes (5K+ traders with refresh)
 
 // Wallet validation
 export const WALLET_ADDRESS_REGEX = /^0x[a-fA-F0-9]{40}$/;
