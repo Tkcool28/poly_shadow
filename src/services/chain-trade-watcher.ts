@@ -68,6 +68,7 @@ export class ChainTradeWatcher {
   private getLiveWallets: () => Set<string>; // returns only live-allocation wallets (~7)
   private subscribedWallets: Set<string> = new Set();
   private recentTxHashes: Map<string, number> = new Map(); // dedupKey → timestamp ms
+  private lastEvictAt = 0; // ms — throttles dedup map eviction
   // NegRisk complementary fill handling: phantom opposite-side events arrive before
   // the real trade (lower logIndex). MAKER events are always real; TAKER events are
   // debounced to allow a MAKER event to arrive and take priority.
@@ -284,19 +285,21 @@ export class ChainTradeWatcher {
     if (this.recentTxHashes.has(dedupKey)) return;
     const now = Date.now();
     this.recentTxHashes.set(dedupKey, now);
-    // Evict entries older than 10 min (covers backfill verify interval + margin)
-    if (this.recentTxHashes.size > 500) {
+    // Evict entries older than 10 min — throttled to once per 30s to avoid O(n²)
+    // (with ~6,500 events/min, the map holds ~65K entries; iterating on every event pins the CPU)
+    if (this.recentTxHashes.size > 500 && now - this.lastEvictAt > 30_000) {
+      this.lastEvictAt = now;
       const cutoff = now - 600_000;
       for (const [key, ts] of this.recentTxHashes) {
         if (ts < cutoff) this.recentTxHashes.delete(key);
       }
-    }
-    // Evict emittedTxSides in sync (same lifecycle — insertion-ordered, cap at 500)
-    if (this.emittedTxSides.size > 500) {
-      let i = 0;
-      for (const key of this.emittedTxSides.keys()) {
-        if (i++ >= 250) break;
-        this.emittedTxSides.delete(key);
+      // Evict emittedTxSides in sync (same lifecycle)
+      if (this.emittedTxSides.size > 500) {
+        let i = 0;
+        for (const key of this.emittedTxSides.keys()) {
+          if (i++ >= 250) break;
+          this.emittedTxSides.delete(key);
+        }
       }
     }
 
