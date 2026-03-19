@@ -333,6 +333,10 @@ model FollowAllocation {
   // Per-allocation detection source override
   copyMakerFills        Boolean  @default(false) // true = also copy CHAIN_MAKER signals for this trader
 
+  // Follow-all mode: copy sells + allow both-side buying
+  copySells             Boolean  @default(false) // true = copy trader SELLs as position exits (not just paper)
+  committedSideLock     Boolean  @default(true)  // false = allow buying both outcomes of same conditionId
+
   // State
   isActive             Boolean   @default(true)
   isPaper              Boolean   @default(false) // true = paper trading, no real orders

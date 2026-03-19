@@ -34,6 +34,8 @@ const { values: args } = parseArgs({
     'no-capital-lockup': { type: 'boolean', default: false },
     'min-trader-roi': { type: 'string', default: '0' },
     'min-copy-buys': { type: 'string', default: '10' },
+    'follow-all': { type: 'boolean', default: false },
+    'min-days': { type: 'string', default: '0' },
     output: { type: 'string', default: '' },
   },
 });
@@ -47,6 +49,8 @@ const USE_EMPIRICAL_SLIPPAGE = !args['no-empirical-slippage'];
 const USE_CAPITAL_LOCKUP = !args['no-capital-lockup'];
 const MIN_TRADER_ROI = parseFloat(args['min-trader-roi'] ?? '0');
 const MIN_COPY_BUYS = parseInt(args['min-copy-buys'] ?? '10', 10);
+const FOLLOW_ALL = args['follow-all'] ?? false;
+const MIN_DAYS = parseInt(args['min-days'] ?? '0', 10);
 const OUTPUT_FILE = args.output ?? '';
 
 // Copy-trade simulation constants
@@ -194,6 +198,8 @@ function simulateCopy(trades: TradeRow[]): Omit<TraderResult, 'wallet' | 'name' 
 
   const traderAccum = new Map<string, Map<string, number>>();
   const buyFailureCooldown = new Map<string, number>();
+  // Follow-all mode: track shares held per conditionId:outcome
+  const followAllPositions = new Map<string, { shares: number; costBasis: number; outcomeWon: boolean; endDateTs: number }>();
 
   // Helper: release matured lockup positions
   function releaseMatured(currentTs: number) {
@@ -218,13 +224,47 @@ function simulateCopy(trades: TradeRow[]): Omit<TraderResult, 'wallet' | 'name' 
     const cat = categorize(trade.eventSlug);
     const fillUsd = trade.size * trade.price;
 
-    // Track SELLs for scalp detection + net pred tracking
+    // Track SELLs
     if (trade.side === 'SELL') {
       sellCount++;
-      // Fix 5: Reduce predDeployed for re-entry allowance (matches production getNetPositionUsd)
-      const predUsed = predDeployed.get(trade.conditionId) ?? 0;
-      const sellUsd = trade.size * trade.price;
-      predDeployed.set(trade.conditionId, Math.max(0, predUsed - sellUsd));
+      if (FOLLOW_ALL) {
+        // Follow-all mode: sell our shares proportionally, realize PnL at sell price
+        const posKey = `${trade.conditionId}:${trade.outcome}`;
+        const held = followAllPositions.get(posKey);
+        if (held && held.shares > 0) {
+          const sellProportion = Math.min(1, (trade.size * COPY_PERCENT) / held.shares);
+          const sharesToSell = held.shares * sellProportion;
+          const costBasis = held.costBasis * sellProportion;
+          const sellRevenue = sharesToSell * trade.price;
+          const feePct = FEE_RATE * Math.pow(trade.price * (1 - trade.price), FEE_EXPONENT);
+          const netRevenue = sellRevenue * (1 - feePct);
+          const pnl = netRevenue - costBasis;
+
+          held.shares -= sharesToSell;
+          held.costBasis -= costBasis;
+
+          const predUsed = predDeployed.get(trade.conditionId) ?? 0;
+          predDeployed.set(trade.conditionId, Math.max(0, predUsed - costBasis));
+          totalPnl += pnl;
+          totalDeployed -= costBasis;
+
+          const day = new Date(trade.timestamp * 1000).toISOString().slice(0, 10);
+          dailyPnl.set(day, (dailyPnl.get(day) ?? 0) + pnl);
+          dailyDeployed.set(day, (dailyDeployed.get(day) ?? 0) + Math.abs(costBasis));
+          if (pnl > 0) wins++; else losses++;
+          const curPnl = totalPnl;
+          if (curPnl > peakPnl) peakPnl = curPnl;
+          const dd = peakPnl - curPnl;
+          if (dd > maxDd) maxDd = dd;
+          holdTotal++;
+          if (pnl > 0) holdWins++;
+        }
+      } else {
+        // Gate mode: just reduce predDeployed for re-entry allowance
+        const predUsed = predDeployed.get(trade.conditionId) ?? 0;
+        const sellUsd = trade.size * trade.price;
+        predDeployed.set(trade.conditionId, Math.max(0, predUsed - sellUsd));
+      }
       continue;
     }
     // Only BUY trades below this point
@@ -253,34 +293,38 @@ function simulateCopy(trades: TradeRow[]): Omit<TraderResult, 'wallet' | 'name' 
     if (trade.price < MIN_BUY_PRICE || trade.price > 0.95) continue;
     if (fillUsd < 1) continue;
 
-    // Guard 2: Majority gate WITH self-exclusion
-    {
-      let totalCidVol = 0;
-      let maxOutcomeVol = 0;
-      let majorityOutcome = '';
-      let numOutcomes = 0;
-      for (const [oc, vol] of outcomeMap) {
-        const adjVol = (oc === trade.outcome) ? Math.max(0, vol - fillUsd) : vol;
-        totalCidVol += adjVol;
-        if (adjVol > 0) numOutcomes++;
-        if (adjVol > maxOutcomeVol) { maxOutcomeVol = adjVol; majorityOutcome = oc; }
+    if (!FOLLOW_ALL) {
+      // Guard 2: Majority gate WITH self-exclusion
+      {
+        let totalCidVol = 0;
+        let maxOutcomeVol = 0;
+        let majorityOutcome = '';
+        let numOutcomes = 0;
+        for (const [oc, vol] of outcomeMap) {
+          const adjVol = (oc === trade.outcome) ? Math.max(0, vol - fillUsd) : vol;
+          totalCidVol += adjVol;
+          if (adjVol > 0) numOutcomes++;
+          if (adjVol > maxOutcomeVol) { maxOutcomeVol = adjVol; majorityOutcome = oc; }
+        }
+
+        if (totalCidVol < MAJORITY_GATE) continue;
+        if (numOutcomes < 2) continue;
+        if (trade.outcome !== majorityOutcome) continue;
+        if (totalCidVol > 0 && maxOutcomeVol / totalCidVol < 0.50) continue;
       }
 
-      if (totalCidVol < MAJORITY_GATE) continue;
-      if (numOutcomes < 2) continue;
-      if (trade.outcome !== majorityOutcome) continue;
-      if (totalCidVol > 0 && maxOutcomeVol / totalCidVol < 0.50) continue;
+      // Guard 3: Committed side lock
+      const committed = committedSides.get(trade.conditionId);
+      if (committed && committed !== trade.outcome) continue;
     }
-
-    // Guard 3: Committed side lock
-    const committed = committedSides.get(trade.conditionId);
-    if (committed && committed !== trade.outcome) continue;
 
     const day = new Date(trade.timestamp * 1000).toISOString().slice(0, 10);
 
     // Guard 4: Available capital
     let available: number;
-    if (USE_CAPITAL_LOCKUP) {
+    if (FOLLOW_ALL) {
+      available = STARTING_CAPITAL - totalDeployed + totalPnl;
+    } else if (USE_CAPITAL_LOCKUP) {
       releaseMatured(trade.timestamp);
       available = STARTING_CAPITAL - currentlyLocked + releasedPnl;
     } else {
@@ -324,10 +368,29 @@ function simulateCopy(trades: TradeRow[]): Omit<TraderResult, 'wallet' | 'name' 
 
     // Track results
     predDeployed.set(trade.conditionId, predUsed + copyAmount);
-    if (!committed) committedSides.set(trade.conditionId, trade.outcome);
+    if (!FOLLOW_ALL) {
+      const committed = committedSides.get(trade.conditionId);
+      if (!committed) committedSides.set(trade.conditionId, trade.outcome);
+    }
     buyCount++;
 
-    if (USE_CAPITAL_LOCKUP) {
+    // Follow-all mode: track shares for sell-side exit
+    if (FOLLOW_ALL) {
+      const posKey = `${trade.conditionId}:${trade.outcome}`;
+      const held = followAllPositions.get(posKey) ?? { shares: 0, costBasis: 0, outcomeWon: false, endDateTs: 0 };
+      held.shares += netShares;
+      held.costBasis += copyAmount;
+      held.outcomeWon = outcomeWon;
+      held.endDateTs = trade.endDate ?? (trade.timestamp + FALLBACK_LOCKUP_SEC);
+      followAllPositions.set(posKey, held);
+    }
+
+    if (FOLLOW_ALL) {
+      // Follow-all: capital deployed, PnL deferred to sell or end-of-sim resolution
+      totalDeployed += copyAmount;
+      dailyPnl.set(day, (dailyPnl.get(day) ?? 0) + 0); // ensure day exists for daysActive
+      dailyDeployed.set(day, (dailyDeployed.get(day) ?? 0) + copyAmount);
+    } else if (USE_CAPITAL_LOCKUP) {
       // Fix 1: Push to lockup queue — PnL credited at resolution, not now
       const endDateTs = trade.endDate ?? (trade.timestamp + FALLBACK_LOCKUP_SEC);
 
@@ -355,8 +418,29 @@ function simulateCopy(trades: TradeRow[]): Omit<TraderResult, 'wallet' | 'name' 
     }
   }
 
+  // Follow-all: resolve remaining unsold shares at market outcome
+  if (FOLLOW_ALL) {
+    // Sort by endDate for chronological drawdown curve
+    const remaining = [...followAllPositions.entries()]
+      .filter(([, h]) => h.shares > 0.001)
+      .sort((a, b) => a[1].endDateTs - b[1].endDateTs);
+    for (const [, held] of remaining) {
+      const pnl = (held.outcomeWon ? held.shares : 0) - held.costBasis;
+      totalPnl += pnl;
+      holdTotal++;
+      if (held.outcomeWon) holdWins++;
+      if (pnl > 0) wins++; else losses++;
+      if (totalPnl > peakPnl) peakPnl = totalPnl;
+      const dd = peakPnl - totalPnl;
+      if (dd > maxDd) maxDd = dd;
+      const resolveDay = new Date(held.endDateTs * 1000).toISOString().slice(0, 10);
+      dailyPnl.set(resolveDay, (dailyPnl.get(resolveDay) ?? 0) + pnl);
+      dailyDeployed.set(resolveDay, (dailyDeployed.get(resolveDay) ?? 0) + held.costBasis);
+    }
+  }
+
   // Flush remaining locked positions
-  if (USE_CAPITAL_LOCKUP) {
+  if (USE_CAPITAL_LOCKUP && !FOLLOW_ALL) {
     for (let i = lockupReleasePtr; i < lockupQueue.length; i++) {
       const pos = lockupQueue[i];
       const pnl = (pos.outcomeWon ? pos.netShares : 0) - pos.deployedUsd;
@@ -372,10 +456,10 @@ function simulateCopy(trades: TradeRow[]): Omit<TraderResult, 'wallet' | 'name' 
     }
   }
 
-  const copyPnl = USE_CAPITAL_LOCKUP ? releasedPnl : totalPnl;
-  const copyDeployed = USE_CAPITAL_LOCKUP
+  const copyPnl = FOLLOW_ALL ? totalPnl : (USE_CAPITAL_LOCKUP ? releasedPnl : totalPnl);
+  const copyDeployed = FOLLOW_ALL ? totalDeployed : (USE_CAPITAL_LOCKUP
     ? lockupQueue.reduce((s, p) => s + p.deployedUsd, 0)
-    : totalDeployed;
+    : totalDeployed);
   const copyRoi = copyDeployed > 0 ? copyPnl / copyDeployed * 100 : 0;
   const copyWr = (wins + losses) > 0 ? wins / (wins + losses) * 100 : 0;
   const copyMaxDdPct = STARTING_CAPITAL > 0 ? maxDd / STARTING_CAPITAL * 100 : 0;
@@ -506,7 +590,8 @@ async function main() {
   if (EXCLUDE_SLUGS.length > 0) flags.push(`slugExclude=[${EXCLUDE_SLUGS.join(',')}]`);
   if (USE_CAPITAL_LOCKUP) flags.push('capitalLockup=ON'); else flags.push('capitalLockup=OFF');
   if (USE_EMPIRICAL_SLIPPAGE) flags.push('empiricalSlippage=ON'); else flags.push('empiricalSlippage=OFF');
-  console.log(`Config: minBuyPrice=${MIN_BUY_PRICE} gate=$${MAJORITY_GATE} ${flags.join(' ')}`);
+  if (FOLLOW_ALL) flags.push('FOLLOW-ALL (no gate, both sides, sells)');
+  console.log(`Config: minBuyPrice=${MIN_BUY_PRICE} gate=$${FOLLOW_ALL ? 'OFF' : MAJORITY_GATE} ${flags.join(' ')}`);
 
   // Calibrate from production data
   await calibrateFromProduction(db);
@@ -633,9 +718,11 @@ async function main() {
   const allCopyPositive = results.filter(r => r.copyPnl > 0);
   const filteredOutByTraderRoi = allCopyPositive.filter(r => r.traderRoi < MIN_TRADER_ROI);
   const filteredOutByMinBuys = allCopyPositive.filter(r => r.traderRoi >= MIN_TRADER_ROI && r.copyBuys < MIN_COPY_BUYS);
+  const filteredOutByMinDays = allCopyPositive.filter(r => r.traderRoi >= MIN_TRADER_ROI && r.copyBuys >= MIN_COPY_BUYS && r.daysActive < MIN_DAYS);
   const profitable = allCopyPositive
     .filter(r => r.traderRoi >= MIN_TRADER_ROI)
-    .filter(r => r.copyBuys >= MIN_COPY_BUYS);
+    .filter(r => r.copyBuys >= MIN_COPY_BUYS)
+    .filter(r => r.daysActive >= MIN_DAYS);
   const unprofitable = results.filter(r => r.copyPnl <= 0);
   profitable.sort((a, b) => b.score - a.score);
   unprofitable.sort((a, b) => b.copyPnl - a.copyPnl);
@@ -646,7 +733,8 @@ async function main() {
   const lockupLabel = USE_CAPITAL_LOCKUP ? 'lockup ON' : 'lockup OFF';
   const slippageLabel = empiricalSlippage ? 'empirical slippage' : 'category slippage';
   console.log(`\n${'='.repeat(200)}`);
-  console.log(`BATCH BACKTEST (Trade-level) — ${results.length} traders | ${lockupLabel} | ${slippageLabel} | FAK=${(fakFailureRate*100).toFixed(0)}%+${BUY_FAILURE_COOLDOWN_SEC}s cd | Copy: 10%, $8/trade, $30/pred, $450 cap, minBuy=$${MIN_BUY_PRICE} gate=$${MAJORITY_GATE} | minTraderROI=${MIN_TRADER_ROI}% minCpBuys=${MIN_COPY_BUYS} | PnL=ClosedPosition+Position | slugExclude=[${EXCLUDE_SLUGS.join(',')}]`);
+  const modeLabel = FOLLOW_ALL ? 'FOLLOW-ALL (no gate, both sides, sells)' : `gate=$${MAJORITY_GATE}`;
+  console.log(`BATCH BACKTEST (Trade-level) — ${results.length} traders | ${lockupLabel} | ${slippageLabel} | FAK=${(fakFailureRate*100).toFixed(0)}%+${BUY_FAILURE_COOLDOWN_SEC}s cd | Copy: 10%, $8/trade, $30/pred, $450 cap, minBuy=$${MIN_BUY_PRICE} ${modeLabel} | minTraderROI=${MIN_TRADER_ROI}% minCpBuys=${MIN_COPY_BUYS} | PnL=ClosedPosition+Position | slugExclude=[${EXCLUDE_SLUGS.join(',')}]`);
   console.log(`${'='.repeat(200)}\n`);
 
   const header =
@@ -679,12 +767,15 @@ async function main() {
   console.log(`SUMMARY`);
   console.log(`${'='.repeat(80)}`);
   console.log(`Total traders tested: ${results.length}`);
-  console.log(`Profitable (copyPnL>0, traderROI>=${MIN_TRADER_ROI}%, copyBuys>=${MIN_COPY_BUYS}): ${profitable.length} (${(profitable.length / results.length * 100).toFixed(1)}%)`);
+  console.log(`Profitable (copyPnL>0, traderROI>=${MIN_TRADER_ROI}%, copyBuys>=${MIN_COPY_BUYS}, days>=${MIN_DAYS}): ${profitable.length} (${(profitable.length / results.length * 100).toFixed(1)}%)`);
   if (filteredOutByTraderRoi.length > 0) {
     console.log(`Filtered out (copyPnL>0 but traderROI<${MIN_TRADER_ROI}%): ${filteredOutByTraderRoi.length} traders`);
   }
   if (filteredOutByMinBuys.length > 0) {
     console.log(`Filtered out (copyPnL>0 but copyBuys<${MIN_COPY_BUYS}): ${filteredOutByMinBuys.length} traders`);
+  }
+  if (filteredOutByMinDays.length > 0) {
+    console.log(`Filtered out (copyPnL>0 but daysActive<${MIN_DAYS}): ${filteredOutByMinDays.length} traders`);
   }
   console.log(`Unprofitable: ${unprofitable.length}`);
   console.log(`Profitable crypto traders: ${cryptoProfitable.length}`);

@@ -288,7 +288,7 @@ async function phaseA(
   allocation: { id: string; isPaper: boolean; currentCapital: number;
     copyTradePercent: number | null; maxPositionUsd: number | null; maxPredictionPositionUsd: number | null;
     minBuyPrice: number | null; excludeEventSlugPatterns: string | null; excludeTitlePatterns: string | null;
-    majorityOnlyMode: boolean },
+    majorityOnlyMode: boolean; copySells: boolean; committedSideLock: boolean },
   cache: DrainCache,
   drainStartMs: number,
   preRecorded?: boolean,
@@ -427,7 +427,7 @@ async function phaseA(
   }
 
   // ── Committed side lock: once FILLED on one outcome, block opposite-side BUYs ──
-  if (trade.side === 'BUY' && config.COMMITTED_SIDE_LOCK) {
+  if (trade.side === 'BUY' && allocation.committedSideLock) {
     const oppositeTokenId = cache.getOppositeTokenId(trade.conditionId, trade.asset);
     if (oppositeTokenId) {
       const oppositePos = cache.getPosition(oppositeTokenId, allocation.id, isPaper);
@@ -450,8 +450,8 @@ async function phaseA(
     return null;
   }
 
-  // ─── Disable SELL-copy for live trades (must mirror copy-trade-worker.ts guard) ───
-  if (!isPaper && trade.side === 'SELL') {
+  // ─── SELL-copy guard: skip unless allocation has copySells=true ───
+  if (!allocation.copySells && !isPaper && trade.side === 'SELL') {
     await createSkippedRecord(trade, 'live SELL-copy disabled (hold-to-settlement strategy)', allocation.id, isPaper);
     return null;
   }
@@ -999,6 +999,8 @@ async function drainParallel(
             excludeEventSlugPatterns: allocation.excludeEventSlugPatterns,
             excludeTitlePatterns: allocation.excludeTitlePatterns,
             majorityOnlyMode: allocation.majorityOnlyMode,
+            copySells: allocation.copySells,
+            committedSideLock: allocation.committedSideLock,
           }, drainCache, drainStartMs, true),  // preRecorded=true: drain pre-pass already recorded
         );
         if (result) {
@@ -1193,6 +1195,7 @@ async function main() {
         select: {
           id: true, proxyWallet: true, currentCapital: true, copyMakerFills: true,
           isPaper: true, minBuyPrice: true, excludeEventSlugPatterns: true,
+          copySells: true,
         },
       });
       const allActiveWallets = allActiveAllocations.map(a => a.proxyWallet);
@@ -1233,11 +1236,11 @@ async function main() {
         orderBy: { detectedAt: 'asc' },
       });
 
-      // ── Pre-filter ALL SELLs for live allocations (SELL-copy disabled, no value in drain processing) ──
-      // Live SELL-copy is disabled (phaseA line 446-450, copy-trade-worker line 260-269).
-      // ALL SELLs for live allocations are guaranteed SKIPPED — batch-skip them here.
-      // If SELL-copy is re-enabled, remove this block. No majority accumulator concern (BUYs only).
+      // ── Pre-filter SELLs for live allocations without copySells ──
+      // Allocations with copySells=false skip SELLs (hold-to-settlement). Batch-skip here
+      // to avoid drain processing overhead. copySells=true allocations pass through.
       {
+        const allocMap = new Map(allActiveAllocations.map(a => [a.proxyWallet, a]));
         const liveWallets = new Set(
           allActiveAllocations.filter(a => !a.isPaper).map(a => a.proxyWallet),
         );
@@ -1245,8 +1248,8 @@ async function main() {
         const keptSells: typeof pendingSells = [];
 
         for (const t of pendingSells) {
-          if (liveWallets.has(t.proxyWallet)) {
-            const alloc = allActiveAllocations.find(a => a.proxyWallet === t.proxyWallet)!;
+          if (liveWallets.has(t.proxyWallet) && !allocMap.get(t.proxyWallet)?.copySells) {
+            const alloc = allocMap.get(t.proxyWallet)!;
             sellsToSkip.push({ trade: t, alloc });
           } else {
             keptSells.push(t);

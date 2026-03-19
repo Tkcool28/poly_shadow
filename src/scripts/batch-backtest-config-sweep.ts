@@ -31,6 +31,7 @@ const { values: args } = parseArgs({
     'exclude-slugs': { type: 'string', default: 'updown-5m,updown-15m' },
     'no-empirical-slippage': { type: 'boolean', default: false },
     'no-capital-lockup': { type: 'boolean', default: false },
+    'follow-all': { type: 'boolean', default: false },
   },
 });
 
@@ -40,6 +41,7 @@ const TOP_N = parseInt(args.top ?? '20', 10);
 const EXCLUDE_SLUGS = (args['exclude-slugs'] ?? '').split(',').map(s => s.trim()).filter(Boolean);
 const USE_EMPIRICAL_SLIPPAGE = !args['no-empirical-slippage'];
 const USE_CAPITAL_LOCKUP = !args['no-capital-lockup'];
+const FOLLOW_ALL = args['follow-all'] ?? false;
 
 const DB_PASSWORD = process.env.HETZNER_PG_PASSWORD ?? '';
 
@@ -181,6 +183,7 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
   const dailyDeployed = new Map<string, number>();
   const traderAccum = new Map<string, Map<string, number>>();
   const buyFailureCooldown = new Map<string, number>();
+  const followAllPositions = new Map<string, { shares: number; costBasis: number; outcomeWon: boolean; endDateTs: number }>();
 
   function releaseMatured(currentTs: number) {
     while (lockupReleasePtr < lockupQueue.length
@@ -206,9 +209,37 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
 
     if (trade.side === 'SELL') {
       sellCount++;
-      // Fix 5: Net position tracking
-      const predUsed = predDeployed.get(trade.conditionId) ?? 0;
-      predDeployed.set(trade.conditionId, Math.max(0, predUsed - fillUsd));
+      if (FOLLOW_ALL) {
+        const posKey = `${trade.conditionId}:${trade.outcome}`;
+        const held = followAllPositions.get(posKey);
+        if (held && held.shares > 0) {
+          const sellProportion = Math.min(1, (trade.size * cfg.copyPercent) / held.shares);
+          const sharesToSell = held.shares * sellProportion;
+          const costBasis = held.costBasis * sellProportion;
+          const sellRevenue = sharesToSell * trade.price;
+          const feePct = FEE_RATE * Math.pow(trade.price * (1 - trade.price), FEE_EXPONENT);
+          const netRevenue = sellRevenue * (1 - feePct);
+          const pnl = netRevenue - costBasis;
+          held.shares -= sharesToSell;
+          held.costBasis -= costBasis;
+          const predUsed = predDeployed.get(trade.conditionId) ?? 0;
+          predDeployed.set(trade.conditionId, Math.max(0, predUsed - costBasis));
+          totalPnl += pnl;
+          totalDeployed -= costBasis;
+          const day = new Date(trade.timestamp * 1000).toISOString().slice(0, 10);
+          dailyPnl.set(day, (dailyPnl.get(day) ?? 0) + pnl);
+          dailyDeployed.set(day, (dailyDeployed.get(day) ?? 0) + Math.abs(costBasis));
+          if (pnl > 0) wins++; else losses++;
+          if (totalPnl > peakPnl) peakPnl = totalPnl;
+          const dd = peakPnl - totalPnl;
+          if (dd > maxDd) maxDd = dd;
+          holdTotal++;
+          if (pnl > 0) holdWins++;
+        }
+      } else {
+        const predUsed = predDeployed.get(trade.conditionId) ?? 0;
+        predDeployed.set(trade.conditionId, Math.max(0, predUsed - fillUsd));
+      }
       continue;
     }
     // Fix 2a: Slug exclusion BEFORE accumulator
@@ -232,33 +263,37 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
     if (trade.price < cfg.minBuyPrice || trade.price > 0.95) continue;
     if (fillUsd < 1) continue;
 
-    // Guard 2: Majority gate WITH self-exclusion
-    if (cfg.gate > 0) {
-      let totalCidVol = 0;
-      let maxOutcomeVol = 0;
-      let majorityOutcome = '';
-      let numOutcomes = 0;
-      for (const [oc, vol] of outcomeMap) {
-        const adjVol = (oc === trade.outcome) ? Math.max(0, vol - fillUsd) : vol;
-        totalCidVol += adjVol;
-        if (adjVol > 0) numOutcomes++;
-        if (adjVol > maxOutcomeVol) { maxOutcomeVol = adjVol; majorityOutcome = oc; }
+    if (!FOLLOW_ALL) {
+      // Guard 2: Majority gate WITH self-exclusion
+      if (cfg.gate > 0) {
+        let totalCidVol = 0;
+        let maxOutcomeVol = 0;
+        let majorityOutcome = '';
+        let numOutcomes = 0;
+        for (const [oc, vol] of outcomeMap) {
+          const adjVol = (oc === trade.outcome) ? Math.max(0, vol - fillUsd) : vol;
+          totalCidVol += adjVol;
+          if (adjVol > 0) numOutcomes++;
+          if (adjVol > maxOutcomeVol) { maxOutcomeVol = adjVol; majorityOutcome = oc; }
+        }
+        if (totalCidVol < cfg.gate) continue;
+        if (numOutcomes < 2) continue;
+        if (trade.outcome !== majorityOutcome) continue;
+        if (totalCidVol > 0 && maxOutcomeVol / totalCidVol < 0.50) continue;
       }
-      if (totalCidVol < cfg.gate) continue;
-      if (numOutcomes < 2) continue;
-      if (trade.outcome !== majorityOutcome) continue;
-      if (totalCidVol > 0 && maxOutcomeVol / totalCidVol < 0.50) continue;
-    }
 
-    // Guard 3: Committed side lock
-    const committed = committedSides.get(trade.conditionId);
-    if (committed && committed !== trade.outcome) continue;
+      // Guard 3: Committed side lock
+      const committed = committedSides.get(trade.conditionId);
+      if (committed && committed !== trade.outcome) continue;
+    }
 
     const day = new Date(trade.timestamp * 1000).toISOString().slice(0, 10);
 
     // Guard 4: Available capital
     let available: number;
-    if (USE_CAPITAL_LOCKUP) {
+    if (FOLLOW_ALL) {
+      available = STARTING_CAPITAL - totalDeployed + totalPnl;
+    } else if (USE_CAPITAL_LOCKUP) {
       releaseMatured(trade.timestamp);
       available = STARTING_CAPITAL - currentlyLocked + releasedPnl;
     } else {
@@ -301,10 +336,27 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
 
     // Track results
     predDeployed.set(trade.conditionId, predUsed + copyAmount);
-    if (!committed) committedSides.set(trade.conditionId, trade.outcome);
+    if (!FOLLOW_ALL) {
+      const committed = committedSides.get(trade.conditionId);
+      if (!committed) committedSides.set(trade.conditionId, trade.outcome);
+    }
     buyCount++;
 
-    if (USE_CAPITAL_LOCKUP) {
+    if (FOLLOW_ALL) {
+      const posKey = `${trade.conditionId}:${trade.outcome}`;
+      const held = followAllPositions.get(posKey) ?? { shares: 0, costBasis: 0, outcomeWon: false, endDateTs: 0 };
+      held.shares += netShares;
+      held.costBasis += copyAmount;
+      held.outcomeWon = outcomeWon;
+      held.endDateTs = trade.endDate ?? (trade.timestamp + FALLBACK_LOCKUP_SEC);
+      followAllPositions.set(posKey, held);
+    }
+
+    if (FOLLOW_ALL) {
+      totalDeployed += copyAmount;
+      dailyPnl.set(day, (dailyPnl.get(day) ?? 0) + 0);
+      dailyDeployed.set(day, (dailyDeployed.get(day) ?? 0) + copyAmount);
+    } else if (USE_CAPITAL_LOCKUP) {
       const endDateTs = trade.endDate ?? (trade.timestamp + FALLBACK_LOCKUP_SEC);
       let lo = lockupReleasePtr, hi = lockupQueue.length;
       while (lo < hi) {
@@ -327,8 +379,28 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
     }
   }
 
+  // Follow-all: resolve remaining unsold shares at market outcome
+  if (FOLLOW_ALL) {
+    const remaining = [...followAllPositions.entries()]
+      .filter(([, h]) => h.shares > 0.001)
+      .sort((a, b) => a[1].endDateTs - b[1].endDateTs);
+    for (const [, held] of remaining) {
+      const pnl = (held.outcomeWon ? held.shares : 0) - held.costBasis;
+      totalPnl += pnl;
+      holdTotal++;
+      if (held.outcomeWon) holdWins++;
+      if (pnl > 0) wins++; else losses++;
+      if (totalPnl > peakPnl) peakPnl = totalPnl;
+      const dd = peakPnl - totalPnl;
+      if (dd > maxDd) maxDd = dd;
+      const resolveDay = new Date(held.endDateTs * 1000).toISOString().slice(0, 10);
+      dailyPnl.set(resolveDay, (dailyPnl.get(resolveDay) ?? 0) + pnl);
+      dailyDeployed.set(resolveDay, (dailyDeployed.get(resolveDay) ?? 0) + held.costBasis);
+    }
+  }
+
   // Flush remaining locked positions
-  if (USE_CAPITAL_LOCKUP) {
+  if (USE_CAPITAL_LOCKUP && !FOLLOW_ALL) {
     for (let i = lockupReleasePtr; i < lockupQueue.length; i++) {
       const pos = lockupQueue[i];
       const pnl = (pos.outcomeWon ? pos.netShares : 0) - pos.deployedUsd;
@@ -344,10 +416,10 @@ function simulateCopy(trades: TradeRow[], cfg: SimConfig): SimResult {
     }
   }
 
-  const copyPnl = USE_CAPITAL_LOCKUP ? releasedPnl : totalPnl;
-  const deployed = USE_CAPITAL_LOCKUP
+  const copyPnl = FOLLOW_ALL ? totalPnl : (USE_CAPITAL_LOCKUP ? releasedPnl : totalPnl);
+  const deployed = FOLLOW_ALL ? totalDeployed : (USE_CAPITAL_LOCKUP
     ? lockupQueue.reduce((s, p) => s + p.deployedUsd, 0)
-    : totalDeployed;
+    : totalDeployed);
   const copyRoi = deployed > 0 ? copyPnl / deployed * 100 : 0;
   const maxDdPct = STARTING_CAPITAL > 0 ? maxDd / STARTING_CAPITAL * 100 : 0;
   const holdWr = holdTotal > 0 ? holdWins / holdTotal * 100 : 0;
@@ -456,6 +528,7 @@ async function main() {
   if (EXCLUDE_SLUGS.length > 0) flags.push(`slugExclude=[${EXCLUDE_SLUGS.join(',')}]`);
   if (USE_CAPITAL_LOCKUP) flags.push('capitalLockup=ON'); else flags.push('capitalLockup=OFF');
   if (USE_EMPIRICAL_SLIPPAGE) flags.push('empiricalSlippage=ON'); else flags.push('empiricalSlippage=OFF');
+  if (FOLLOW_ALL) flags.push('FOLLOW-ALL (no gate, both sides, sells)');
   console.log(`Config: ${flags.join(' ')}`);
 
   await calibrateFromProduction(db);

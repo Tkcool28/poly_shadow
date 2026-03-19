@@ -250,7 +250,7 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   }
 
   // ─── Committed side lock: once FILLED on one outcome, block opposite-side BUYs ───
-  if (trade.side === 'BUY' && config.COMMITTED_SIDE_LOCK) {
+  if (trade.side === 'BUY' && allocation.committedSideLock) {
     const oppositePos = await getOppositePosition(trade.conditionId, trade.asset, allocation.id, isPaper);
     if (oppositePos.netUsd >= 0.01) {
       await createSkippedRecord(trade,
@@ -266,13 +266,9 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
     return;
   }
 
-  // ─── Disable SELL-copy for live trades ───
-  // Analysis of 0x8dxd allocation shows copying trader SELL signals loses money:
-  //   - 67% of sells are on winning positions (destroys profits)
-  //   - Sells + re-entry whipsaw costs more than holding to settlement
-  //   - Hold-to-settlement matches the backtested strategy (backtest never modeled sells)
-  // Paper trades still copy sells for simulation accuracy.
-  if (!isPaper && trade.side === 'SELL') {
+  // ─── SELL-copy guard: skip unless allocation has copySells=true ───
+  // Default (copySells=false): hold-to-settlement strategy. Paper trades always copy sells.
+  if (!allocation.copySells && !isPaper && trade.side === 'SELL') {
     await createSkippedRecord(trade, 'live SELL-copy disabled (hold-to-settlement strategy)', allocation.id, isPaper);
     return;
   }
