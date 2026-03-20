@@ -109,12 +109,12 @@ export async function refreshTrackedWallets(): Promise<void> {
   });
   liveAllocationWallets = new Set(rapidPollAllocs.map(a => a.proxyWallet.toLowerCase()));
 
-  // 2. ChainTradeWatcher: ALL live allocations (chain events are the primary detection for copyMakerFills)
-  const allLiveAllocs = await prisma.followAllocation.findMany({
-    where: { isPaper: false, isActive: true },
+  // 2. ChainTradeWatcher: ALL active allocations (chain events benefit both live and paper)
+  const allActiveAllocs = await prisma.followAllocation.findMany({
+    where: { isActive: true },
     select: { proxyWallet: true },
   });
-  chainWatcherWallets = new Set(allLiveAllocs.map(a => a.proxyWallet.toLowerCase()));
+  chainWatcherWallets = new Set(allActiveAllocs.map(a => a.proxyWallet.toLowerCase()));
 }
 
 export async function startCacheRefresh(intervalMs = 60000): Promise<void> {

@@ -1167,7 +1167,17 @@ async function main() {
     if (drainRunning || shuttingDown || isShuttingDown()) return;
     drainRunning = true;
     try {
-      await drainTrades();
+      const DRAIN_TIMEOUT_MS = 30_000;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<'TIMEOUT'>(resolve => {
+        timer = setTimeout(() => resolve('TIMEOUT'), DRAIN_TIMEOUT_MS);
+        timer.unref();  // don't block process shutdown
+      });
+      const result = await Promise.race([drainTrades().then(() => 'OK' as const), timeout]);
+      if (timer) clearTimeout(timer);
+      if (result === 'TIMEOUT') {
+        log.warn(`drainTrades() timed out after ${DRAIN_TIMEOUT_MS}ms — resetting drain lock`);
+      }
     } finally {
       drainRunning = false;
       if (drainScheduled) setImmediate(runDrain);
@@ -1199,6 +1209,7 @@ async function main() {
         },
       });
       const allActiveWallets = allActiveAllocations.map(a => a.proxyWallet);
+      const paperWalletSet = new Set(allActiveAllocations.filter(a => a.isPaper).map(a => a.proxyWallet));
       const buyEligibleWallets = allActiveAllocations
         .filter(a => a.currentCapital > 0)
         .map(a => a.proxyWallet);
@@ -1224,17 +1235,31 @@ async function main() {
       };
 
       // ── SELLs: never filter CHAIN_MAKER — exits are always safe ──
-      // (if we don't hold shares, processCopyTrade skips with "no shares held to sell")
-      // Always exclude RAPID_POLL/POLL — stale signals are useless for execution
-      let pendingSells = await prisma.detectedTrade.findMany({
+      // Live: exclude RAPID_POLL/POLL (stale signals waste CLOB calls)
+      // Paper: allow all sources (paper executor has no CLOB cost)
+      const liveSellWallets = allActiveWallets.filter(w => !paperWalletSet.has(w));
+      const paperSellWallets = allActiveWallets.filter(w => paperWalletSet.has(w));
+
+      const liveSells = liveSellWallets.length > 0 ? await prisma.detectedTrade.findMany({
         where: {
           ...baseWhere,
           side: 'SELL',
-          proxyWallet: { in: allActiveWallets },
+          proxyWallet: { in: liveSellWallets },
           detectionSource: { notIn: ['RAPID_POLL', 'POLL'] },
         },
         orderBy: { detectedAt: 'asc' },
-      });
+      }) : [];
+
+      const paperSells = paperSellWallets.length > 0 ? await prisma.detectedTrade.findMany({
+        where: {
+          ...baseWhere,
+          side: 'SELL',
+          proxyWallet: { in: paperSellWallets },
+        },
+        orderBy: { detectedAt: 'asc' },
+      }) : [];
+
+      let pendingSells = [...liveSells, ...paperSells];
 
       // ── Pre-filter SELLs for live allocations without copySells ──
       // Allocations with copySells=false skip SELLs (hold-to-settlement). Batch-skip here
@@ -1281,18 +1306,37 @@ async function main() {
         pendingSells = keptSells;
       }
 
-      // ── BUYs: filter CHAIN_MAKER globally, allow for copyMakerFills opt-in ──
-      const buyWhere = {
-        ...baseWhere,
-        side: 'BUY' as const,
-        ...(config.SKIP_CHAIN_MAKER_FILLS
-          ? { detectionSource: { notIn: ['CHAIN_MAKER', 'RAPID_POLL', 'POLL'] } }
-          : { detectionSource: { notIn: ['RAPID_POLL', 'POLL'] } }),
-      };
-      const pendingBuys = await prisma.detectedTrade.findMany({
-        where: { ...buyWhere, proxyWallet: { in: buyEligibleWallets } },
+      // ── BUYs: filter CHAIN_MAKER globally, allow POLL for paper ──
+      const liveBuyWallets = buyEligibleWallets.filter(w => !paperWalletSet.has(w));
+      const paperBuyWallets = buyEligibleWallets.filter(w => paperWalletSet.has(w));
+
+      const liveBuySourceFilter = config.SKIP_CHAIN_MAKER_FILLS
+        ? ['CHAIN_MAKER', 'RAPID_POLL', 'POLL']
+        : ['RAPID_POLL', 'POLL'];
+
+      const liveBuys = liveBuyWallets.length > 0 ? await prisma.detectedTrade.findMany({
+        where: {
+          ...baseWhere,
+          side: 'BUY',
+          proxyWallet: { in: liveBuyWallets },
+          detectionSource: { notIn: liveBuySourceFilter },
+        },
         orderBy: { detectedAt: 'asc' },
-      });
+      }) : [];
+
+      // Paper BUYs: allow POLL sources, still respect CHAIN_MAKER skip if globally set
+      const paperBuySourceFilter = config.SKIP_CHAIN_MAKER_FILLS ? ['CHAIN_MAKER'] : [];
+      const paperBuys = paperBuyWallets.length > 0 ? await prisma.detectedTrade.findMany({
+        where: {
+          ...baseWhere,
+          side: 'BUY',
+          proxyWallet: { in: paperBuyWallets },
+          ...(paperBuySourceFilter.length > 0 ? { detectionSource: { notIn: paperBuySourceFilter } } : {}),
+        },
+        orderBy: { detectedAt: 'asc' },
+      }) : [];
+
+      const pendingBuys = [...liveBuys, ...paperBuys];
 
       // ── Maker-fill BUYs — only for opted-in wallets ──
       let makerBuys: typeof pendingBuys = [];
