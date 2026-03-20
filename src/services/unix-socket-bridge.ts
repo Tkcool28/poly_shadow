@@ -523,11 +523,17 @@ async function handleCopyTradeResult(msg: CopyTradeResultMsg): Promise<void> {
       if (msg.status === 'FILLED' && msg.filled_size > 0) {
         const fillUsd = msg.filled_size * msg.filled_price;
         if (msg.side === 'BUY') {
+          // Guard: don't decrement more than available capital (prevents negative)
+          const fresh = await tx.followAllocation.findUniqueOrThrow({
+            where: { id: msg.allocation_id },
+            select: { currentCapital: true },
+          });
+          const safeDecrement = Math.min(fillUsd, Math.max(fresh.currentCapital, 0));
           await tx.followAllocation.update({
             where: { id: msg.allocation_id },
             data: {
-              currentCapital: { decrement: fillUsd },
-              deployedCapital: { increment: fillUsd },
+              currentCapital: { decrement: safeDecrement },
+              deployedCapital: { increment: safeDecrement },
             },
           });
         } else {
@@ -550,11 +556,16 @@ async function handleCopyTradeResult(msg: CopyTradeResultMsg): Promise<void> {
           const avgBuyPrice =
             totalBuyShares > 0 ? totalBuyCost / totalBuyShares : msg.filled_price;
           const costBasis = msg.filled_size * avgBuyPrice;
+          const freshSell = await tx.followAllocation.findUniqueOrThrow({
+            where: { id: msg.allocation_id },
+            select: { deployedCapital: true },
+          });
+          const safeDecrementDC = Math.min(costBasis, Math.max(freshSell.deployedCapital, 0));
           await tx.followAllocation.update({
             where: { id: msg.allocation_id },
             data: {
               currentCapital: { increment: fillUsd },
-              deployedCapital: { decrement: costBasis },
+              deployedCapital: { decrement: safeDecrementDC },
             },
           });
         }
