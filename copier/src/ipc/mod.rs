@@ -175,9 +175,13 @@ pub fn spawn_ipc_task(
             let stream = match maybe_stream.take() {
                 Some(s) => s,
                 None => {
-                    let mut backoff = Duration::from_secs(5);
+                    let mut first_attempt = true;
+                    let mut backoff = Duration::from_millis(200);
                     let raw_stream = loop {
-                        tokio::time::sleep(backoff).await;
+                        if !first_attempt {
+                            tokio::time::sleep(backoff).await;
+                        }
+                        first_attempt = false;
                         match UnixStream::connect(&socket_path).await {
                             Ok(s) => {
                                 tracing::info!("IPC reconnected");
