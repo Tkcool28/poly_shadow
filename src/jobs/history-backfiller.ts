@@ -8,7 +8,7 @@ import { config } from '../config/env';
 const JOB_NAME = 'history-backfiller';
 const log = createJobLogger(JOB_NAME);
 const BATCH_SIZE = 10;
-const TRADER_CONCURRENCY = 3;
+const TRADER_CONCURRENCY = 1; // Reduced from 3: concurrent large traders (3000+ trades) cause OOM at 1.5GB limit
 
 async function runCycle(): Promise<{ total: number; refreshCount: number }> {
   const claimed = await claimTradersForBackfill(

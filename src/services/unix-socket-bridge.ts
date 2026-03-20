@@ -467,11 +467,40 @@ async function handleCopyTradeResult(msg: CopyTradeResultMsg): Promise<void> {
       : null;
 
   try {
-    await prisma.$transaction(async (tx) => {
-      // Upsert: FAK SKIPPED creates the record, GTC FILLED updates it
-      await tx.copyTrade.upsert({
+    // Check if CopyTrade already exists (Node.js copy-trader may have created it first)
+    const existing = await prisma.copyTrade.findUnique({
+      where: { detectedTradeId: dtId! },
+      select: { id: true },
+    });
+
+    if (existing) {
+      // Record already created by Node.js copy-trader — update metadata only, skip capital
+      await prisma.copyTrade.update({
         where: { detectedTradeId: dtId! },
-        create: {
+        data: {
+          status: msg.status,
+          filledPrice: msg.filled_price > 0 ? msg.filled_price : undefined,
+          filledSize: msg.filled_size > 0 ? msg.filled_size : undefined,
+          orderId: msg.order_id ?? undefined,
+          executionMethod: execMethod ?? undefined,
+          latencyMs: Math.round(msg.latency_ms),
+          failReason: msg.fail_reason ?? undefined,
+          filledAt: msg.status === 'FILLED' ? new Date() : undefined,
+        },
+      });
+      // Capital already adjusted by Node.js — DO NOT decrement again
+      if (msg.status === 'FILLED') {
+        log.info('CopyTrade updated (Node.js wrote first, capital skipped)', {
+          side: msg.side, alloc: msg.allocation_id, paper: msg.is_paper,
+        });
+      }
+      return;
+    }
+
+    await prisma.$transaction(async (tx) => {
+      // New record — create and adjust capital
+      await tx.copyTrade.create({
+        data: {
           detectedTradeId: dtId!,
           tokenId: msg.token_id,
           side: msg.side,
@@ -488,20 +517,9 @@ async function handleCopyTradeResult(msg: CopyTradeResultMsg): Promise<void> {
           followAllocationId: msg.allocation_id,
           filledAt: msg.status === 'FILLED' ? new Date() : null,
         },
-        update: {
-          // GTC fallback overwrites FAK SKIPPED with actual fill data
-          status: msg.status,
-          filledPrice: msg.filled_price > 0 ? msg.filled_price : undefined,
-          filledSize: msg.filled_size > 0 ? msg.filled_size : undefined,
-          orderId: msg.order_id ?? undefined,
-          executionMethod: execMethod ?? undefined,
-          latencyMs: Math.round(msg.latency_ms),
-          failReason: msg.fail_reason ?? undefined,
-          filledAt: msg.status === 'FILLED' ? new Date() : undefined,
-        },
       });
 
-      // Update allocation capital on FILLED
+      // Capital adjustment — only on CREATE (first writer wins)
       if (msg.status === 'FILLED' && msg.filled_size > 0) {
         const fillUsd = msg.filled_size * msg.filled_price;
         if (msg.side === 'BUY') {
