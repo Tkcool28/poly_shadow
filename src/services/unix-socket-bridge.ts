@@ -467,14 +467,14 @@ async function handleCopyTradeResult(msg: CopyTradeResultMsg): Promise<void> {
       : null;
 
   try {
-    // Check if CopyTrade already exists (Node.js copy-trader may have created it first)
+    // Check if CopyTrade already exists (idempotency guard)
     const existing = await prisma.copyTrade.findUnique({
       where: { detectedTradeId: dtId! },
       select: { id: true },
     });
 
     if (existing) {
-      // Record already created by Node.js copy-trader — update metadata only, skip capital
+      // Record already exists — update metadata only, skip capital adjustment
       await prisma.copyTrade.update({
         where: { detectedTradeId: dtId! },
         data: {

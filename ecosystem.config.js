@@ -48,18 +48,6 @@ module.exports = {
       },
     },
     {
-      name: 'copy-trader',
-      script: './node_modules/.bin/tsx',
-      args: 'src/jobs/copy-trader.ts',
-      autorestart: true,
-      watch: false,
-      max_restarts: 50,
-      exp_backoff_restart_delay: 1000,
-      env: {
-        NODE_ENV: 'production',
-      },
-    },
-    {
       name: 'ipc-bridge',
       script: './node_modules/.bin/tsx',
       args: 'src/jobs/ipc-bridge.ts',

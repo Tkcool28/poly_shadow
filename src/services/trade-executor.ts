@@ -294,8 +294,7 @@ export async function executeMarketOrder(params: ExecuteOrderParams): Promise<Ex
     };
   }
 
-  // Guard: SELL share amount must be non-zero — floating-point residuals can survive
-  // the > 0 check in copy-trade-worker but round to 0 in CLOB integer conversion.
+  // Guard: SELL share amount must be non-zero — floating-point residuals can round to 0 in CLOB integer conversion.
   if (side === 'SELL' && amount < 0.000001) {
     return {
       orderId: null,

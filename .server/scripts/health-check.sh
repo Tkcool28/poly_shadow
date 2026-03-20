@@ -34,7 +34,7 @@ fi
 cd "$COMPOSE_DIR"
 
 # ─── Container health ───
-CORE_WORKERS="copy-trader trade-monitor history-backfiller leaderboard-scanner score-calculator"
+CORE_WORKERS="trade-monitor history-backfiller leaderboard-scanner score-calculator"
 
 for worker in $CORE_WORKERS; do
   STATUS=$(docker compose -f "$COMPOSE_FILE" ps --format json "$worker" 2>/dev/null | \

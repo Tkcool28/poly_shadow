@@ -55,4 +55,4 @@ ENV NODE_ENV=production
 ENTRYPOINT ["/entrypoint.sh"]
 
 # Default CMD (overridden per-container in docker-compose)
-CMD ["src/jobs/copy-trader.ts"]
+CMD ["src/jobs/trade-monitor.ts"]

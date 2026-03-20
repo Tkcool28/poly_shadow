@@ -269,7 +269,7 @@ jobs:
         id: backup
         working-directory: ${{ env.DEPLOY_DIR }}
         run: |
-          CURRENT_TAG=$(docker inspect polymarket_copy_trader --format='{{.Config.Image}}' 2>/dev/null | cut -d':' -f2 || echo "none")
+          CURRENT_TAG=$(docker inspect polymarket_trade_monitor --format='{{.Config.Image}}' 2>/dev/null | cut -d':' -f2 || echo "none")
           echo "previous_tag=$CURRENT_TAG" >> $GITHUB_OUTPUT
           echo "Current image tag: $CURRENT_TAG"
 
@@ -280,7 +280,7 @@ jobs:
           GITHUB_REPOSITORY_OWNER: ${{ env.IMAGE_OWNER }}
         run: |
           echo "Stopping existing workers..."
-          WORKERS="copy-trader trade-monitor history-backfiller leaderboard-scanner score-calculator"
+          WORKERS="trade-monitor history-backfiller leaderboard-scanner score-calculator"
           for worker in $WORKERS; do
             docker compose -f docker-compose.ghcr.yml stop --timeout 45 "$worker" 2>/dev/null || true
             docker compose -f docker-compose.ghcr.yml rm -f "$worker" 2>/dev/null || true
@@ -299,7 +299,7 @@ jobs:
         run: |
           echo "Starting new workers..."
           docker compose -f docker-compose.ghcr.yml ${{ steps.profiles.outputs.flags }} up -d \
-            copy-trader trade-monitor history-backfiller leaderboard-scanner score-calculator
+            trade-monitor history-backfiller leaderboard-scanner score-calculator
           PROFILES="${{ inputs.profiles }}"
           if echo "$PROFILES" | grep -q "arb"; then
             docker compose -f docker-compose.ghcr.yml --profile arb up -d arb-worker
@@ -326,17 +326,9 @@ jobs:
             exit 1
           fi
           echo "OK - PostgreSQL running"
-          CORE_WORKERS="copy-trader trade-monitor history-backfiller"
+          CORE_WORKERS="trade-monitor history-backfiller"
           for worker in $CORE_WORKERS; do
             if ! docker compose -f docker-compose.ghcr.yml ps "$worker" | grep -q "Up"; then
-              # Check if copy-trader exited cleanly because COPY_TRADE_ENABLED=false
-              if [ "$worker" = "copy-trader" ]; then
-                LOGS=$(docker compose -f docker-compose.ghcr.yml logs --tail=5 "$worker" 2>&1)
-                if echo "$LOGS" | grep -q "Copy trading disabled"; then
-                  echo "OK - $worker exited (COPY_TRADE_ENABLED=false)"
-                  continue
-                fi
-              fi
               echo "ERROR - $worker is not running"
               docker compose -f docker-compose.ghcr.yml logs --tail=30 "$worker"
               exit 1
@@ -393,20 +385,20 @@ jobs:
           PREVIOUS_TAG="${{ steps.backup.outputs.previous_tag }}"
           if [ "$PREVIOUS_TAG" != "none" ] && [ -n "$PREVIOUS_TAG" ]; then
             echo "Rolling back to tag: $PREVIOUS_TAG"
-            WORKERS="copy-trader trade-monitor history-backfiller leaderboard-scanner score-calculator"
+            WORKERS="trade-monitor history-backfiller leaderboard-scanner score-calculator"
             for worker in $WORKERS; do
               docker compose -f docker-compose.ghcr.yml stop --timeout 45 "$worker" 2>/dev/null || true
               docker compose -f docker-compose.ghcr.yml rm -f "$worker" 2>/dev/null || true
             done
             IMAGE_TAG=$PREVIOUS_TAG docker compose -f docker-compose.ghcr.yml up -d \
-              copy-trader trade-monitor history-backfiller leaderboard-scanner score-calculator
+              trade-monitor history-backfiller leaderboard-scanner score-calculator
             echo "Rollback complete"
           else
             echo "No previous version found. Manual intervention required."
           fi
           echo ""
           echo "=== Container Logs ==="
-          for container in polymarket_postgres polymarket_copy_trader polymarket_trade_monitor polymarket_history_backfiller; do
+          for container in polymarket_postgres polymarket_trade_monitor polymarket_history_backfiller; do
             echo "--- $container ---"
             docker logs --tail=100 "$container" 2>/dev/null || echo "(no logs)"
             echo ""

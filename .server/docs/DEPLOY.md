@@ -26,7 +26,8 @@
     │                                             │
     │  polymarket_postgres       (127.0.0.1:5438) │
     │  polymarket_migrate        (one-shot)       │
-    │  polymarket_copy_trader    (daemon)          │
+    │  polymarket_ipc_bridge     (daemon, copier) │
+    │  polymarket_copier         (daemon, copier) │
     │  polymarket_trade_monitor  (daemon)          │
     │  polymarket_history_backfiller (daemon, 8GB) │
     │  polymarket_leaderboard_scanner (cron 12h)   │
@@ -137,7 +138,7 @@ cd ~/polymarket-copytrade
 docker compose -f docker-compose.ghcr.yml logs -f
 
 # Single worker
-docker compose -f docker-compose.ghcr.yml logs -f copy-trader
+docker compose -f docker-compose.ghcr.yml logs -f ipc-bridge
 
 # Container status
 docker compose -f docker-compose.ghcr.yml ps
@@ -156,7 +157,7 @@ cd ~/polymarket-copytrade
 
 # Roll back to specific tag
 IMAGE_TAG=sha-previous docker compose -f docker-compose.ghcr.yml up -d \
-  copy-trader trade-monitor history-backfiller leaderboard-scanner score-calculator
+  trade-monitor history-backfiller leaderboard-scanner score-calculator
 ```
 
 ### Database Rollback
@@ -208,8 +209,8 @@ pm2 delete all && pm2 save
 ### Container Won't Start
 
 ```bash
-docker logs polymarket_copy_trader
-docker compose -f docker-compose.ghcr.yml logs --tail=50 copy-trader
+docker logs polymarket_ipc_bridge
+docker compose -f docker-compose.ghcr.yml logs --tail=50 ipc-bridge
 ```
 
 ### Migration Failures

@@ -87,19 +87,6 @@ services:
   # Daemon Workers
   # ===========================================================================
 
-  copy-trader:
-    <<: *worker-base
-    container_name: polymarket_copy_trader
-    command: ["src/jobs/copy-trader.ts"]
-    stop_grace_period: 45s
-    environment:
-      NODE_ENV: production
-      NODE_OPTIONS: --max-old-space-size=600
-    deploy:
-      resources:
-        limits:
-          memory: 768M
-
   ipc-bridge:
     <<: *worker-base
     container_name: polymarket_ipc_bridge

@@ -64,7 +64,7 @@ const envSchema = z.object({
     .default('true')
     .transform((v) => v === 'true'),
 
-  // Copy-trade wallet credentials (required when COPY_TRADE_ENABLED=true)
+  // Copy-trade wallet credentials (used by ipc-bridge for CLOB API)
   PRIVATE_KEY: z.string().optional(),
   CLOB_API_KEY: z.string().optional(),
   CLOB_API_SECRET: z.string().optional(),
@@ -97,8 +97,7 @@ const envSchema = z.object({
   HEDGE_MAX_RATIO: z.coerce.number().min(0).max(1.0).default(0.20),         // max 20% of opposite (5:1)
   HEDGE_NAKED_MAX_PRICE: z.coerce.number().min(0).max(0.50).default(0.10), // block naked BUY (no opposite) if price ≤ this (0 = disabled)
 
-  // Fallback poll interval for copy-trader when pg LISTEN is active
-  COPY_TRADE_FALLBACK_POLL_MS: z.coerce.number().min(1000).default(7000), // 7s safety net
+  COPY_TRADE_FALLBACK_POLL_MS: z.coerce.number().min(1000).default(7000), // legacy (unused, kept for .env compat)
 
   // Anti-cycle: per-token cool-down after a SELL fill to prevent market-making spread loss
   TOKEN_SELL_COOLDOWN_MS: z.coerce.number().min(0).default(60000), // 60s — 0 = disabled

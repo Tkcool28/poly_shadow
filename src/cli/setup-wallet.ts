@@ -78,5 +78,5 @@ export async function setupWallet(): Promise<void> {
   console.log('2. Set FUNDER_ADDRESS to your proxy wallet from Polymarket settings');
   console.log('3. Set SIGNATURE_TYPE=1 (POLY_PROXY) or SIGNATURE_TYPE=2 (GNOSIS_SAFE)');
   console.log('4. Ensure token approvals are set (usually already done if you trade on Polymarket)');
-  console.log('5. Set COPY_TRADE_ENABLED=true when ready to start');
+  console.log('5. Set PAPER_ONLY=false when ready for live trading');
 }

@@ -142,5 +142,5 @@ export async function resetFollows(options: ResetOptions): Promise<void> {
     );
   }
   console.log(`\nTotal: $${updated.reduce((s, a) => s + a.currentCapital, 0).toFixed(2)}`);
-  console.log('\nReminder: Restart copy-trader with `pm2 restart copy-trader`');
+  console.log('\nReminder: Restart ipc-bridge: docker compose restart ipc-bridge');
 }
