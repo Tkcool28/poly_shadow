@@ -476,11 +476,12 @@ export async function processCopyTrade(trade: DetectedTradeRow): Promise<void> {
   // ─── Global daily backstop (BUY only) ───
   // Per-allocation budget is managed via currentCapital; this is a cross-allocation safety net.
 
-  if (trade.side === 'BUY') {
+  if (trade.side === 'BUY' && !isPaper) {
     const todayStart = new Date();
     todayStart.setUTCHours(0, 0, 0, 0);
 
     // Global daily backstop (across all allocations, scoped by paper/live)
+    // Paper trades skip this — no real money at risk, per-allocation capital is sufficient guard
     const globalSpend = await prisma.copyTrade.aggregate({
       where: {
         status: { in: ['FILLED', 'POOLED', 'PENDING'] },
