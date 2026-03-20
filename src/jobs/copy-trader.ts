@@ -1234,6 +1234,12 @@ async function main() {
         timestamp: { gte: Math.floor(staleCutoff.getTime() / 1000) },
       };
 
+      // Paper: skip timestamp filter (POLL trades have stale timestamps but paper has no CLOB cost)
+      const paperBaseWhere = {
+        copyTrade: null,
+        detectedAt: { gte: staleCutoff },
+      };
+
       // ── SELLs: never filter CHAIN_MAKER — exits are always safe ──
       // Live: exclude RAPID_POLL/POLL (stale signals waste CLOB calls)
       // Paper: allow all sources (paper executor has no CLOB cost)
@@ -1252,7 +1258,7 @@ async function main() {
 
       const paperSells = paperSellWallets.length > 0 ? await prisma.detectedTrade.findMany({
         where: {
-          ...baseWhere,
+          ...paperBaseWhere,
           side: 'SELL',
           proxyWallet: { in: paperSellWallets },
         },
@@ -1328,7 +1334,7 @@ async function main() {
       const paperBuySourceFilter = config.SKIP_CHAIN_MAKER_FILLS ? ['CHAIN_MAKER'] : [];
       const paperBuys = paperBuyWallets.length > 0 ? await prisma.detectedTrade.findMany({
         where: {
-          ...baseWhere,
+          ...paperBaseWhere,
           side: 'BUY',
           proxyWallet: { in: paperBuyWallets },
           ...(paperBuySourceFilter.length > 0 ? { detectionSource: { notIn: paperBuySourceFilter } } : {}),
