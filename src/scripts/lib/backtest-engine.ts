@@ -52,6 +52,7 @@ export interface SimConfig {
   // Feature flags
   includeOpenMarkets?: boolean;
   trackPredictions?: boolean;
+  accumulatorWarmupSec?: number;  // seconds from first trade: warm accumulator only, no copy trades
 }
 
 export interface PredictionBreakdown {
@@ -91,6 +92,7 @@ export interface SimResult {
   scalpPct: number;
   holdWr: number;
   pnlPerDay: number;
+  buysPerDay: number;
   daysActive: number;
   score: number;
   skips: {
@@ -174,10 +176,12 @@ export function computeScore(
   copyPnl: number, copyRoi: number, scalpPct: number,
   copyBuys: number, maxDdPct: number,
   minBuysForScore: number = 0,
+  tradesPerDay: number = 1,
 ): number {
   if (copyPnl <= 0 || copyBuys < minBuysForScore) return -1;
   const samplePenalty = Math.min(1, Math.log(1 + copyBuys) / Math.log(1 + 50));
-  return copyRoi * (1 - scalpPct / 100) * samplePenalty * (1 / (1 + maxDdPct / 20));
+  const frequencyFactor = Math.min(1, tradesPerDay / 2.0);
+  return copyRoi * (1 - scalpPct / 100) * samplePenalty * (1 / (1 + maxDdPct / 20)) * (0.7 + 0.3 * frequencyFactor);
 }
 
 // ─── Main Simulation ───
@@ -197,6 +201,11 @@ export function simulateCopy(
 
   const rng = mulberry32(seed);
   trades.sort((a, b) => a.timestamp - b.timestamp);
+
+  // Warmup: early trades only build accumulator, no copy positions (simulates production cold-start)
+  const warmupCutoff = config.accumulatorWarmupSec && trades.length > 0
+    ? trades[0].timestamp + config.accumulatorWarmupSec * 1000
+    : 0;
 
   let buyCount = 0, wins = 0, losses = 0;
   let peakPnl = 0, maxDd = 0;
@@ -358,6 +367,9 @@ export function simulateCopy(
 
     const oi = resolveOutcomeIndex(trade);
     if (oi == null) continue;
+
+    // Warmup period: accumulate only, no copy trades
+    if (warmupCutoff && trade.timestamp < warmupCutoff) continue;
 
     // === PRODUCTION GUARDS ===
 
@@ -624,7 +636,8 @@ export function simulateCopy(
     ? Math.max(1, Math.round((new Date(allDays[allDays.length - 1]).getTime() - new Date(allDays[0]).getTime()) / (24 * 60 * 60 * 1000)) + 1)
     : 0;
 
-  const score = computeScore(copyPnl, copyRoi, scalpPct, buyCount, copyMaxDdPct);
+  const buysPerDay = calendarDays > 0 ? buyCount / calendarDays : 0;
+  const score = computeScore(copyPnl, copyRoi, scalpPct, buyCount, copyMaxDdPct, 0, buysPerDay);
 
   return {
     copyPnl, copyDeployed, copyRoi, copyWr, copyBuys: buyCount,
@@ -633,6 +646,7 @@ export function simulateCopy(
     winDays, lossDays, dayWr, maxWinStreak, maxLossStreak,
     mainCategory: mainCat, cryptoPct, scalpPct, holdWr,
     pnlPerDay: calendarDays > 0 ? copyPnl / calendarDays : 0,
+    buysPerDay,
     daysActive: calendarDays,
     score,
     skips: { slug: skippedSlug, price: skippedPrice, gate: skippedGate, pred: skippedPred, fak: skippedFak, capital: skippedCapital },

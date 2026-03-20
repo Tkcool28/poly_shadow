@@ -32,17 +32,24 @@ const TOP_N = parseInt(args.top ?? '20', 10);
 const MIN_BUYS_FOR_RANKING = 10;
 
 // ─── Sweep Dimensions ───
+// majorityOn: true → gate=175 (matches production MAJORITY_MIN_USD), false → gate=0
+// warmupHours: 0 = full history, 24 = simulate production cold-start (first 24h warms accumulator only)
 const SWEEP = {
   minBuyPrice:  [0.20, 0.30, 0.40, 0.50, 0.60],
-  gate:         [0, 50, 100, 175, 250],
+  majorityOn:   [false, true],
+  warmupHours:  [0, 24],
   maxTrade:     [3, 5, 8, 12],
   maxPred:      [10, 20, 30, 50],
   copyPercent:  [0.05, 0.10, 0.15, 0.20],
 };
 
+const MAJORITY_GATE_USD = 175;  // must match production MAJORITY_MIN_USD
+const MIN_BUYS_PER_DAY = 0.5;   // hard filter: configs below this are excluded from ranking
+
 interface SweepConfig {
   minBuyPrice: number;
-  gate: number;
+  majorityOn: boolean;
+  warmupHours: number;
   maxTrade: number;
   maxPred: number;
   copyPercent: number;
@@ -51,11 +58,13 @@ interface SweepConfig {
 function generateSweepConfigs(): SweepConfig[] {
   const configs: SweepConfig[] = [];
   for (const minBuyPrice of SWEEP.minBuyPrice) {
-    for (const gate of SWEEP.gate) {
-      for (const maxTrade of SWEEP.maxTrade) {
-        for (const maxPred of SWEEP.maxPred) {
-          for (const copyPercent of SWEEP.copyPercent) {
-            configs.push({ minBuyPrice, gate, maxTrade, maxPred, copyPercent });
+    for (const majorityOn of SWEEP.majorityOn) {
+      for (const warmupHours of SWEEP.warmupHours) {
+        for (const maxTrade of SWEEP.maxTrade) {
+          for (const maxPred of SWEEP.maxPred) {
+            for (const copyPercent of SWEEP.copyPercent) {
+              configs.push({ minBuyPrice, majorityOn, warmupHours, maxTrade, maxPred, copyPercent });
+            }
           }
         }
       }
@@ -180,17 +189,18 @@ async function main() {
         maxTradeUsd: sc.maxTrade,
         maxPredUsd: sc.maxPred,
         minBuyPrice: sc.minBuyPrice,
-        majorityGate: sc.gate,
+        majorityGate: sc.majorityOn ? MAJORITY_GATE_USD : 0,
+        accumulatorWarmupSec: sc.warmupHours * 3600,
         trackPredictions: false,
         includeOpenMarkets: !!timeWindow,
       };
       const result = simulateCopy(trades, simCfg);
-      results.push({ ...result, sweepCfg: sc, score: computeScore(result.copyPnl, result.copyRoi, result.scalpPct, result.copyBuys, result.copyMaxDdPct, MIN_BUYS_FOR_RANKING) });
+      results.push({ ...result, sweepCfg: sc, score: computeScore(result.copyPnl, result.copyRoi, result.scalpPct, result.copyBuys, result.copyMaxDdPct, MIN_BUYS_FOR_RANKING, result.buysPerDay) });
     }
 
     const elapsed = ((Date.now() - startMs) / 1000).toFixed(1);
-    const profitable = results.filter(r => r.score > 0);
-    console.log(`  Done in ${elapsed}s — ${profitable.length}/${sweepConfigs.length} profitable (>= ${MIN_BUYS_FOR_RANKING} buys)\n`);
+    const profitable = results.filter(r => r.score > 0 && r.buysPerDay >= MIN_BUYS_PER_DAY);
+    console.log(`  Done in ${elapsed}s — ${profitable.length}/${sweepConfigs.length} profitable (>= ${MIN_BUYS_FOR_RANKING} buys, >= ${MIN_BUYS_PER_DAY} buys/day)\n`);
 
     profitable.sort((a, b) => b.score - a.score);
     const seen = new Set<string>();
@@ -205,9 +215,9 @@ async function main() {
     console.log(`  Unique result profiles: ${deduped.length} (from ${profitable.length} profitable configs)\n`);
 
     const subheader =
-      `${pad('', 5)}${rpad('minBuy', 7)}${rpad('Gate$', 6)}${rpad('MaxTr', 7)}${rpad('MaxPrd', 7)}${rpad('Copy%', 6)}  ` +
+      `${pad('', 5)}${rpad('minBuy', 7)}${rpad('Maj', 5)}${rpad('Warm', 5)}${rpad('MaxTr', 7)}${rpad('MaxPrd', 7)}${rpad('Copy%', 6)}  ` +
       `${rpad('PnL$', 8)}${rpad('Depld$', 8)}${rpad('ROI%', 7)}${rpad('HldWR%', 7)}${rpad('Buys', 6)}` +
-      `${rpad('MaxDD%', 8)}${rpad('Sharpe', 8)}${rpad('DayWR%', 7)}${rpad('Score', 8)}`;
+      `${rpad('MaxDD%', 8)}${rpad('Sharpe', 8)}${rpad('Tr/Day', 7)}${rpad('Score', 8)}`;
     console.log(subheader);
     console.log('-'.repeat(subheader.length));
 
@@ -216,9 +226,9 @@ async function main() {
       const c = r.sweepCfg;
       console.log(
         `${pad(String(i + 1), 5)}` +
-        `${rpad(c.minBuyPrice.toFixed(2), 7)}${rpad('$' + c.gate, 6)}${rpad('$' + c.maxTrade, 7)}${rpad('$' + c.maxPred, 7)}${rpad((c.copyPercent * 100).toFixed(0) + '%', 6)}  ` +
+        `${rpad(c.minBuyPrice.toFixed(2), 7)}${rpad(c.majorityOn ? 'Yes' : 'No', 5)}${rpad(c.warmupHours + 'h', 5)}${rpad('$' + c.maxTrade, 7)}${rpad('$' + c.maxPred, 7)}${rpad((c.copyPercent * 100).toFixed(0) + '%', 6)}  ` +
         `${rpad('$' + r.copyPnl.toFixed(0), 8)}${rpad('$' + r.copyDeployed.toFixed(0), 8)}${rpad(r.copyRoi.toFixed(1), 7)}${rpad(r.holdWr.toFixed(1), 7)}${rpad(String(r.copyBuys), 6)}` +
-        `${rpad(r.copyMaxDdPct.toFixed(1), 8)}${rpad(r.copySharpe.toFixed(2), 8)}${rpad(r.dayWr.toFixed(0), 7)}${rpad(r.score.toFixed(2), 8)}`
+        `${rpad(r.copyMaxDdPct.toFixed(1), 8)}${rpad(r.copySharpe.toFixed(2), 8)}${rpad(r.buysPerDay.toFixed(1), 7)}${rpad(r.score.toFixed(2), 8)}`
       );
     }
 
@@ -235,7 +245,8 @@ async function main() {
             maxTradeUsd: baseSc.maxTrade,
             maxPredUsd: baseSc.maxPred,
             minBuyPrice: baseSc.minBuyPrice,
-            majorityGate: baseSc.gate,
+            majorityGate: baseSc.majorityOn ? MAJORITY_GATE_USD : 0,
+            accumulatorWarmupSec: baseSc.warmupHours * 3600,
             seed: baseConfig.seed + s,
             trackPredictions: false,
             includeOpenMarkets: !!timeWindow,
@@ -249,7 +260,7 @@ async function main() {
         const stdev = Math.sqrt(variance);
         const allPositive = mcPnls.every(p => p > 0);
 
-        console.log(`  Config #${i + 1} (minBuy=${baseSc.minBuyPrice} Gate=${baseSc.gate} MaxTr=${baseSc.maxTrade} MaxPr=${baseSc.maxPred} Copy=${(baseSc.copyPercent * 100).toFixed(0)}%):`);
+        console.log(`  Config #${i + 1} (minBuy=${baseSc.minBuyPrice} Maj=${baseSc.majorityOn ? 'Yes' : 'No'} Warm=${baseSc.warmupHours}h MaxTr=${baseSc.maxTrade} MaxPr=${baseSc.maxPred} Copy=${(baseSc.copyPercent * 100).toFixed(0)}%):`);
         console.log(`    PnLs: ${mcPnls.map(p => '$' + p.toFixed(0)).join(', ')}`);
         console.log(`    Mean=$${mean.toFixed(0)} | Stdev=$${stdev.toFixed(0)} | Min=$${min.toFixed(0)} | Max=$${max.toFixed(0)} | All positive: ${allPositive ? 'YES' : 'NO'}`);
         console.log('');
@@ -259,10 +270,11 @@ async function main() {
     // Parameter sensitivity
     console.log(`  Parameter Sensitivity (avg PnL by parameter value, profitable configs only):\n`);
     for (const [param, values] of Object.entries(SWEEP)) {
-      const row = values.map((v: number) => {
+      const row = (values as (number | boolean)[]).map((v) => {
         const matching = profitable.filter(r => (r.sweepCfg as any)[param] === v);
         const avgPnl = matching.length > 0 ? matching.reduce((s, r) => s + r.copyPnl, 0) / matching.length : 0;
-        return `${v}→$${avgPnl.toFixed(0)}`;
+        const label = typeof v === 'boolean' ? (v ? 'on' : 'off') : String(v);
+        return `${label}→$${avgPnl.toFixed(0)}`;
       }).join('  ');
       console.log(`    ${pad(param, 14)}: ${row}`);
     }

@@ -117,6 +117,9 @@ async function main() {
       }
 
       const gate = args.gate ? parseInt(args.gate, 10) : 175;
+      if (gate !== 0 && gate !== 175) {
+        console.warn(`WARNING: gate=${gate} not standard. Production uses MAJORITY_MIN_USD=175. Use 0 (off) or 175 (on).`);
+      }
       const configData = {
         copyTradePercent: args['copy-percent'] ? parseFloat(args['copy-percent']) : null,
         maxPositionUsd: args['max-trade'] ? parseFloat(args['max-trade']) : null,
@@ -221,7 +224,13 @@ async function main() {
     if (args['max-trade']) addUpdate('maxPositionUsd', parseFloat(args['max-trade']));
     if (args['max-pred']) addUpdate('maxPredictionPositionUsd', parseFloat(args['max-pred']));
     if (args['min-buy-price']) addUpdate('minBuyPrice', parseFloat(args['min-buy-price']));
-    if (args.gate) addUpdate('majorityOnlyMode', parseInt(args.gate, 10) > 0);
+    if (args.gate) {
+      const gateVal = parseInt(args.gate, 10);
+      if (gateVal !== 0 && gateVal !== 175) {
+        console.warn(`WARNING: gate=${gateVal} not standard. Production uses MAJORITY_MIN_USD=175. Use 0 (off) or 175 (on).`);
+      }
+      addUpdate('majorityOnlyMode', gateVal > 0);
+    }
     if (args['follow-sells']) addUpdate('copySells', true);
     if (args['no-follow-sells']) addUpdate('copySells', false);
     if (args['both-sides']) addUpdate('committedSideLock', false);
