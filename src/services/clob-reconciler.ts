@@ -7,6 +7,10 @@ import { getOrCreateMutex } from '../lib/allocation-mutex';
 
 const log = createJobLogger('clob-reconciler');
 
+// Track orderIds that recently failed getOrder() — skip for 10min to avoid retry loops
+const failedOrderCooldown = new Map<string, number>();
+const GHOST_FILL_COOLDOWN_MS = 10 * 60 * 1000;
+
 export async function reconcileStalePending(): Promise<void> {
   const stalePending = await prisma.copyTrade.findMany({
     where: { status: 'PENDING', createdAt: { lt: new Date(Date.now() - 60000) } },
@@ -165,11 +169,18 @@ export async function reconcileSkippedGhostFills(): Promise<void> {
         { failReason: { contains: 'GTC fallback: placement failed' } },
       ],
       isPaper: false,
-      createdAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+      createdAt: { gte: new Date(Date.now() - 4 * 60 * 60 * 1000) }, // 4h — FAK fills instantly, GTC within minutes
     },
   });
 
   if (skippedWithOrderId.length === 0) return;
+
+  // Prune stale cooldown entries
+  const now = Date.now();
+  for (const [orderId, ts] of failedOrderCooldown) {
+    if (now - ts > GHOST_FILL_COOLDOWN_MS) failedOrderCooldown.delete(orderId);
+  }
+
   log.info(`Ghost fill reconciliation: checking ${skippedWithOrderId.length} SKIPPED FAK/GTC trades`);
 
   const client = getClient();
@@ -182,6 +193,10 @@ export async function reconcileSkippedGhostFills(): Promise<void> {
   const affectedAllocations = new Set<string>();
 
   for (const record of skippedWithOrderId) {
+    // Skip orders that recently failed — avoid hammering CLOB with repeat 500s
+    const lastFail = failedOrderCooldown.get(record.orderId!);
+    if (lastFail && Date.now() - lastFail < GHOST_FILL_COOLDOWN_MS) continue;
+
     try {
       const order = await client.getOrder(record.orderId!);
 
@@ -245,6 +260,7 @@ export async function reconcileSkippedGhostFills(): Promise<void> {
         });
       }
     } catch (err: any) {
+      failedOrderCooldown.set(record.orderId!, Date.now());
       log.warn('Ghost fill check failed for order', {
         id: record.id, orderId: record.orderId,
         error: err.message?.slice(0, 200),

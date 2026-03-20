@@ -13,7 +13,7 @@ import { initialize as initExecutor } from '../services/trade-executor.js';
 const log = createJobLogger('ipc-bridge');
 const SETTLEMENT_INTERVAL_MS = 5 * 60 * 1000; // 5 min
 const MARKET_REFRESH_MS = 15 * 60 * 1000; // 15 min
-const RECONCILE_INTERVAL_MS = 60 * 1000; // 60s
+const RECONCILE_INTERVAL_MS = 5 * 60 * 1000; // 5 min — SKIPPED records are hours old, no urgency
 
 async function main() {
   let shuttingDown = false;

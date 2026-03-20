@@ -364,13 +364,15 @@ pub fn run(
             }
         }
 
-        // ─── 18. Daily loss limit ───
-        let daily_remaining =
-            config.max_daily_loss_usd - state.capital.daily_spend(is_paper);
-        if daily_remaining <= 0.0 {
-            return FilterResult::Skip("global daily loss limit reached".into());
+        // ─── 18. Daily loss limit (live only — paper has no real capital risk) ───
+        if !is_paper {
+            let daily_remaining =
+                config.max_daily_loss_usd - state.capital.daily_spend(false);
+            if daily_remaining <= 0.0 {
+                return FilterResult::Skip("global daily loss limit reached".into());
+            }
+            amt = amt.min(daily_remaining);
         }
-        amt = amt.min(daily_remaining);
 
         // ─── 19. Zero amount ───
         if amt <= 0.0 {
@@ -737,6 +739,28 @@ mod tests {
                 );
             }
             FilterResult::Skip(reason) => panic!("expected Execute, got Skip: {reason}"),
+        }
+    }
+
+    #[test]
+    fn test_daily_loss_limit_skipped_for_paper() {
+        let config = default_config(); // max_daily_loss_usd = 200
+        let mut alloc = default_alloc();
+        alloc.is_paper = true;
+        let state = default_state();
+
+        // Seed paper daily spend way over limit
+        state.capital.seed_daily_spend(true, 999.0);
+
+        let signal = buy_signal(0.70, 50.0);
+        match run(&signal, &alloc, &config, &state) {
+            FilterResult::Execute(_) => {} // paper should NOT be blocked by daily limit
+            FilterResult::Skip(reason) => {
+                assert!(
+                    !reason.contains("daily loss"),
+                    "paper should bypass daily limit, got: {reason}"
+                );
+            }
         }
     }
 
