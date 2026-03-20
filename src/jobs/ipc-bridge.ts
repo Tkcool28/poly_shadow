@@ -8,12 +8,18 @@ import {
   sweepStaleMarkets,
 } from '../services/position-settlement.js';
 import { reconcileStalePending, reconcileSkippedGhostFills } from '../services/clob-reconciler.js';
-import { initialize as initExecutor } from '../services/trade-executor.js';
+import { initialize as initExecutor, getWalletBalance } from '../services/trade-executor.js';
+import { auditAllAllocations, cleanupPhantomPositions, checkCircuitBreakers } from '../lib/capital-audit.js';
+import { sweepPreResolutionSells } from '../services/pre-resolution-seller.js';
+import { config } from '../config/env.js';
 
 const log = createJobLogger('ipc-bridge');
 const SETTLEMENT_INTERVAL_MS = 5 * 60 * 1000; // 5 min
 const MARKET_REFRESH_MS = 15 * 60 * 1000; // 15 min
-const RECONCILE_INTERVAL_MS = 5 * 60 * 1000; // 5 min — SKIPPED records are hours old, no urgency
+const RECONCILE_INTERVAL_MS = 5 * 60 * 1000; // 5 min
+const CAPITAL_AUDIT_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const BALANCE_CHECK_INTERVAL_MS = 10 * 60 * 1000; // 10 min
+const PRE_RESOLUTION_INTERVAL_MS = 15 * 60 * 1000; // 15 min
 
 async function main() {
   let shuttingDown = false;
@@ -25,6 +31,9 @@ async function main() {
   let settlementTimer: ReturnType<typeof setInterval>;
   let marketRefreshTimer: ReturnType<typeof setInterval>;
   let reconcileTimer: ReturnType<typeof setInterval>;
+  let capitalAuditTimer: ReturnType<typeof setInterval>;
+  let balanceCheckTimer: ReturnType<typeof setInterval>;
+  let preResolutionTimer: ReturnType<typeof setInterval>;
 
   const cleanup = async (signal: string) => {
     if (shuttingDown) return;
@@ -33,6 +42,9 @@ async function main() {
     clearInterval(settlementTimer);
     clearInterval(marketRefreshTimer);
     clearInterval(reconcileTimer);
+    clearInterval(capitalAuditTimer);
+    clearInterval(balanceCheckTimer);
+    clearInterval(preResolutionTimer);
     closeBridge();
     await prisma.$disconnect();
     process.exit(0);
@@ -64,7 +76,7 @@ async function main() {
     }
   }, MARKET_REFRESH_MS);
 
-  // Reconciliation sweep (60s) — recovers stale PENDING and ghost fills
+  // Reconciliation sweep (5min) — recovers stale PENDING and ghost fills
   reconcileTimer = setInterval(async () => {
     if (shuttingDown) return;
     try {
@@ -74,6 +86,59 @@ async function main() {
       log.warn(`Reconciliation sweep failed: ${err.message}`);
     }
   }, RECONCILE_INTERVAL_MS);
+
+  // Capital audit (1h) — drift detection + phantom cleanup + circuit breakers
+  capitalAuditTimer = setInterval(async () => {
+    if (shuttingDown) return;
+    try {
+      await auditAllAllocations({ isPaper: false, threshold: 1.0 });
+      if (config.PHANTOM_AUTO_CLEANUP_ENABLED && config.FUNDER_ADDRESS) {
+        await cleanupPhantomPositions(config.FUNDER_ADDRESS);
+      }
+      if (config.ALLOCATION_CIRCUIT_BREAKER_ENABLED) {
+        await checkCircuitBreakers(config.ALLOCATION_CIRCUIT_BREAKER_THRESHOLD);
+      }
+    } catch (err: any) {
+      log.warn(`Capital audit failed: ${err.message}`);
+    }
+  }, CAPITAL_AUDIT_INTERVAL_MS);
+
+  // Balance monitor (10min) — wallet USDC check for live allocations
+  balanceCheckTimer = setInterval(async () => {
+    if (shuttingDown) return;
+    try {
+      // Query ALL non-paper allocations (wallet holds capital for active + inactive)
+      const dbCapital = (await prisma.followAllocation.aggregate({
+        where: { isPaper: false },
+        _sum: { currentCapital: true },
+      }))._sum.currentCapital ?? 0;
+      if (dbCapital === 0) return; // no live allocations
+
+      const walletBal = await getWalletBalance();
+      if (walletBal) {
+        const deficit = dbCapital - walletBal.balance;
+        if (deficit > config.BALANCE_MISMATCH_THRESHOLD) {
+          log.warn('Balance deficit: wallet USDC below total DB currentCapital', {
+            clobBalance: walletBal.balance.toFixed(2),
+            dbTotalCC: dbCapital.toFixed(2),
+            deficit: deficit.toFixed(2),
+          });
+        }
+      }
+    } catch (err: any) {
+      log.warn(`Balance check failed: ${err.message}`);
+    }
+  }, BALANCE_CHECK_INTERVAL_MS);
+
+  // Pre-resolution sells (15min) — auto-exit before market deadline
+  preResolutionTimer = setInterval(async () => {
+    if (shuttingDown) return;
+    try {
+      await sweepPreResolutionSells();
+    } catch (err: any) {
+      log.warn(`Pre-resolution sweep failed: ${err.message}`);
+    }
+  }, PRE_RESOLUTION_INTERVAL_MS);
 
   // Startup sweeps
   sweepPositionSettlements()
@@ -85,6 +150,10 @@ async function main() {
   reconcileStalePending()
     .then(() => reconcileSkippedGhostFills())
     .catch((err: any) => log.warn(`Startup reconciliation failed: ${err.message}`));
+  auditAllAllocations({ isPaper: false, threshold: 1.0 })
+    .catch((err: any) => log.warn(`Startup capital audit failed: ${err.message}`));
+  sweepPreResolutionSells()
+    .catch((err: any) => log.warn(`Startup pre-resolution sweep failed: ${err.message}`));
 
   log.info('IPC bridge process ready');
   await new Promise(() => {}); // keep alive forever
