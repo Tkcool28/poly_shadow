@@ -134,8 +134,9 @@ impl ClobClient {
         side: TradeSide,
         original: FillResult,
     ) -> FillResult {
-        // Brief delay for CLOB internal state propagation before querying
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Sports markets have a ~3s matching delay. POST returns success+orderID
+        // but zero amounts. Wait for matching to settle before checking fill status.
+        tokio::time::sleep(Duration::from_secs(3)).await;
         match self.get_order(order_id).await {
             Ok(resp) => {
                 let status = resp.status.as_deref().unwrap_or("unknown");
@@ -159,13 +160,12 @@ impl ClobClient {
                         };
                     }
                 }
-                // Not matched or zero amounts — genuine unmatched FAK
-                tracing::info!(order_id, status, "FAK verify: not matched");
+                // After 3s, still not matched — genuinely unmatched FAK
+                tracing::info!(order_id, status, "FAK verify: not matched after 3s");
                 original
             }
             Err(e) => {
-                // GET failed — can't verify. Return original Skipped.
-                tracing::warn!(error = %e, order_id, "FAK verify: get_order failed");
+                tracing::warn!(error = %e, order_id, "FAK verify: get_order failed after 3s");
                 original
             }
         }
@@ -420,6 +420,10 @@ impl ClobClient {
         let url = format!("{}{}", self.base_url, path);
         let resp = self.http.get(&url).headers(headers).send().await?;
         let text = resp.text().await?;
+        // CLOB returns literal "null" for orders not yet settled
+        if text.trim() == "null" || text.trim().is_empty() {
+            return Err(anyhow::anyhow!("order not found (null response)"));
+        }
         Ok(serde_json::from_str(&text)?)
     }
 
