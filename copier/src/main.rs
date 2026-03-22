@@ -4,6 +4,8 @@ mod filter;
 mod ipc;
 mod state;
 mod wss;
+#[cfg(test)]
+mod test_clob_order;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;

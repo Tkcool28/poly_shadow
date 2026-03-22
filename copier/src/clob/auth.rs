@@ -41,8 +41,12 @@ fn hmac_sign(
         message.push_str(b);
     }
 
-    // Decode secret: may be base64url, convert to standard base64 first
-    let sanitized = secret_b64.replace('-', "+").replace('_', "/");
+    // Decode secret: may be base64url without padding, convert to standard base64
+    let mut sanitized = secret_b64.replace('-', "+").replace('_', "/");
+    // Add padding if missing (base64 STANDARD requires it)
+    while sanitized.len() % 4 != 0 {
+        sanitized.push('=');
+    }
     let key_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &sanitized)?;
 
     // HMAC-SHA256

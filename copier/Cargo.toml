@@ -27,6 +27,9 @@ alloy-primitives = "0.8"
 alloy-sol-types = "0.8"
 ethers = { version = "2", features = ["eip712"] }
 
+# Env loading (test only)
+dotenv = "0.15"
+
 # CLOB API authentication
 hmac = "0.12"
 sha2 = "0.10"

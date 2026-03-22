@@ -151,6 +151,12 @@ const envSchema = z.object({
   // Min USD value to trigger auto-claim (netShares == USD for price=1.0 wins; skips gas-inefficient dust)
   MIN_CLAIM_USD: z.coerce.number().min(0).default(1.00),
 
+  // Polymarket Relayer API (gasless on-chain operations: redeem, split, merge)
+  RELAYER_API_KEY: z.string().optional(),
+  RELAYER_API_KEY_ADDRESS: z.string().optional(),
+  RELAYER_ENABLED: z.string().default('false').transform((v) => v === 'true'),
+  RELAYER_URL: z.string().default('https://relayer-v2.polymarket.com/'),
+
   // Position settlement
   SETTLEMENT_SWEEP_INTERVAL_MS: z.coerce.number().default(300000), // 5 minutes
   STALE_TRADE_CUTOFF_MS: z.coerce.number().default(600000), // 10 min (was hardcoded 5 min)
