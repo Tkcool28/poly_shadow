@@ -387,20 +387,31 @@ async function queryMarkets(): Promise<
     where: { conditionId: { in: cids } },
   });
 
-  return markets.map((m) => {
-    let tokens: string[] = [];
-    try { tokens = JSON.parse(m.clobTokenIds ?? '[]'); } catch {}
-    return {
-      condition_id: m.conditionId,
-      closed: m.closed ?? false,
-      end_date: m.endDate ? Math.floor(m.endDate.getTime() / 1000) : null,
-      event_slug: m.slug ?? null,
-      question: m.question ?? null,
-      tokens,
-      tick_size: String(m.minimumTickSize ?? 0.01),
-      taker_base_fee: null, // DB doesn't store this; Rust resolver fills from CLOB API
-    };
+  // Build conditionId → tokenIds from DetectedTrade assets
+  // (Market model doesn't have clobTokenIds — Gamma API is the source)
+  const tokensByCondition = new Map<string, string[]>();
+  const tokenRows = await prisma.detectedTrade.findMany({
+    where: { conditionId: { in: cids } },
+    select: { conditionId: true, asset: true },
+    distinct: ['conditionId', 'asset'],
   });
+  for (const row of tokenRows) {
+    const existing = tokensByCondition.get(row.conditionId) ?? [];
+    if (!existing.includes(row.asset)) {
+      tokensByCondition.set(row.conditionId, [...existing, row.asset]);
+    }
+  }
+
+  return markets.map((m) => ({
+    condition_id: m.conditionId,
+    closed: m.closed ?? false,
+    end_date: m.endDate ? Math.floor(m.endDate.getTime() / 1000) : null,
+    event_slug: m.eventSlug ?? null,
+    question: m.question ?? null,
+    tokens: tokensByCondition.get(m.conditionId) ?? [],
+    tick_size: "0.01", // Default; Rust MetadataResolver fetches actual from CLOB API
+    taker_base_fee: null, // DB doesn't store this; Rust resolver fills from CLOB API
+  }));
 }
 
 // ─── Trade Detected Handler ───

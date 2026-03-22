@@ -97,7 +97,7 @@ async function doSweepPositionSettlements(): Promise<void> {
   // Split conditionIds by negRisk flag to avoid Gamma garbage for NegRisk markets
   const marketRows = await prisma.market.findMany({
     where: { conditionId: { in: uniqueConditionIds } },
-    select: { conditionId: true, negRisk: true, outcomes: true, clobTokenIds: true },
+    select: { conditionId: true, negRisk: true, outcomes: true },
   });
   const negRiskSet = new Set(marketRows.filter(m => m.negRisk).map(m => m.conditionId));
   const standardIds = uniqueConditionIds.filter(id => !negRiskSet.has(id));
@@ -519,12 +519,16 @@ async function doSweepPositionSettlements(): Promise<void> {
         }
         if (tids.length > 0) conditionTokenIds.set(market.conditionId, tids);
       }
-      // Also include NegRisk/DB-only markets
-      for (const m of marketRows) {
-        if (conditionTokenIds.has(m.conditionId)) continue;
-        let tids: string[] = [];
-        try { tids = JSON.parse(m.clobTokenIds ?? '[]'); } catch {}
-        if (tids.length > 0) conditionTokenIds.set(m.conditionId, tids);
+      // For NegRisk markets not in Gamma, try to build from DetectedTrade asset→conditionId
+      // (Market model doesn't have clobTokenIds — only Gamma API provides them)
+      for (const pos of openPositions) {
+        const meta = tokenMeta.get(pos.tokenId);
+        if (!meta || conditionTokenIds.has(meta.conditionId)) continue;
+        // Build from our position tokens — we know at least this tokenId belongs to this condition
+        const existing = conditionTokenIds.get(meta.conditionId) ?? [];
+        if (!existing.includes(pos.tokenId)) {
+          conditionTokenIds.set(meta.conditionId, [...existing, pos.tokenId]);
+        }
       }
 
       for (const conditionId of resolvedMarkets.keys()) {
