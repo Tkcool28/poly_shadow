@@ -228,8 +228,10 @@ pub fn parse_fill_amounts(
     taking_amount_str: &str,
     side: TradeSide,
 ) -> (f64, f64) {
-    let making = making_amount_str.parse::<f64>().unwrap_or(0.0) / 1e6;
-    let taking = taking_amount_str.parse::<f64>().unwrap_or(0.0) / 1e6;
+    // CLOB API returns amounts as direct float strings (e.g., "2.127658"), NOT 6-decimal units.
+    // We SEND in 6-decimal units (to_units_string) but RECEIVE as floats.
+    let making = making_amount_str.parse::<f64>().unwrap_or(0.0);
+    let taking = taking_amount_str.parse::<f64>().unwrap_or(0.0);
 
     if making <= 0.0 || taking <= 0.0 {
         return (0.0, 0.0);
@@ -356,8 +358,8 @@ mod tests {
 
     #[test]
     fn test_parse_fill_normal_buy() {
-        // BUY: making=shares, taking=usdc
-        let (size, price) = parse_fill_amounts("7690000", "5000000", TradeSide::Buy);
+        // BUY: making=shares, taking=usdc (CLOB returns direct float strings)
+        let (size, price) = parse_fill_amounts("7.69", "5.0", TradeSide::Buy);
         assert!((size - 7.69).abs() < 0.001);
         assert!((price - 0.6502).abs() < 0.01);
     }
@@ -365,8 +367,7 @@ mod tests {
     #[test]
     fn test_parse_fill_negrisk_buy() {
         // NegRisk BUY: amounts swapped, price > 1.0 triggers flip
-        // making=5000000 (usdc), taking=7690000 (shares) but swapped
-        let (size, price) = parse_fill_amounts("5000000", "7690000", TradeSide::Buy);
+        let (size, price) = parse_fill_amounts("5.0", "7.69", TradeSide::Buy);
         // Normal: price = 7.69/5.0 = 1.538 > 1.0 → flip
         // After flip: shares=7.69, price=5.0/7.69≈0.65
         assert!((size - 7.69).abs() < 0.001);
