@@ -68,7 +68,7 @@ async function main() {
     null,
     {
       trackPredictions: VERBOSE,
-      includeOpenMarkets: !!timeWindow,
+      includeOpenMarkets: !!timeWindow || !!args['include-open'],
     },
   );
 
@@ -148,21 +148,37 @@ async function main() {
   const results: TraderResult[] = [];
   let processed = 0;
 
+  const includeOpen = !!args['include-open'];
+
   for (const trader of traders.rows) {
-    const tradeQuery = timeWindow
-      ? `SELECT t."conditionId", t.outcome, t."outcomeIndex",
+    let tradeQuery: string;
+    let tradeParams: any[];
+
+    if (timeWindow) {
+      tradeQuery = `SELECT t."conditionId", t.outcome, t."outcomeIndex",
                t.price, t.size, t.timestamp, t.side, t."eventSlug",
                m."outcomePrices", m.outcomes, m."endDate", m.closed, m.question
          FROM "Trade" t JOIN "Market" m ON t."conditionId" = m."conditionId"
          WHERE t."proxyWallet" = $1 AND t.timestamp >= $2
-         ORDER BY t.timestamp ASC`
-      : `SELECT t."conditionId", t.outcome, t."outcomeIndex",
+         ORDER BY t.timestamp ASC`;
+      tradeParams = [trader.proxyWallet, timeWindow.cutoffTs];
+    } else if (includeOpen) {
+      tradeQuery = `SELECT t."conditionId", t.outcome, t."outcomeIndex",
+               t.price, t.size, t.timestamp, t.side, t."eventSlug",
+               m."outcomePrices", m.outcomes, m."endDate", m.closed, m.question
+         FROM "Trade" t JOIN "Market" m ON t."conditionId" = m."conditionId"
+         WHERE t."proxyWallet" = $1
+         ORDER BY t.timestamp ASC`;
+      tradeParams = [trader.proxyWallet];
+    } else {
+      tradeQuery = `SELECT t."conditionId", t.outcome, t."outcomeIndex",
                t.price, t.size, t.timestamp, t.side, t."eventSlug",
                m."outcomePrices", m.outcomes, m."endDate"
          FROM "Trade" t JOIN "Market" m ON t."conditionId" = m."conditionId"
          WHERE t."proxyWallet" = $1 AND m.closed = true
          ORDER BY t.timestamp ASC`;
-    const tradeParams = timeWindow ? [trader.proxyWallet, timeWindow.cutoffTs] : [trader.proxyWallet];
+      tradeParams = [trader.proxyWallet];
+    }
     const tradeResult = await db.query(tradeQuery, tradeParams);
 
     const trades: TradeRow[] = tradeResult.rows.map((r: any) => ({
@@ -177,7 +193,7 @@ async function main() {
       outcomePrices: r.outcomePrices || '[]',
       outcomes: r.outcomes || '[]',
       endDate: r.endDate ? Math.floor(new Date(r.endDate).getTime() / 1000) : null,
-      ...(timeWindow ? { closed: r.closed ?? true, question: r.question || '' } : {}),
+      ...(timeWindow || includeOpen ? { closed: r.closed ?? true, question: r.question || '' } : {}),
     }));
 
     // Trader stats
@@ -300,6 +316,11 @@ async function main() {
   }
   console.log(`Unprofitable: ${unprofitable.length}`);
   console.log(`Profitable crypto traders: ${cryptoProfitable.length}`);
+  const perfectWr = profitable.filter(r => r.sim.holdWr >= 100.0);
+  if (perfectWr.length > 0 && !includeOpen) {
+    console.log(`\n  WARNING: ${perfectWr.length} traders show 100% holdWR — likely survivorship bias from closed-only filter.`);
+    console.log(`  Re-run with --include-open to include open market positions.`);
+  }
   console.log(`\nTop 5 by composite score:`);
   for (const r of profitable.slice(0, 5)) {
     console.log(`  ${r.name}: Score=${r.sim.score.toFixed(2)} | CopyPnL=$${r.sim.copyPnl.toFixed(0)} | ActPnL=$${r.traderPnl.toFixed(0)} | HoldWR=${r.sim.holdWr.toFixed(1)}% | ${r.sim.mainCategory}`);

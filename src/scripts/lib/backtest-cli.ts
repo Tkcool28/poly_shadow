@@ -28,6 +28,8 @@ export const COMMON_FLAGS = {
   output: { type: 'string' as const, default: '' },
   hours: { type: 'string' as const, default: '0' },
   days: { type: 'string' as const, default: '0' },
+  'include-open': { type: 'boolean' as const, default: false },
+  'no-train-test': { type: 'boolean' as const, default: false },
 } as const;
 
 // ─── DB Allocation Row ───

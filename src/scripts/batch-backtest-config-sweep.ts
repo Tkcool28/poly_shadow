@@ -96,6 +96,8 @@ async function main() {
   if (timeWindow) flags.push(`window=${timeWindow.days > 0 ? `${timeWindow.days}d` : `${timeWindow.hours}h`}`);
   console.log(`Config: ${flags.join(' ')}\n`);
 
+  const includeOpen = !!args['include-open'];
+
   for (const input of traderInputs) {
     let wallet: string;
     let userName: string;
@@ -111,20 +113,34 @@ async function main() {
     }
 
     // Fetch trades
-    const tradeQuery = timeWindow
-      ? `SELECT t."conditionId", t.outcome, t."outcomeIndex",
+    let tradeQuery: string;
+    let tradeParams: any[];
+
+    if (timeWindow) {
+      tradeQuery = `SELECT t."conditionId", t.outcome, t."outcomeIndex",
                t.price, t.size, t.timestamp, t.side, t."eventSlug",
                m."outcomePrices", m.outcomes, m."endDate", m.closed
          FROM "Trade" t JOIN "Market" m ON t."conditionId" = m."conditionId"
          WHERE t."proxyWallet" = $1 AND t.timestamp >= $2
-         ORDER BY t.timestamp ASC`
-      : `SELECT t."conditionId", t.outcome, t."outcomeIndex",
+         ORDER BY t.timestamp ASC`;
+      tradeParams = [wallet, timeWindow.cutoffTs];
+    } else if (includeOpen) {
+      tradeQuery = `SELECT t."conditionId", t.outcome, t."outcomeIndex",
+               t.price, t.size, t.timestamp, t.side, t."eventSlug",
+               m."outcomePrices", m.outcomes, m."endDate", m.closed
+         FROM "Trade" t JOIN "Market" m ON t."conditionId" = m."conditionId"
+         WHERE t."proxyWallet" = $1
+         ORDER BY t.timestamp ASC`;
+      tradeParams = [wallet];
+    } else {
+      tradeQuery = `SELECT t."conditionId", t.outcome, t."outcomeIndex",
                t.price, t.size, t.timestamp, t.side, t."eventSlug",
                m."outcomePrices", m.outcomes, m."endDate"
          FROM "Trade" t JOIN "Market" m ON t."conditionId" = m."conditionId"
          WHERE t."proxyWallet" = $1 AND m.closed = true
          ORDER BY t.timestamp ASC`;
-    const tradeParams = timeWindow ? [wallet, timeWindow.cutoffTs] : [wallet];
+      tradeParams = [wallet];
+    }
     const tradeResult = await db.query(tradeQuery, tradeParams);
 
     const trades: TradeRow[] = tradeResult.rows.map((r: any) => ({
@@ -139,7 +155,7 @@ async function main() {
       outcomePrices: r.outcomePrices || '[]',
       outcomes: r.outcomes || '[]',
       endDate: r.endDate ? Math.floor(new Date(r.endDate).getTime() / 1000) : null,
-      ...(timeWindow ? { closed: r.closed ?? true } : {}),
+      ...(timeWindow || includeOpen ? { closed: r.closed ?? true } : {}),
     }));
 
     const buyTrades = trades.filter(t => t.side === 'BUY');
@@ -177,8 +193,27 @@ async function main() {
     console.log(`Actual PnL: ${actPnlStr} | ROI: ${actualTraderRoi.toFixed(1)}% | Volume: $${traderBought.toFixed(0)}`);
     console.log(`${'='.repeat(140)}\n`);
 
+    // Train/test split — sweep on train set only for out-of-sample validation
+    const useTrainTest = !args['no-train-test'];
+    const MIN_TRADES_FOR_SPLIT = 30;
+    const canSplit = useTrainTest && trades.length >= MIN_TRADES_FOR_SPLIT;
+
+    let sweepTrades = trades;
+    let trainTrades: TradeRow[] | null = null;
+    let testTrades: TradeRow[] | null = null;
+
+    if (canSplit) {
+      const splitIdx = Math.floor(trades.length * 0.7);
+      trainTrades = trades.slice(0, splitIdx);
+      testTrades = trades.slice(splitIdx);
+      sweepTrades = trainTrades;
+      console.log(`  Train/test split: ${trainTrades.length} train, ${testTrades.length} test trades (split at trade #${splitIdx})`);
+    } else if (useTrainTest) {
+      console.log(`  WARNING: Only ${trades.length} trades — insufficient for train/test split (need ${MIN_TRADES_FOR_SPLIT}). Using full dataset.`);
+    }
+
     const sweepConfigs = generateSweepConfigs();
-    console.log(`Sweeping ${sweepConfigs.length} configs...`);
+    console.log(`Sweeping ${sweepConfigs.length} configs${canSplit ? ' (on train set)' : ''}...`);
     const startMs = Date.now();
 
     const results: (SimResult & { sweepCfg: SweepConfig })[] = [];
@@ -192,9 +227,9 @@ async function main() {
         majorityGate: sc.majorityOn ? MAJORITY_GATE_USD : 0,
         accumulatorWarmupSec: sc.warmupHours * 3600,
         trackPredictions: false,
-        includeOpenMarkets: !!timeWindow,
+        includeOpenMarkets: !!timeWindow || includeOpen,
       };
-      const result = simulateCopy(trades, simCfg);
+      const result = simulateCopy(sweepTrades, simCfg);
       results.push({ ...result, sweepCfg: sc, score: computeScore(result.copyPnl, result.copyRoi, result.scalpPct, result.copyBuys, result.copyMaxDdPct, MIN_BUYS_FOR_RANKING, result.buysPerDay) });
     }
 
@@ -212,7 +247,20 @@ async function main() {
       deduped.push(r);
     }
 
-    console.log(`  Unique result profiles: ${deduped.length} (from ${profitable.length} profitable configs)\n`);
+    console.log(`  Unique result profiles: ${deduped.length} (from ${profitable.length} profitable configs)`);
+
+    // Median selection: when >80% configs profitable, "best" is noise — use median
+    const profitableRatio = profitable.length / sweepConfigs.length;
+    let selectionMethod: string;
+    if (profitableRatio > 0.80 && deduped.length > 2) {
+      const medianIdx = Math.floor(deduped.length / 2);
+      const median = deduped.splice(medianIdx, 1)[0];
+      deduped.unshift(median);
+      selectionMethod = `MEDIAN (${(profitableRatio * 100).toFixed(0)}% of configs profitable — picking median to avoid noise)`;
+    } else {
+      selectionMethod = `BEST (${(profitableRatio * 100).toFixed(0)}% of configs profitable)`;
+    }
+    console.log(`  Selection: ${selectionMethod}\n`);
 
     const subheader =
       `${pad('', 5)}${rpad('minBuy', 7)}${rpad('Maj', 5)}${rpad('Warm', 5)}${rpad('MaxTr', 7)}${rpad('MaxPrd', 7)}${rpad('Copy%', 6)}  ` +
@@ -232,9 +280,48 @@ async function main() {
       );
     }
 
-    // Monte Carlo on top 3
-    if (profitable.length > 0) {
-      console.log(`\n  Monte Carlo (10 seeds) on top ${Math.min(3, profitable.length)} configs:\n`);
+    // Train/Test validation on top configs (replaces Monte Carlo when sufficient trades)
+    if (canSplit && testTrades && trainTrades && deduped.length > 0) {
+      const nValidate = Math.min(3, deduped.length);
+      console.log(`\n  Train/Test Validation on top ${nValidate} configs:\n`);
+
+      for (let i = 0; i < nValidate; i++) {
+        const sc = deduped[i].sweepCfg;
+        const simCfg: SimConfig = {
+          ...baseConfig,
+          copyPercent: sc.copyPercent,
+          maxTradeUsd: sc.maxTrade,
+          maxPredUsd: sc.maxPred,
+          minBuyPrice: sc.minBuyPrice,
+          majorityGate: sc.majorityOn ? MAJORITY_GATE_USD : 0,
+          accumulatorWarmupSec: sc.warmupHours * 3600,
+          trackPredictions: false,
+          includeOpenMarkets: !!timeWindow || includeOpen,
+        };
+
+        // Train result reused from sweep (already computed on trainTrades)
+        const trainPnl = deduped[i].copyPnl;
+        const trainBuys = deduped[i].copyBuys;
+        const trainWr = deduped[i].holdWr;
+
+        // Test result — fresh run on test set, trainTrades warms majority accumulator
+        const testResult = simulateCopy(testTrades, simCfg, trainTrades);
+        const testPnl = testResult.copyPnl;
+        const testBuys = testResult.copyBuys;
+        const testWr = testResult.holdWr;
+
+        const ratio = trainPnl > 0 ? testPnl / trainPnl : 0;
+        const passed = trainPnl > 0 && testPnl > 0;
+
+        console.log(`  Config #${i + 1} (minBuy=${sc.minBuyPrice} Maj=${sc.majorityOn ? 'Yes' : 'No'} Warm=${sc.warmupHours}h MaxTr=$${sc.maxTrade} MaxPr=$${sc.maxPred} Copy=${(sc.copyPercent * 100).toFixed(0)}%):`);
+        console.log(`    Train: PnL=$${trainPnl.toFixed(0)} | Buys=${trainBuys} | WR=${trainWr.toFixed(1)}%`);
+        console.log(`    Test:  PnL=$${testPnl.toFixed(0)} | Buys=${testBuys} | WR=${testWr.toFixed(1)}%`);
+        console.log(`    Ratio=${ratio.toFixed(2)} | ${passed ? 'PASS' : 'FAIL'}`);
+        console.log('');
+      }
+    } else if (profitable.length > 0) {
+      // Fallback: Monte Carlo when <30 trades or --no-train-test
+      console.log(`\n  Monte Carlo (10 seeds) — fallback (${trades.length < MIN_TRADES_FOR_SPLIT ? `only ${trades.length} trades` : '--no-train-test'}):\n`);
       for (let i = 0; i < Math.min(3, profitable.length); i++) {
         const baseSc = profitable[i].sweepCfg;
         const mcPnls: number[] = [];
@@ -249,7 +336,7 @@ async function main() {
             accumulatorWarmupSec: baseSc.warmupHours * 3600,
             seed: baseConfig.seed + s,
             trackPredictions: false,
-            includeOpenMarkets: !!timeWindow,
+            includeOpenMarkets: !!timeWindow || includeOpen,
           };
           mcPnls.push(simulateCopy(trades, mcCfg).copyPnl);
         }
