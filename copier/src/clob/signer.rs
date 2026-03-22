@@ -2,6 +2,7 @@ use anyhow::Result;
 use ethers::contract::{Eip712, EthAbiType};
 use ethers::core::types::{Address, U256};
 use ethers::signers::{LocalWallet, Signer};
+use ethers::utils::keccak256;
 
 use crate::wss::TradeSide;
 
@@ -38,55 +39,138 @@ pub async fn sign_clob_auth(
     Ok(format!("0x{}", sig))
 }
 
-// ─── Order EIP-712 (on-chain order signing) ───
-// Two domains: Standard CTF Exchange and NegRisk CTF Exchange
-// Both have name="Polymarket CTF Exchange", version="1", chainId=137
-// Different verifyingContract addresses
+// ─── Order EIP-712 (manual implementation) ───
+//
+// The ethers #[derive(Eip712)] macro uses the Rust struct name as the EIP-712 type name.
+// Polymarket expects "Order(...)" but Rust structs are "OrderStandard"/"OrderNegRisk".
+// We implement EIP-712 manually to produce the correct type hash.
+//
+// Type string: "Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)"
 
-#[derive(Clone, Debug, Eip712, EthAbiType)]
-#[eip712(
-    name = "Polymarket CTF Exchange",
-    version = "1",
-    chain_id = 137,
-    verifying_contract = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
-)]
-#[allow(non_snake_case)]
-struct OrderStandard {
-    salt: U256,
-    maker: Address,
-    signer: Address,
-    taker: Address,
-    tokenId: U256,
-    makerAmount: U256,
-    takerAmount: U256,
-    expiration: U256,
-    nonce: U256,
-    feeRateBps: U256,
-    side: u8,
-    signatureType: u8,
+const ORDER_TYPE_STR: &str = "Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)";
+
+const CTF_EXCHANGE: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
+const NEG_RISK_CTF_EXCHANGE: &str = "0xC5d563A36AE78145C45a50134d48A1215220f80a";
+
+/// Compute EIP-712 domain separator for a Polymarket exchange contract.
+fn domain_separator(verifying_contract: &str) -> [u8; 32] {
+    let domain_type = keccak256(
+        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
+    );
+    let name_hash = keccak256(b"Polymarket CTF Exchange");
+    let version_hash = keccak256(b"1");
+    let chain_id = U256::from(137);
+    let contract: Address = verifying_contract.parse().expect("invalid contract address");
+
+    let mut buf = Vec::with_capacity(5 * 32);
+    buf.extend_from_slice(&domain_type);
+    buf.extend_from_slice(&name_hash);
+    buf.extend_from_slice(&version_hash);
+    buf.extend_from_slice(&{
+        let mut b = [0u8; 32];
+        chain_id.to_big_endian(&mut b);
+        b
+    });
+    // Address is 20 bytes, left-padded to 32
+    buf.extend_from_slice(&{
+        let mut b = [0u8; 32];
+        b[12..].copy_from_slice(contract.as_bytes());
+        b
+    });
+
+    keccak256(&buf)
 }
 
-#[derive(Clone, Debug, Eip712, EthAbiType)]
-#[eip712(
-    name = "Polymarket CTF Exchange",
-    version = "1",
-    chain_id = 137,
-    verifying_contract = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
-)]
-#[allow(non_snake_case)]
-struct OrderNegRisk {
+/// Compute EIP-712 struct hash for an Order.
+fn order_struct_hash(
     salt: U256,
     maker: Address,
-    signer: Address,
+    signer_addr: Address,
     taker: Address,
-    tokenId: U256,
-    makerAmount: U256,
-    takerAmount: U256,
+    token_id: U256,
+    maker_amount: U256,
+    taker_amount: U256,
     expiration: U256,
     nonce: U256,
-    feeRateBps: U256,
+    fee_rate_bps: U256,
     side: u8,
-    signatureType: u8,
+    signature_type: u8,
+) -> [u8; 32] {
+    let type_hash = keccak256(ORDER_TYPE_STR.as_bytes());
+
+    let mut buf = Vec::with_capacity(13 * 32);
+    buf.extend_from_slice(&type_hash);
+
+    // Encode each field as 32-byte ABI word
+    for val in [salt, token_id, maker_amount, taker_amount, expiration, nonce, fee_rate_bps] {
+        // We'll add these in order — but first, the address fields
+        let _ = val; // placeholder
+    }
+    // Actually, do it properly in order:
+    buf.clear();
+    buf.extend_from_slice(&type_hash);
+
+    // salt (uint256)
+    let mut word = [0u8; 32];
+    salt.to_big_endian(&mut word);
+    buf.extend_from_slice(&word);
+
+    // maker (address)
+    let mut word = [0u8; 32];
+    word[12..].copy_from_slice(maker.as_bytes());
+    buf.extend_from_slice(&word);
+
+    // signer (address)
+    let mut word = [0u8; 32];
+    word[12..].copy_from_slice(signer_addr.as_bytes());
+    buf.extend_from_slice(&word);
+
+    // taker (address)
+    let mut word = [0u8; 32];
+    word[12..].copy_from_slice(taker.as_bytes());
+    buf.extend_from_slice(&word);
+
+    // tokenId (uint256)
+    let mut word = [0u8; 32];
+    token_id.to_big_endian(&mut word);
+    buf.extend_from_slice(&word);
+
+    // makerAmount (uint256)
+    let mut word = [0u8; 32];
+    maker_amount.to_big_endian(&mut word);
+    buf.extend_from_slice(&word);
+
+    // takerAmount (uint256)
+    let mut word = [0u8; 32];
+    taker_amount.to_big_endian(&mut word);
+    buf.extend_from_slice(&word);
+
+    // expiration (uint256)
+    let mut word = [0u8; 32];
+    expiration.to_big_endian(&mut word);
+    buf.extend_from_slice(&word);
+
+    // nonce (uint256)
+    let mut word = [0u8; 32];
+    nonce.to_big_endian(&mut word);
+    buf.extend_from_slice(&word);
+
+    // feeRateBps (uint256)
+    let mut word = [0u8; 32];
+    fee_rate_bps.to_big_endian(&mut word);
+    buf.extend_from_slice(&word);
+
+    // side (uint8)
+    let mut word = [0u8; 32];
+    word[31] = side;
+    buf.extend_from_slice(&word);
+
+    // signatureType (uint8)
+    let mut word = [0u8; 32];
+    word[31] = signature_type;
+    buf.extend_from_slice(&word);
+
+    keccak256(&buf)
 }
 
 /// Parameters for constructing an order to sign.
@@ -101,8 +185,8 @@ pub struct OrderParams {
     pub signature_type: u8,
 }
 
-/// Sign an order with EIP-712.
-/// Uses the standard CTF Exchange domain or NegRisk domain based on `is_neg_risk`.
+/// Sign an order with EIP-712 (manual implementation matching Polymarket's contract).
+/// Uses "Order(...)" type name (not the Rust struct name).
 pub async fn sign_order(
     wallet: &LocalWallet,
     params: &OrderParams,
@@ -120,40 +204,33 @@ pub async fn sign_order(
         TradeSide::Sell => 1u8,
     };
 
-    let sig = if is_neg_risk {
-        let order = OrderNegRisk {
-            salt: U256::from(params.salt),
-            maker: params.maker,
-            signer: params.signer,
-            taker: Address::zero(),
-            tokenId: token_id,
-            makerAmount: maker_amount,
-            takerAmount: taker_amount,
-            expiration: U256::zero(),
-            nonce: U256::zero(),
-            feeRateBps: U256::zero(),
-            side,
-            signatureType: params.signature_type,
-        };
-        wallet.sign_typed_data(&order).await?
-    } else {
-        let order = OrderStandard {
-            salt: U256::from(params.salt),
-            maker: params.maker,
-            signer: params.signer,
-            taker: Address::zero(),
-            tokenId: token_id,
-            makerAmount: maker_amount,
-            takerAmount: taker_amount,
-            expiration: U256::zero(),
-            nonce: U256::zero(),
-            feeRateBps: U256::zero(),
-            side,
-            signatureType: params.signature_type,
-        };
-        wallet.sign_typed_data(&order).await?
-    };
+    let contract = if is_neg_risk { NEG_RISK_CTF_EXCHANGE } else { CTF_EXCHANGE };
+    let domain_sep = domain_separator(contract);
+    let struct_hash = order_struct_hash(
+        U256::from(params.salt),
+        params.maker,
+        params.signer,
+        Address::zero(), // taker
+        token_id,
+        maker_amount,
+        taker_amount,
+        U256::zero(), // expiration
+        U256::zero(), // nonce
+        U256::zero(), // feeRateBps
+        side,
+        params.signature_type,
+    );
 
+    // EIP-712 digest: keccak256("\x19\x01" || domainSeparator || structHash)
+    let mut digest_input = Vec::with_capacity(2 + 32 + 32);
+    digest_input.push(0x19);
+    digest_input.push(0x01);
+    digest_input.extend_from_slice(&domain_sep);
+    digest_input.extend_from_slice(&struct_hash);
+    let digest = keccak256(&digest_input);
+
+    // Sign the raw digest (not typed data — we already computed the EIP-712 hash)
+    let sig = wallet.sign_hash(ethers::types::H256::from(digest))?;
     Ok(format!("0x{}", sig))
 }
 
@@ -251,7 +328,24 @@ mod tests {
         let s2 = generate_salt();
         assert!(s1 > 0);
         assert!(s2 > 0);
-        // Very unlikely to be equal
-        // (but not impossible, so not asserting ne)
+    }
+
+    #[test]
+    fn test_type_hash_matches_polymarket() {
+        let expected = "Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)";
+        let expected_hash = keccak256(expected.as_bytes());
+        let actual_hash = keccak256(ORDER_TYPE_STR.as_bytes());
+        assert_eq!(expected_hash, actual_hash, "ORDER_TYPE_STR must match Polymarket's expected type string");
+    }
+
+    #[test]
+    fn test_domain_separator_standard() {
+        let ds = domain_separator(CTF_EXCHANGE);
+        // Domain separator should be deterministic
+        let ds2 = domain_separator(CTF_EXCHANGE);
+        assert_eq!(ds, ds2);
+        // Standard and NegRisk should differ (different verifyingContract)
+        let ds_neg = domain_separator(NEG_RISK_CTF_EXCHANGE);
+        assert_ne!(ds, ds_neg);
     }
 }
