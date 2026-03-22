@@ -50,19 +50,20 @@ pub async fn sign_clob_auth(
     chain_id = 137,
     verifying_contract = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 )]
+#[allow(non_snake_case)]
 struct OrderStandard {
     salt: U256,
     maker: Address,
     signer: Address,
     taker: Address,
-    token_id: U256,
-    maker_amount: U256,
-    taker_amount: U256,
+    tokenId: U256,
+    makerAmount: U256,
+    takerAmount: U256,
     expiration: U256,
     nonce: U256,
-    fee_rate_bps: U256,
+    feeRateBps: U256,
     side: u8,
-    signature_type: u8,
+    signatureType: u8,
 }
 
 #[derive(Clone, Debug, Eip712, EthAbiType)]
@@ -72,19 +73,20 @@ struct OrderStandard {
     chain_id = 137,
     verifying_contract = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
 )]
+#[allow(non_snake_case)]
 struct OrderNegRisk {
     salt: U256,
     maker: Address,
     signer: Address,
     taker: Address,
-    token_id: U256,
-    maker_amount: U256,
-    taker_amount: U256,
+    tokenId: U256,
+    makerAmount: U256,
+    takerAmount: U256,
     expiration: U256,
     nonce: U256,
-    fee_rate_bps: U256,
+    feeRateBps: U256,
     side: u8,
-    signature_type: u8,
+    signatureType: u8,
 }
 
 /// Parameters for constructing an order to sign.
@@ -124,14 +126,14 @@ pub async fn sign_order(
             maker: params.maker,
             signer: params.signer,
             taker: Address::zero(),
-            token_id,
-            maker_amount,
-            taker_amount,
+            tokenId: token_id,
+            makerAmount: maker_amount,
+            takerAmount: taker_amount,
             expiration: U256::zero(),
             nonce: U256::zero(),
-            fee_rate_bps: U256::zero(),
+            feeRateBps: U256::zero(),
             side,
-            signature_type: params.signature_type,
+            signatureType: params.signature_type,
         };
         wallet.sign_typed_data(&order).await?
     } else {
@@ -140,14 +142,14 @@ pub async fn sign_order(
             maker: params.maker,
             signer: params.signer,
             taker: Address::zero(),
-            token_id,
-            maker_amount,
-            taker_amount,
+            tokenId: token_id,
+            makerAmount: maker_amount,
+            takerAmount: taker_amount,
             expiration: U256::zero(),
             nonce: U256::zero(),
-            fee_rate_bps: U256::zero(),
+            feeRateBps: U256::zero(),
             side,
-            signature_type: params.signature_type,
+            signatureType: params.signature_type,
         };
         wallet.sign_typed_data(&order).await?
     };
