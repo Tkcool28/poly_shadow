@@ -86,6 +86,8 @@ impl ClobClient {
     }
 
     /// Place a FAK (Fill-And-Kill) order.
+    /// After placement, verifies fill via GET /data/order/:id because
+    /// POST /order doesn't return makingAmount/takingAmount.
     pub async fn place_fak_order(
         &self,
         token_id: &str,
@@ -101,7 +103,16 @@ impl ClobClient {
             .place_order(token_id, side, amount_usd, slip_price, is_neg_risk, tick_size, fee_bps, "FAK", false)
             .await;
         match result {
-            Ok(fill) => fill,
+            Ok(fill) => {
+                // POST /order returns success=true but NO makingAmount/takingAmount.
+                // If we got an order_id, the order was accepted — verify fill via GET.
+                if fill.status == FillStatus::Skipped {
+                    if let Some(order_id) = fill.order_id.clone() {
+                        return self.verify_fak_fill(&order_id, side, fill).await;
+                    }
+                }
+                fill
+            }
             Err(e) => {
                 tracing::error!(error = %e, token_id, "FAK order failed");
                 FillResult {
@@ -111,6 +122,51 @@ impl ClobClient {
                     order_id: None,
                     execution_method: ExecutionMethod::Fak,
                 }
+            }
+        }
+    }
+
+    /// Verify a FAK fill by querying GET /data/order/:id.
+    /// POST /order doesn't return makingAmount/takingAmount — only GET does.
+    async fn verify_fak_fill(
+        &self,
+        order_id: &str,
+        side: TradeSide,
+        original: FillResult,
+    ) -> FillResult {
+        // Brief delay for CLOB internal state propagation before querying
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match self.get_order(order_id).await {
+            Ok(resp) => {
+                let status = resp.status.as_deref().unwrap_or("unknown");
+                if status == "MATCHED" || status == "matched" {
+                    let making = resp.making_amount.as_deref().unwrap_or("0");
+                    let taking = resp.taking_amount.as_deref().unwrap_or("0");
+                    let (size, price) = parse_fill_amounts(making, taking, side);
+                    if size > 0.0 {
+                        tracing::info!(
+                            size,
+                            price,
+                            order_id,
+                            "FAK fill verified via GET /data/order"
+                        );
+                        return FillResult {
+                            status: FillStatus::Filled,
+                            filled_size: size,
+                            filled_price: price,
+                            order_id: original.order_id,
+                            execution_method: ExecutionMethod::Fak,
+                        };
+                    }
+                }
+                // Not matched or zero amounts — genuine unmatched FAK
+                tracing::info!(order_id, status, "FAK verify: not matched");
+                original
+            }
+            Err(e) => {
+                // GET failed — can't verify. Return original Skipped.
+                tracing::warn!(error = %e, order_id, "FAK verify: get_order failed");
+                original
             }
         }
     }

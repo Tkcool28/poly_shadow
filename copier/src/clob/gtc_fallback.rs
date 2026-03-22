@@ -41,16 +41,14 @@ pub fn spawn(
     ipc_tx: mpsc::Sender<OutboundMessage>,
 ) {
     tokio::spawn(async move {
-        // Step 0: Check minimum order size (CLOB rejects GTC < $5 / 5 shares)
-        let min_shares = params.amount_usd / params.price;
-        if params.amount_usd < 5.0 || min_shares < 5.0 {
+        // Step 0: Check minimum order size (CLOB minimum is $1)
+        if params.amount_usd < 1.0 {
             let _lock = params.alloc_mutex.lock().await;
             capital.release_pending(&params.alloc_id, params.amount_usd);
-            tracing::debug!(
+            tracing::info!(
                 alloc = %params.alloc_id,
                 amount_usd = params.amount_usd,
-                shares = min_shares,
-                "GTC fallback: below minimum size, releasing capital"
+                "GTC fallback: below $1 CLOB minimum, releasing capital"
             );
             return;
         }
