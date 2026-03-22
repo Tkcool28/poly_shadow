@@ -69,6 +69,7 @@ mod live_clob_tests {
             maker_amount: maker_amount.clone(),
             taker_amount: taker_amount.clone(),
             side: TradeSide::Buy,
+            fee_rate_bps: 0,
             signature_type,
         };
 

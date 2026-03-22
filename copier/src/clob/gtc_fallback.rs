@@ -20,6 +20,7 @@ pub struct GtcFallbackParams {
     pub price: f64, // signal price (GTC rests at fair value, no slippage)
     pub is_neg_risk: bool,
     pub tick_size: String,
+    pub fee_bps: u32,
     pub is_paper: bool,
     pub rest_ms: u64,
     pub alloc_mutex: Arc<Mutex<()>>,
@@ -40,6 +41,20 @@ pub fn spawn(
     ipc_tx: mpsc::Sender<OutboundMessage>,
 ) {
     tokio::spawn(async move {
+        // Step 0: Check minimum order size (CLOB rejects GTC < $5 / 5 shares)
+        let min_shares = params.amount_usd / params.price;
+        if params.amount_usd < 5.0 || min_shares < 5.0 {
+            let _lock = params.alloc_mutex.lock().await;
+            capital.release_pending(&params.alloc_id, params.amount_usd);
+            tracing::debug!(
+                alloc = %params.alloc_id,
+                amount_usd = params.amount_usd,
+                shares = min_shares,
+                "GTC fallback: below minimum size, releasing capital"
+            );
+            return;
+        }
+
         // Step 1: Place GTC order (outside mutex — idempotent)
         let fill = clob
             .place_gtc_order(
@@ -49,20 +64,35 @@ pub fn spawn(
                 params.price,
                 params.is_neg_risk,
                 &params.tick_size,
+                params.fee_bps,
             )
             .await;
 
-        let order_id = match fill.order_id {
-            Some(ref id) if fill.status != FillStatus::Failed => id.clone(),
-            _ => {
-                // GTC placement failed — release reserved capital
+        let order_id = match &fill.order_id {
+            Some(id) if fill.status == FillStatus::Failed => {
+                // Failed WITH order_id — CLOB may have accepted then rejected.
+                // Cancel defensively to prevent silent fills.
+                let _ = clob.cancel_order(id).await;
+                let _lock = params.alloc_mutex.lock().await;
+                capital.release_pending(&params.alloc_id, params.amount_usd);
+                cooldowns.record_buy_failure(&params.alloc_id, &params.token_id);
+                tracing::warn!(
+                    alloc = %params.alloc_id,
+                    order_id = %id,
+                    "GTC fallback: failed with order_id, cancelled defensively"
+                );
+                return;
+            }
+            Some(id) => id.clone(),
+            None => {
+                // No order_id — genuine placement failure, nothing on CLOB to cancel
                 let _lock = params.alloc_mutex.lock().await;
                 capital.release_pending(&params.alloc_id, params.amount_usd);
                 cooldowns.record_buy_failure(&params.alloc_id, &params.token_id);
                 tracing::warn!(
                     alloc = %params.alloc_id,
                     token = %&params.token_id[..16.min(params.token_id.len())],
-                    "GTC fallback: placement failed"
+                    "GTC fallback: placement failed (no order_id)"
                 );
                 return;
             }
@@ -161,8 +191,15 @@ pub fn spawn(
                         );
                     }
                 } else {
-                    // Not filled — cancel and release
-                    let _ = clob.cancel_order(&order_id).await;
+                    // Not filled — MUST cancel before releasing capital
+                    let cancel_ok = clob.cancel_order(&order_id).await.unwrap_or(false);
+                    if !cancel_ok {
+                        tracing::error!(
+                            order_id,
+                            alloc = %params.alloc_id,
+                            "GTC cancel FAILED — order may still be live on CLOB!"
+                        );
+                    }
                     capital.release_pending(&params.alloc_id, params.amount_usd);
                     cooldowns.record_buy_failure(&params.alloc_id, &params.token_id);
                     send_result(
@@ -177,20 +214,31 @@ pub fn spawn(
                         alloc = %params.alloc_id,
                         status,
                         order_id,
+                        cancelled = cancel_ok,
                         "GTC fallback unfilled, cancelled"
                     );
                 }
             }
             Err(e) => {
-                // get_order failed — release capital to prevent stuck funds
+                // get_order failed — CANCEL the order first, THEN release capital.
+                // CRITICAL: Without cancellation, the GTC order stays live on CLOB
+                // and may fill later, deploying real money with no tracking.
+                let cancel_ok = clob.cancel_order(&order_id).await.unwrap_or(false);
                 capital.release_pending(&params.alloc_id, params.amount_usd);
                 cooldowns.record_buy_failure(&params.alloc_id, &params.token_id);
                 tracing::error!(
                     error = %e,
                     alloc = %params.alloc_id,
                     order_id,
-                    "GTC fallback: get_order failed, releasing capital"
+                    cancelled = cancel_ok,
+                    "GTC fallback: get_order failed, cancelling order and releasing capital"
                 );
+                if !cancel_ok {
+                    tracing::error!(
+                        order_id,
+                        "GTC cancel FAILED after get_order error — order may still be live!"
+                    );
+                }
             }
         }
     });

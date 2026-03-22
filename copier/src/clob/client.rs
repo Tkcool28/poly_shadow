@@ -94,10 +94,11 @@ impl ClobClient {
         price: f64,
         is_neg_risk: bool,
         tick_size: &str,
+        fee_bps: u32,
     ) -> FillResult {
         let slip_price = slippage_price(price, self.slippage_upside, self.slippage_min);
         let result = self
-            .place_order(token_id, side, amount_usd, slip_price, is_neg_risk, tick_size, "FAK", false)
+            .place_order(token_id, side, amount_usd, slip_price, is_neg_risk, tick_size, fee_bps, "FAK", false)
             .await;
         match result {
             Ok(fill) => fill,
@@ -123,9 +124,10 @@ impl ClobClient {
         price: f64,
         is_neg_risk: bool,
         tick_size: &str,
+        fee_bps: u32,
     ) -> FillResult {
         let result = self
-            .place_order(token_id, side, amount_usd, price, is_neg_risk, tick_size, "GTC", false)
+            .place_order(token_id, side, amount_usd, price, is_neg_risk, tick_size, fee_bps, "GTC", false)
             .await;
         match result {
             Ok(fill) => fill,
@@ -151,6 +153,7 @@ impl ClobClient {
         price: f64,
         is_neg_risk: bool,
         tick_size: &str,
+        fee_bps: u32,
         order_type: &str,
         retried: bool,
     ) -> Result<FillResult> {
@@ -179,6 +182,7 @@ impl ClobClient {
             maker_amount: maker_amount.clone(),
             taker_amount: taker_amount.clone(),
             side,
+            fee_rate_bps: fee_bps,
             signature_type: self.signature_type,
         };
         let signature = sign_order(&self.wallet, &params, is_neg_risk).await?;
@@ -195,7 +199,7 @@ impl ClobClient {
                 taker_amount,
                 expiration: "0".to_string(),
                 nonce: "0".to_string(),
-                fee_rate_bps: "0".to_string(),
+                fee_rate_bps: fee_bps.to_string(),
                 side: side_to_string(side),
                 signature_type: self.signature_type,
                 signature,
@@ -265,7 +269,7 @@ impl ClobClient {
             tracing::warn!("CLOB 429 rate limited, retrying in 1s");
             tokio::time::sleep(Duration::from_secs(1)).await;
             return Box::pin(self.place_order(
-                token_id, side, amount_usd, price, is_neg_risk, tick_size, order_type, true,
+                token_id, side, amount_usd, price, is_neg_risk, tick_size, fee_bps, order_type, true,
             ))
             .await;
         }

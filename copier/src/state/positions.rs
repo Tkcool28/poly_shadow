@@ -125,6 +125,21 @@ impl PositionTracker {
         }
     }
 
+    /// Sum net_usd across ALL allocations for a given tokenId + isPaper.
+    /// Used for wallet-level position cap (cross-allocation guard).
+    pub fn get_total_for_token(&self, token_id: &str, is_paper: bool) -> f64 {
+        let prefix = format!("{}:", token_id);
+        let suffix = format!(":{}", is_paper);
+        let mut total = 0.0;
+        for entry in self.positions.iter() {
+            let key = entry.key();
+            if key.starts_with(&prefix) && key.ends_with(&suffix) {
+                total += entry.value().net_usd;
+            }
+        }
+        total
+    }
+
     pub fn count(&self) -> usize {
         self.positions.len()
     }

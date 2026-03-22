@@ -97,7 +97,7 @@ async function doSweepPositionSettlements(): Promise<void> {
   // Split conditionIds by negRisk flag to avoid Gamma garbage for NegRisk markets
   const marketRows = await prisma.market.findMany({
     where: { conditionId: { in: uniqueConditionIds } },
-    select: { conditionId: true, negRisk: true, outcomes: true },
+    select: { conditionId: true, negRisk: true, outcomes: true, clobTokenIds: true },
   });
   const negRiskSet = new Set(marketRows.filter(m => m.negRisk).map(m => m.conditionId));
   const standardIds = uniqueConditionIds.filter(id => !negRiskSet.has(id));
@@ -502,22 +502,39 @@ async function doSweepPositionSettlements(): Promise<void> {
   await markConditionsClaimed(claimedConditionIds);
 
   // Notify Rust copier about settled markets (fire-and-forget)
-  // Send market_closed for each resolved conditionId — Rust handles capital release internally
-  // via its own position tracker + capital tracker (seeded from DB at startup).
   if (settledCount > 0) {
     try {
       const { sendToRust } = await import('./unix-socket-bridge.js');
+
+      // Build conditionId → tokenIds map from Gamma API + DB data
+      // so Rust doesn't need to rely on its in-memory cache (which may be stale)
+      const conditionTokenIds = new Map<string, string[]>();
+      for (const market of freshMarkets) {
+        const raw = market as Record<string, unknown>;
+        let tids: string[] = [];
+        if (typeof raw.clobTokenIds === 'string') {
+          try { tids = JSON.parse(raw.clobTokenIds as string); } catch {}
+        } else if (Array.isArray(raw.clobTokenIds)) {
+          tids = (raw.clobTokenIds as unknown[]).filter((v): v is string => typeof v === 'string');
+        }
+        if (tids.length > 0) conditionTokenIds.set(market.conditionId, tids);
+      }
+      // Also include NegRisk/DB-only markets
+      for (const m of marketRows) {
+        if (conditionTokenIds.has(m.conditionId)) continue;
+        let tids: string[] = [];
+        try { tids = JSON.parse(m.clobTokenIds ?? '[]'); } catch {}
+        if (tids.length > 0) conditionTokenIds.set(m.conditionId, tids);
+      }
+
       for (const conditionId of resolvedMarkets.keys()) {
-        // Parse outcome prices for this market
         const marketData = resolvedMarkets.get(conditionId)!;
         let prices: number[] = [];
         try { prices = JSON.parse(marketData.outcomePrices).map(Number); } catch {}
-        // Rust's MarketCache knows token_ids for each conditionId. Send prices in outcome order.
-        // Rust receiver matches settlement_prices[i] to its cached token_ids[i].
         sendToRust({
           type: 'market_settled',
           condition_id: conditionId,
-          token_ids: [], // Rust resolves from its MarketCache
+          token_ids: conditionTokenIds.get(conditionId) ?? [],
           settlement_prices: prices,
         });
       }

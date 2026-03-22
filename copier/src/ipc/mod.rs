@@ -132,6 +132,7 @@ fn apply_seed(msg: InboundMessage, state: &SharedState) -> Result<()> {
                             question: m.question,
                             tokens: m.tokens,
                             tick_size: m.tick_size,
+                            taker_base_fee: m.taker_base_fee.unwrap_or(0),
                             fetched_at: Instant::now(),
                         },
                     )

@@ -36,10 +36,13 @@ pub struct SignedOrder {
 }
 
 // ─── Order Response (from CLOB API) ───
+// POST /order returns { success, orderID, ... }
+// GET /data/order/:id returns { status, makingAmount, takingAmount, ... } (no success field)
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderResponse {
+    #[serde(default = "default_true")]
     pub success: bool,
     pub status: Option<String>,
     #[serde(rename = "orderID")]
@@ -48,6 +51,10 @@ pub struct OrderResponse {
     pub making_amount: Option<String>,
     pub taking_amount: Option<String>,
     pub error_msg: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ─── Fill Result (internal) ───
@@ -147,50 +154,45 @@ pub fn to_units_string(amount: f64, decimals: u32) -> String {
 
 // ─── Amount Computation ───
 
+/// CLOB decimal limits:
+/// - USDC side: always max 2 decimals
+/// - Shares side: max 4 decimals (CLOB rejects anything beyond)
+const USDC_MAX_DECIMALS: u32 = 2;
+const SHARES_MAX_DECIMALS: u32 = 4;
+
 /// Compute maker/taker amounts for a BUY order.
 /// Returns (makerAmount, takerAmount) as 6-decimal strings.
-/// BUY: maker = USDC you pay, taker = shares you get.
+/// BUY: maker = USDC you pay (max 2 dec), taker = shares you get (max 4 dec).
 pub fn compute_buy_amounts(
     amount_usd: f64,
     price: f64,
     tick_size: &str,
 ) -> (String, String) {
-    let (price_dec, size_dec, amount_dec) = rounding_config(tick_size);
+    let (price_dec, size_dec, _amount_dec) = rounding_config(tick_size);
+    let effective_size_dec = size_dec.min(SHARES_MAX_DECIMALS);
     let rounded_price = round_normal(price, price_dec);
     let shares = amount_usd / rounded_price;
-    let raw_taker = round_down(shares, size_dec);
-    let mut raw_maker = raw_taker * rounded_price;
-
-    // Multi-step re-round if too many decimal places (matches JS behavior)
-    if decimal_places(raw_maker) > amount_dec {
-        raw_maker = round_up(raw_maker, amount_dec + 4);
-        if decimal_places(raw_maker) > amount_dec {
-            raw_maker = round_down(raw_maker, amount_dec);
-        }
-    }
+    let raw_taker = round_down(shares, effective_size_dec);
+    // Maker is USDC: enforce max 2 decimals (CLOB requirement)
+    let raw_maker = round_down(raw_taker * rounded_price, USDC_MAX_DECIMALS);
 
     (to_units_string(raw_maker, 6), to_units_string(raw_taker, 6))
 }
 
 /// Compute maker/taker amounts for a SELL order.
 /// Returns (makerAmount, takerAmount) as 6-decimal strings.
-/// SELL: maker = shares you give, taker = USDC you get.
+/// SELL: maker = shares you give (max 4 dec), taker = USDC you get (max 2 dec).
 pub fn compute_sell_amounts(
     shares: f64,
     price: f64,
     tick_size: &str,
 ) -> (String, String) {
-    let (price_dec, size_dec, amount_dec) = rounding_config(tick_size);
+    let (price_dec, size_dec, _amount_dec) = rounding_config(tick_size);
+    let effective_size_dec = size_dec.min(SHARES_MAX_DECIMALS);
     let rounded_price = round_normal(price, price_dec);
-    let raw_maker = round_down(shares, size_dec);
-    let mut raw_taker = raw_maker * rounded_price;
-
-    if decimal_places(raw_taker) > amount_dec {
-        raw_taker = round_up(raw_taker, amount_dec + 4);
-        if decimal_places(raw_taker) > amount_dec {
-            raw_taker = round_down(raw_taker, amount_dec);
-        }
-    }
+    let raw_maker = round_down(shares, effective_size_dec);
+    // Taker is USDC: enforce max 2 decimals (CLOB requirement)
+    let raw_taker = round_down(raw_maker * rounded_price, USDC_MAX_DECIMALS);
 
     (to_units_string(raw_maker, 6), to_units_string(raw_taker, 6))
 }

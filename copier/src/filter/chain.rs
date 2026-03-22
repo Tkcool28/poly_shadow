@@ -305,6 +305,16 @@ pub fn run(
             amt = amt.min(remaining);
         }
 
+        // ─── 15b. Wallet-level position cap (cross-allocation, live BUY only) ───
+        if !is_paper && is_buy && config.max_wallet_position_usd > 0.0 {
+            let wallet_total = state.positions.get_total_for_token(&signal.token_id, false);
+            let wallet_remaining = config.max_wallet_position_usd - wallet_total;
+            if wallet_remaining < 0.01 {
+                return FilterResult::Skip("wallet-level position limit reached".into());
+            }
+            amt = amt.min(wallet_remaining);
+        }
+
         // ─── 16. Hedge guard ───
         let mut hedge_max_usd = f64::MAX;
         if config.hedge_price_ratio > 0.0 && signal.price < config.hedge_price_ratio
@@ -457,6 +467,7 @@ mod tests {
             hedge_naked_max_price: 0.10,
             hedge_min_opposite_usd: 5.0,
             hedge_max_ratio: 0.20,
+            max_wallet_position_usd: 50.0,
             pool_min_amount_usd: 0.50,
             live_pool_min_amount_usd: 1.0,
         }
@@ -491,6 +502,7 @@ mod tests {
                 question: Some("Will X happen?".into()),
                 tokens: vec!["tokenA".into(), "tokenB".into()],
                 tick_size: "0.01".into(),
+                taker_base_fee: 0,
                 fetched_at: Instant::now(),
             },
         );
@@ -587,6 +599,7 @@ mod tests {
                 question: Some("BTC up?".into()),
                 tokens: vec!["tokenA".into(), "tokenB".into()],
                 tick_size: "0.01".into(),
+                taker_base_fee: 0,
                 fetched_at: Instant::now(),
             },
         );
@@ -777,6 +790,50 @@ mod tests {
                 assert!(reason.contains("insufficient wallet balance"), "got: {reason}");
             }
             FilterResult::Execute(_) => panic!("expected Skip for paused"),
+        }
+    }
+
+    #[test]
+    fn test_wallet_level_position_cap() {
+        let mut config = default_config();
+        config.max_wallet_position_usd = 20.0; // Wallet-wide cap
+        let alloc = default_alloc();
+        let state = default_state();
+
+        // Simulate another allocation ("alloc2") already having $15 on tokenA
+        state
+            .positions
+            .add_fill("tokenA", "alloc2", false, TradeSide::Buy, 20.0, 15.0);
+
+        // alloc1 tries to buy $5 (10% of $50 signal)
+        let signal = buy_signal(0.70, 50.0);
+        match run(&signal, &alloc, &config, &state) {
+            FilterResult::Execute(params) => {
+                // Wallet remaining = 20 - 15 = 5. alloc1 wants 5, capped to 5.
+                assert!(
+                    params.copy_amount_usd <= 5.01,
+                    "expected ≤$5, got ${:.2}",
+                    params.copy_amount_usd
+                );
+            }
+            FilterResult::Skip(reason) => panic!("expected Execute, got Skip: {reason}"),
+        }
+
+        // Add more to alloc2 to exceed wallet cap
+        state
+            .positions
+            .add_fill("tokenA", "alloc2", false, TradeSide::Buy, 10.0, 6.0);
+        // Now wallet total = 15 + 6 = 21 > 20 cap
+
+        let signal2 = buy_signal(0.70, 50.0);
+        match run(&signal2, &alloc, &config, &state) {
+            FilterResult::Skip(reason) => {
+                assert!(
+                    reason.contains("wallet-level position limit"),
+                    "got: {reason}"
+                );
+            }
+            FilterResult::Execute(_) => panic!("expected Skip for wallet cap exceeded"),
         }
     }
 }

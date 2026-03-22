@@ -182,6 +182,7 @@ pub struct OrderParams {
     pub maker_amount: String, // 6-decimal string
     pub taker_amount: String, // 6-decimal string
     pub side: TradeSide,
+    pub fee_rate_bps: u32,   // market's taker fee in basis points (0, 700, 1000)
     pub signature_type: u8,
 }
 
@@ -216,7 +217,7 @@ pub async fn sign_order(
         taker_amount,
         U256::zero(), // expiration
         U256::zero(), // nonce
-        U256::zero(), // feeRateBps
+        U256::from(params.fee_rate_bps),
         side,
         params.signature_type,
     );
@@ -277,6 +278,7 @@ mod tests {
             taker_amount: "7690000".to_string(),
             side: TradeSide::Buy,
             signature_type: 1,
+            fee_rate_bps: 0,
         };
         let sig = sign_order(&wallet, &params, false).await;
         assert!(sig.is_ok());
@@ -297,6 +299,7 @@ mod tests {
             taker_amount: "7690000".to_string(),
             side: TradeSide::Buy,
             signature_type: 1,
+            fee_rate_bps: 0,
         };
         let sig_standard = sign_order(&wallet, &params, false).await.unwrap();
         let sig_negrisk = sign_order(&wallet, &params, true).await.unwrap();
@@ -316,6 +319,7 @@ mod tests {
             taker_amount: "2000000".to_string(),
             side: TradeSide::Sell,
             signature_type: 0,
+            fee_rate_bps: 0,
         };
         let sig1 = sign_order(&wallet, &params, false).await.unwrap();
         let sig2 = sign_order(&wallet, &params, false).await.unwrap();

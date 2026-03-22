@@ -104,11 +104,12 @@ impl MetadataResolver {
         // Try Gamma API for full metadata
         let gamma = self.fetch_gamma_metadata(condition_id).await;
 
-        // Also fetch tick_size from CLOB (Gamma doesn't have it)
+        // Also fetch tick_size and taker fee from CLOB (Gamma doesn't have them)
         let tick_size = self
             .fetch_tick_size_from_clob(token_id)
             .await
             .unwrap_or_else(|| "0.01".to_string());
+        let taker_base_fee = self.fetch_taker_fee_from_clob(condition_id).await;
 
         let meta = if let Some((event_slug, question, end_date, mut tokens)) = gamma {
             // Always ensure the current tokenId is in the tokens list
@@ -123,6 +124,7 @@ impl MetadataResolver {
                 question: Some(question),
                 tokens,
                 tick_size,
+                taker_base_fee,
                 fetched_at: Instant::now(),
             }
         } else {
@@ -134,6 +136,7 @@ impl MetadataResolver {
                 question: None,
                 tokens: vec![token_id.to_string()],
                 tick_size,
+                taker_base_fee,
                 fetched_at: Instant::now(),
             }
         };
@@ -201,6 +204,22 @@ impl MetadataResolver {
             tracing::warn!(tick_size = %ts, token_id, "unexpected tick_size from CLOB");
             None
         }
+    }
+
+    /// CLOB API: GET /markets/:conditionId → taker_base_fee
+    async fn fetch_taker_fee_from_clob(&self, condition_id: &str) -> u32 {
+        let url = format!("{}/markets/{}", self.clob_base_url, condition_id);
+        let resp = match self.http.get(&url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => return 0,
+        };
+        let json: serde_json::Value = match resp.json().await {
+            Ok(j) => j,
+            Err(_) => return 0,
+        };
+        json.get("taker_base_fee")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32
     }
 
     /// Gamma API: GET /markets?condition_ids=X
@@ -285,6 +304,7 @@ mod tests {
                 question: None,
                 tokens: vec!["tokenA".into()],
                 tick_size: "0.01".into(),
+                taker_base_fee: 0,
                 fetched_at: Instant::now(),
             },
         );
@@ -306,6 +326,7 @@ mod tests {
                 question: None,
                 tokens: vec!["tokenA".into()],
                 tick_size: "0.001".into(),
+                taker_base_fee: 0,
                 fetched_at: Instant::now(),
             },
         );

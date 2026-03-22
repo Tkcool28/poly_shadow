@@ -150,6 +150,8 @@ pub struct SeedMarket {
     pub tokens: Vec<String>,
     #[serde(default = "default_tick_size")]
     pub tick_size: String,
+    #[serde(default)]
+    pub taker_base_fee: Option<u32>,
 }
 
 fn default_tick_size() -> String {

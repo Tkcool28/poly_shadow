@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import { createJobLogger } from '../lib/logger.js';
 import { prisma } from '../lib/prisma.js';
-import { startBridge, closeBridge } from '../services/unix-socket-bridge.js';
+import { startBridge, closeBridge, reconcileAllAllocations } from '../services/unix-socket-bridge.js';
 import {
   sweepPositionSettlements,
   sweepUnclaimedSettledPositions,
@@ -17,6 +17,7 @@ const log = createJobLogger('ipc-bridge');
 const SETTLEMENT_INTERVAL_MS = 5 * 60 * 1000; // 5 min
 const MARKET_REFRESH_MS = 15 * 60 * 1000; // 15 min
 const RECONCILE_INTERVAL_MS = 5 * 60 * 1000; // 5 min
+const CAPITAL_RECONCILE_MS = 60 * 1000; // 60s — sync Rust copier capital with DB
 const CAPITAL_AUDIT_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 const BALANCE_CHECK_INTERVAL_MS = 10 * 60 * 1000; // 10 min
 const PRE_RESOLUTION_INTERVAL_MS = 15 * 60 * 1000; // 15 min
@@ -34,6 +35,7 @@ async function main() {
   let capitalAuditTimer: ReturnType<typeof setInterval>;
   let balanceCheckTimer: ReturnType<typeof setInterval>;
   let preResolutionTimer: ReturnType<typeof setInterval>;
+  let capitalReconcileTimer: ReturnType<typeof setInterval>;
 
   const cleanup = async (signal: string) => {
     if (shuttingDown) return;
@@ -45,6 +47,7 @@ async function main() {
     clearInterval(capitalAuditTimer);
     clearInterval(balanceCheckTimer);
     clearInterval(preResolutionTimer);
+    clearInterval(capitalReconcileTimer);
     closeBridge();
     await prisma.$disconnect();
     process.exit(0);
@@ -139,6 +142,16 @@ async function main() {
       log.warn(`Pre-resolution sweep failed: ${err.message}`);
     }
   }, PRE_RESOLUTION_INTERVAL_MS);
+
+  // Capital reconciliation (60s) — sync Rust copier capital with DB state
+  capitalReconcileTimer = setInterval(async () => {
+    if (shuttingDown) return;
+    try {
+      await reconcileAllAllocations();
+    } catch (err: any) {
+      log.warn(`Capital reconciliation failed: ${err.message}`);
+    }
+  }, CAPITAL_RECONCILE_MS);
 
   // Startup sweeps
   sweepPositionSettlements()

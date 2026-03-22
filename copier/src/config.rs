@@ -97,7 +97,7 @@ impl Config {
         let gtc_fallback_enabled = std::env::var("GTC_FALLBACK_ENABLED")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(true);
+            .unwrap_or(false); // SAFETY: disabled by default — GTC orders can fill silently if status check fails
         let gtc_fallback_rest_ms = std::env::var("GTC_FALLBACK_REST_MS")
             .ok()
             .and_then(|v| v.parse().ok())

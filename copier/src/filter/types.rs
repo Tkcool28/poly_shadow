@@ -71,6 +71,9 @@ pub struct FilterConfig {
     pub hedge_min_opposite_usd: f64,
     pub hedge_max_ratio: f64,
 
+    // Wallet-level position cap (cross-allocation, 0 = disabled)
+    pub max_wallet_position_usd: f64,
+
     // Pool thresholds (V2: sub-threshold → skip, no pooling)
     pub pool_min_amount_usd: f64,
     pub live_pool_min_amount_usd: f64,
@@ -95,6 +98,7 @@ impl FilterConfig {
             hedge_naked_max_price: parse_env("HEDGE_NAKED_MAX_PRICE", 0.10),
             hedge_min_opposite_usd: parse_env("HEDGE_MIN_OPPOSITE_USD", 5.0),
             hedge_max_ratio: parse_env("HEDGE_MAX_RATIO", 0.20),
+            max_wallet_position_usd: parse_env("MAX_WALLET_POSITION_USD", 50.0),
             pool_min_amount_usd: parse_env("POOL_MIN_AMOUNT_USD", 0.50),
             live_pool_min_amount_usd: parse_env("LIVE_POOL_MIN_AMOUNT_USD", 1.0),
         }

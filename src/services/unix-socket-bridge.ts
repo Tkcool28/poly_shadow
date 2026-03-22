@@ -114,6 +114,23 @@ export function sendToRust(msg: object): void {
   }
 }
 
+/** Reconcile all allocation capital with Rust copier (periodic safety net). */
+export async function reconcileAllAllocations(): Promise<void> {
+  if (!activeConnection) return;
+  const allocs = await prisma.followAllocation.findMany({
+    where: { isActive: true },
+    select: { id: true, currentCapital: true, deployedCapital: true },
+  });
+  for (const a of allocs) {
+    sendToRust({
+      type: 'capital_reconciled',
+      alloc_id: a.id,
+      current: a.currentCapital,
+      deployed: a.deployedCapital,
+    });
+  }
+}
+
 /** Close the bridge server and active connection. */
 export function closeBridge(): void {
   if (activeConnection) {
@@ -163,11 +180,12 @@ async function handleSeedRequest(socket: net.Socket): Promise<void> {
   log.info('Seed request received, querying DB...');
 
   try {
-    const [allocations, positions, majorityData, dailySpend] = await Promise.all([
+    const [allocations, positions, majorityData, dailySpend, markets] = await Promise.all([
       queryAllocations(),
       queryPositions(),
       queryMajorityData(),
       queryDailySpend(),
+      queryMarkets(),
     ]);
 
     // Capital comes from the allocations query
@@ -183,7 +201,7 @@ async function handleSeedRequest(socket: net.Socket): Promise<void> {
       positions,
       capital,
       majority_data: majorityData,
-      markets: [], // Markets are resolved by Rust's MetadataResolver from CLOB/Gamma APIs
+      markets,
       daily_live_spend: dailySpend.live,
       daily_paper_spend: dailySpend.paper,
     };
@@ -195,6 +213,7 @@ async function handleSeedRequest(socket: net.Socket): Promise<void> {
       allocations: allocations.length,
       positions: positions.length,
       majority_data: majorityData.length,
+      markets: markets.length,
       elapsed_ms: Date.now() - t0,
     });
   } catch (err: any) {
@@ -337,6 +356,51 @@ async function queryDailySpend(): Promise<{ live: number; paper: number }> {
     }
   }
   return { live, paper };
+}
+
+async function queryMarkets(): Promise<
+  Array<{
+    condition_id: string;
+    closed: boolean;
+    end_date: number | null;
+    event_slug: string | null;
+    question: string | null;
+    tokens: string[];
+    tick_size: string;
+    taker_base_fee: number | null;
+  }>
+> {
+  // Get markets for conditions with open (unsettled) positions
+  const conditions = await prisma.$queryRaw<Array<{ conditionId: string }>>`
+    SELECT DISTINCT dt."conditionId"
+    FROM "CopyTrade" ct
+    JOIN "DetectedTrade" dt ON ct."detectedTradeId" = dt.id
+    WHERE ct.status = 'FILLED'
+      AND ct."followAllocationId" IS NOT NULL
+      AND ct."createdAt" > NOW() - INTERVAL '30 days'
+  `;
+  if (conditions.length === 0) return [];
+  const cids = conditions.map((c) => c.conditionId).filter(Boolean);
+  if (cids.length === 0) return [];
+
+  const markets = await prisma.market.findMany({
+    where: { conditionId: { in: cids } },
+  });
+
+  return markets.map((m) => {
+    let tokens: string[] = [];
+    try { tokens = JSON.parse(m.clobTokenIds ?? '[]'); } catch {}
+    return {
+      condition_id: m.conditionId,
+      closed: m.closed ?? false,
+      end_date: m.endDate ? Math.floor(m.endDate.getTime() / 1000) : null,
+      event_slug: m.slug ?? null,
+      question: m.question ?? null,
+      tokens,
+      tick_size: String(m.minimumTickSize ?? 0.01),
+      taker_base_fee: null, // DB doesn't store this; Rust resolver fills from CLOB API
+    };
+  });
 }
 
 // ─── Trade Detected Handler ───

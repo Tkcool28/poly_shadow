@@ -291,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
                             } else {
                                 params.copy_amount_usd
                             };
+                            let fee_bps = shared_state.markets.taker_base_fee_for_token(&params.token_id);
                             clob.place_fak_order(
                                 &params.token_id,
                                 params.side,
@@ -298,6 +299,7 @@ async fn main() -> anyhow::Result<()> {
                                 params.price,
                                 params.is_neg_risk,
                                 &tick_size,
+                                fee_bps,
                             )
                             .await
                         }
@@ -412,6 +414,7 @@ async fn main() -> anyhow::Result<()> {
                         if params.side == TradeSide::Buy {
                             if !alloc.is_paper && cfg.gtc_fallback_enabled {
                                 // Capital stays reserved — pass to GTC task
+                                let gtc_fee_bps = shared_state.markets.taker_base_fee_for_token(&params.token_id);
                                 clob::gtc_fallback::spawn(
                                     clob_arc.clone().unwrap(),
                                     clob::gtc_fallback::GtcFallbackParams {
@@ -422,6 +425,7 @@ async fn main() -> anyhow::Result<()> {
                                         price: params.price,
                                         is_neg_risk: params.is_neg_risk,
                                         tick_size: tick_size.clone(),
+                                        fee_bps: gtc_fee_bps,
                                         is_paper: alloc.is_paper,
                                         rest_ms: cfg.gtc_fallback_rest_ms,
                                         alloc_mutex: alloc_mutex.clone(),

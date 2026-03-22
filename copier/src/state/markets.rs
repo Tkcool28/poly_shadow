@@ -11,6 +11,7 @@ pub struct MarketMeta {
     pub question: Option<String>,       // Market title/question
     pub tokens: Vec<String>,            // All token IDs in this condition (usually 2)
     pub tick_size: String,              // "0.01", "0.001", "0.0001", "0.1"
+    pub taker_base_fee: u32,            // Fee in basis points (0, 700, 1000, etc.)
     pub fetched_at: Instant,
 }
 
@@ -135,6 +136,14 @@ impl MarketCache {
             .map(|e| e.tick_size.clone())
     }
 
+    pub fn taker_base_fee_for_token(&self, token_id: &str) -> u32 {
+        self.token_to_condition
+            .get(token_id)
+            .and_then(|cid| self.by_condition.get(cid.value()))
+            .map(|e| e.taker_base_fee)
+            .unwrap_or(0)
+    }
+
     pub fn count(&self) -> usize {
         self.by_condition.len()
     }
@@ -152,6 +161,7 @@ mod tests {
             question: Some("Will X happen?".to_string()),
             tokens: tokens.into_iter().map(String::from).collect(),
             tick_size: "0.01".to_string(),
+            taker_base_fee: 0,
             fetched_at: Instant::now(),
         }
     }
