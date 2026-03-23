@@ -42,6 +42,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # Config
 envy = "0.4"
 
+# Parquet price recording
+parquet = { version = "53", default-features = false, features = ["snap", "arrow"] }
+arrow = { version = "53", default-features = false }
+
 # Misc
 rand = "0.8"
 chrono = "0.4"

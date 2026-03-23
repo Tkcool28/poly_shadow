@@ -1,6 +1,12 @@
 mod clob;
+mod clob_ws;
 mod config;
 mod filter;
+mod gtc_paper;
+#[cfg(unix)]
+mod ipc;
+#[cfg(not(unix))]
+#[path = "ipc_stub.rs"]
 mod ipc;
 mod state;
 mod wss;
@@ -96,6 +102,50 @@ async fn main() -> anyhow::Result<()> {
         shared_state.clone(),
         ipc_rx,
     );
+
+    // ── GTC Paper: CLOB Market WS + price recording + fill tracking ──
+    let (clob_ws_client, gtc_tracker) = if cfg.gtc_paper_enabled {
+        tracing::info!(
+            timeout_ms = cfg.gtc_paper_timeout_ms,
+            parquet_dir = %cfg.parquet_data_dir,
+            "GTC paper mode enabled"
+        );
+        let (client, _sub_tx) = clob_ws::ClobWsClient::spawn(cfg.clob_ws_url.clone());
+
+        // Parquet price writer
+        let parquet_rx = client.subscribe_prices();
+        clob_ws::spawn_parquet_writer(
+            parquet_rx,
+            cfg.parquet_data_dir.clone(),
+            cfg.parquet_flush_rows,
+            cfg.parquet_flush_interval_ms,
+        );
+
+        // GTC paper tracker + tasks
+        let tracker = Arc::new(gtc_paper::GtcPaperTracker::new(
+            std::time::Duration::from_millis(cfg.gtc_paper_timeout_ms),
+        ));
+        let fill_rx = client.subscribe_prices();
+        gtc_paper::spawn_fill_monitor(
+            tracker.clone(),
+            fill_rx,
+            capital.clone(),
+            ipc_tx.clone(),
+        );
+        gtc_paper::spawn_timeout_sweeper(
+            tracker.clone(),
+            capital.clone(),
+            ipc_tx.clone(),
+            client.clone(),
+        );
+
+        (client, tracker)
+    } else {
+        // Dummy — not used when GTC paper is disabled
+        let (client, _) = clob_ws::ClobWsClient::spawn("ws://unused".to_string());
+        let tracker = Arc::new(gtc_paper::GtcPaperTracker::new(std::time::Duration::from_secs(10)));
+        (client, tracker)
+    };
 
     // ── WSS pipeline ──
     let (event_tx, mut event_rx) = mpsc::channel::<wss::RawLogEvent>(4096);
@@ -261,9 +311,34 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Route: paper vs live
-                let fill = if alloc.is_paper {
-                    // Paper: simulate immediately
+                // Route: GTC paper → legacy paper → live
+                let fill = if alloc.is_paper && cfg.gtc_paper_enabled {
+                    // GTC paper: submit pending order, fill resolved async
+                    let amount_usd = if params.side == TradeSide::Sell {
+                        params.sell_shares.unwrap_or(0.0) * params.price
+                    } else {
+                        params.copy_amount_usd
+                    };
+                    clob_ws_client.subscribe(&[params.token_id.clone()]);
+                    gtc_tracker.increment_ref(&params.token_id);
+                    gtc_tracker.submit(gtc_paper::PendingGtcPaper {
+                        alloc_id: alloc.id.clone(),
+                        token_id: params.token_id.clone(),
+                        side: params.side,
+                        price: params.price,
+                        amount_usd,
+                        is_neg_risk: params.is_neg_risk,
+                        created_at: std::time::Instant::now(),
+                        timeout: std::time::Duration::from_millis(cfg.gtc_paper_timeout_ms),
+                        proxy_wallet: alloc.proxy_wallet.clone(),
+                        condition_id: signal.condition_id.clone(),
+                        transaction_hash: trade.transaction_hash.clone(),
+                    });
+                    // Capital already reserved above — fill_monitor will commit or sweeper will release
+                    // DON'T send CopyTradeResult — fill_monitor or timeout_sweeper handles it async
+                    continue;
+                } else if alloc.is_paper {
+                    // Legacy paper: simulate immediately
                     let amount_usd = if params.side == TradeSide::Sell {
                         params.sell_shares.unwrap_or(0.0) * params.price
                     } else {

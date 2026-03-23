@@ -80,6 +80,7 @@ pub enum ExecutionMethod {
     Fak,
     Gtc,
     Paper,
+    GtcPaper,
 }
 
 impl ExecutionMethod {
@@ -88,6 +89,7 @@ impl ExecutionMethod {
             Self::Fak => "FAK",
             Self::Gtc => "GTC",
             Self::Paper => "PAPER",
+            Self::GtcPaper => "GTC_PAPER",
         }
     }
 }

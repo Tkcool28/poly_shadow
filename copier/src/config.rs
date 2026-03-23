@@ -37,6 +37,14 @@ pub struct Config {
     pub gtc_fallback_rest_ms: u64,
     pub slippage_upside_fraction: f64,
     pub slippage_min_absolute: f64,
+
+    // GTC paper mode (replaces instant simulate_paper_fill)
+    pub gtc_paper_enabled: bool,
+    pub gtc_paper_timeout_ms: u64,
+    pub clob_ws_url: String,
+    pub parquet_data_dir: String,
+    pub parquet_flush_rows: usize,
+    pub parquet_flush_interval_ms: u64,
 }
 
 impl Config {
@@ -111,6 +119,27 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.01);
 
+        let gtc_paper_enabled = std::env::var("GTC_PAPER_ENABLED")
+            .ok()
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+        let gtc_paper_timeout_ms = std::env::var("GTC_PAPER_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000);
+        let clob_ws_url = std::env::var("CLOB_WS_URL")
+            .unwrap_or_else(|_| "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_string());
+        let parquet_data_dir = std::env::var("PARQUET_DATA_DIR")
+            .unwrap_or_else(|_| "data/prices".to_string());
+        let parquet_flush_rows: usize = std::env::var("PARQUET_FLUSH_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000);
+        let parquet_flush_interval_ms = std::env::var("PARQUET_FLUSH_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000);
+
         Ok(Config {
             polygon_ws_rpc_url,
             polygon_http_rpc_url,
@@ -134,6 +163,12 @@ impl Config {
             gtc_fallback_rest_ms,
             slippage_upside_fraction,
             slippage_min_absolute,
+            gtc_paper_enabled,
+            gtc_paper_timeout_ms,
+            clob_ws_url,
+            parquet_data_dir,
+            parquet_flush_rows,
+            parquet_flush_interval_ms,
         })
     }
 

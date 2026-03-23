@@ -231,6 +231,7 @@ services:
       RUST_LOG: polymarket_copier=info
     volumes:
       - copier_ipc:/var/run/copier
+      - price_data:/data/prices
     networks:
       - polymarket-network
     depends_on:
@@ -258,6 +259,9 @@ volumes:
     name: polymarket_logs
   copier_ipc:
     driver: local
+  price_data:
+    driver: local
+    name: polymarket_price_data
 
 # =============================================================================
 # Networks
