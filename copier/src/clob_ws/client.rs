@@ -132,6 +132,9 @@ async fn connect_and_stream(
     let (mut ws, _) = connect_async(url).await?;
     tracing::info!("CLOB WS connected");
 
+    // Send initial PING to keep connection alive (server may close idle connections)
+    ws.send(Message::Text("PING".to_string())).await?;
+
     // Re-subscribe all currently tracked token IDs
     let current_ids: Vec<String> = subscribed.iter().map(|r| r.key().clone()).collect();
     if !current_ids.is_empty() {
