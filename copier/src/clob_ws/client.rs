@@ -129,6 +129,18 @@ async fn connect_and_stream(
     subscribed: &Arc<DashSet<String>>,
     sub_cmd_rx: &mut mpsc::Receiver<SubCommand>,
 ) -> anyhow::Result<()> {
+    // Build request with headers that Cloudflare expects
+    let request = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(url)
+        .header("Host", "ws-subscriptions-clob.polymarket.com")
+        .header("Origin", "https://polymarket.com")
+        .header("User-Agent", "Mozilla/5.0")
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", tokio_tungstenite::tungstenite::handshake::client::generate_key())
+        .body(())?;
+
     // Force HTTP/1.1 ALPN — Cloudflare rejects WebSocket upgrade over HTTP/2
     let tls_connector = {
         let mut builder = native_tls::TlsConnector::builder();
@@ -137,7 +149,7 @@ async fn connect_and_stream(
         tokio_tungstenite::Connector::NativeTls(connector)
     };
     let (mut ws, _) = tokio_tungstenite::connect_async_tls_with_config(
-        url,
+        request,
         None,
         false,
         Some(tls_connector),
