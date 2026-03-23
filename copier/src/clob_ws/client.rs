@@ -273,70 +273,85 @@ async fn send_unsubscribe(
 }
 
 /// Parse CLOB Market WS events into PriceTicks.
-/// Handles both single-event objects and arrays of events.
+/// The frontend endpoint often omits `event_type` — detect from structure.
 fn parse_price_event(text: &str) -> Option<Vec<PriceTick>> {
     let v: serde_json::Value = serde_json::from_str(text).ok()?;
 
     // Array of events
     if let Some(arr) = v.as_array() {
-        let ticks: Vec<PriceTick> = arr.iter().filter_map(parse_single_event).collect();
+        let mut ticks = Vec::new();
+        for item in arr {
+            ticks.extend(parse_any_event(item));
+        }
         if ticks.is_empty() { return None; }
         return Some(ticks);
     }
 
     // Single event
-    if let Some(tick) = parse_single_event(&v) {
-        return Some(vec![tick]);
+    let ticks = parse_any_event(&v);
+    if ticks.is_empty() { None } else { Some(ticks) }
+}
+
+/// Parse any event by detecting type from structure (not event_type field).
+fn parse_any_event(v: &serde_json::Value) -> Vec<PriceTick> {
+    // 1. Has "price_changes" array → orderbook update
+    if v.get("price_changes").and_then(|c| c.as_array()).is_some() {
+        return parse_price_changes(v);
     }
 
-    // price_change event with nested price_changes array
-    if v.get("event_type").and_then(|e| e.as_str()) == Some("price_change") {
-        let ticks = parse_price_changes(&v);
-        if !ticks.is_empty() { return Some(ticks); }
+    // 2. Has "bids"/"asks" → book snapshot
+    if v.get("bids").is_some() && v.get("asks").is_some() {
+        if let Some(tick) = parse_book_snapshot(v) {
+            return vec![tick];
+        }
     }
 
-    None
+    // 3. Has explicit event_type (non-frontend endpoint)
+    if let Some(tick) = parse_single_event(v) {
+        return vec![tick];
+    }
+
+    Vec::new()
 }
 
 fn parse_single_event(v: &serde_json::Value) -> Option<PriceTick> {
     let event_type = v.get("event_type")?.as_str()?;
+    if event_type != "last_trade_price" { return None; }
 
-    match event_type {
-        "last_trade_price" => {
-            let asset_id = v.get("asset_id")?.as_str()?;
-            let price: f64 = v.get("price").and_then(|p| {
-                p.as_str().and_then(|s| s.parse().ok()).or_else(|| p.as_f64())
-            })?;
-            let size: f64 = v.get("size").and_then(|s| {
-                s.as_str().and_then(|s| s.parse().ok()).or_else(|| s.as_f64())
-            }).unwrap_or(0.0);
-            let side = v.get("side").and_then(|s| s.as_str()).unwrap_or("").to_string();
-            let timestamp_ms: i64 = v.get("timestamp").and_then(|t| {
-                t.as_str().and_then(|s| s.parse().ok()).or_else(|| t.as_i64())
-            }).unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    let asset_id = v.get("asset_id")?.as_str()?;
+    let price: f64 = v.get("price").and_then(|p| {
+        p.as_str().and_then(|s| s.parse().ok()).or_else(|| p.as_f64())
+    })?;
+    let size: f64 = v.get("size").and_then(|s| {
+        s.as_str().and_then(|s| s.parse().ok()).or_else(|| s.as_f64())
+    }).unwrap_or(0.0);
+    let side = v.get("side").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let timestamp_ms: i64 = v.get("timestamp").and_then(|t| {
+        t.as_str().and_then(|s| s.parse().ok()).or_else(|| t.as_i64())
+    }).unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
 
-            Some(PriceTick { timestamp_ms, token_id: asset_id.to_string(), price, size, side })
-        }
-        "book" => {
-            // Orderbook snapshot — extract best ask as a price tick (for GTC fill detection)
-            let asset_id = v.get("asset_id")?.as_str()?;
-            let asks = v.get("asks")?.as_array()?;
-            if asks.is_empty() { return None; }
-            // Best ask = lowest price in asks array
-            let best_ask = asks.iter()
-                .filter_map(|a| a.get("price").and_then(|p| p.as_str()?.parse::<f64>().ok()))
-                .fold(f64::MAX, f64::min);
-            if best_ask >= 1.0 { return None; }
-            Some(PriceTick {
-                timestamp_ms: chrono::Utc::now().timestamp_millis(),
-                token_id: asset_id.to_string(),
-                price: best_ask,
-                size: 0.0,
-                side: "ASK".to_string(),
-            })
-        }
-        _ => None,
-    }
+    Some(PriceTick { timestamp_ms, token_id: asset_id.to_string(), price, size, side })
+}
+
+/// Parse a book snapshot into a PriceTick (best ask price for GTC fill detection).
+fn parse_book_snapshot(v: &serde_json::Value) -> Option<PriceTick> {
+    let asset_id = v.get("asset_id")?.as_str()?;
+    let asks = v.get("asks")?.as_array()?;
+    if asks.is_empty() { return None; }
+    let best_ask = asks.iter()
+        .filter_map(|a| a.get("price").and_then(|p| p.as_str()?.parse::<f64>().ok()))
+        .fold(f64::MAX, f64::min);
+    if best_ask >= 1.0 { return None; }
+    let timestamp_ms: i64 = v.get("timestamp").and_then(|t| {
+        t.as_str().and_then(|s| s.parse().ok())
+    }).unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    Some(PriceTick {
+        timestamp_ms,
+        token_id: asset_id.to_string(),
+        price: best_ask,
+        size: 0.0,
+        side: "ASK".to_string(),
+    })
 }
 
 /// Parse price_change events with nested price_changes array.
