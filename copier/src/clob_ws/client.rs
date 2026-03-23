@@ -156,14 +156,21 @@ async fn connect_and_stream(
     ).await?;
     tracing::info!("CLOB WS connected");
 
-    // Send initial PING to keep connection alive (server may close idle connections)
-    ws.send(Message::Text("PING".to_string())).await?;
-
-    // Re-subscribe all currently tracked token IDs
+    // Send subscription immediately — server disconnects if no subscription within ~20ms
+    // Use a dummy token ID if nothing to subscribe to yet (server needs at least one sub message)
     let current_ids: Vec<String> = subscribed.iter().map(|r| r.key().clone()).collect();
     if !current_ids.is_empty() {
         send_subscribe(&mut ws, &current_ids).await?;
-        tracing::info!(count = current_ids.len(), "CLOB WS re-subscribed on reconnect");
+        tracing::info!(count = current_ids.len(), "CLOB WS subscribed on connect");
+    } else {
+        // Subscribe with empty array to establish the connection
+        let init_msg = serde_json::json!({
+            "assets_ids": [],
+            "type": "market",
+            "custom_feature_enabled": true,
+        });
+        ws.send(Message::Text(init_msg.to_string())).await?;
+        tracing::info!("CLOB WS sent init subscription (empty)");
     }
 
     let ping_interval = tokio::time::Duration::from_millis(PING_INTERVAL_MS);
