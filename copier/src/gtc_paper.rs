@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -10,6 +11,8 @@ use crate::clob_ws::{ClobWsClient, PriceTick};
 use crate::ipc::messages::OutboundMessage;
 use crate::state::capital::CapitalTracker;
 use crate::wss::TradeSide;
+
+static ORDER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A pending GTC paper order awaiting fill from CLOB Market WS price data.
 #[derive(Debug, Clone)]
@@ -46,12 +49,8 @@ impl GtcPaperTracker {
 
     /// Submit a new pending GTC paper order.
     pub fn submit(&self, order: PendingGtcPaper) {
-        let key = format!(
-            "{}:{}:{}",
-            order.alloc_id,
-            order.token_id,
-            order.created_at.elapsed().as_nanos()
-        );
+        let seq = ORDER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let key = format!("{}:{}:{}", order.alloc_id, order.token_id, seq);
         self.pending.insert(key, order);
     }
 
@@ -134,6 +133,7 @@ pub fn spawn_fill_monitor(
     mut price_rx: broadcast::Receiver<PriceTick>,
     capital: Arc<CapitalTracker>,
     ipc_tx: mpsc::Sender<OutboundMessage>,
+    clob_ws: Arc<ClobWsClient>,
 ) {
     tokio::spawn(async move {
         loop {
@@ -160,8 +160,10 @@ pub fn spawn_fill_monitor(
                             }
                         }
 
-                        // Decrement token refcount
-                        tracker.decrement_ref(&order.token_id);
+                        // Decrement token refcount + unsubscribe if zero
+                        if tracker.decrement_ref(&order.token_id) {
+                            clob_ws.unsubscribe(&[order.token_id.clone()]);
+                        }
 
                         let latency_ms = order.created_at.elapsed().as_millis() as u64;
 

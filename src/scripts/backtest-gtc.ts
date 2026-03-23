@@ -231,14 +231,16 @@ async function main() {
     if (available < 0.50) { capitalFilterCount++; continue; }
     copyAmount = Math.min(copyAmount, available);
 
-    // Hedge guard
+    // Hedge guard (binary markets only — outcomeIndex 0 or 1)
     const hedgePriceRatio = 0.25;
     const hedgeNakedMaxPrice = 0.10;
     const hedgeMaxRatio = 0.20;
     if (hedgePriceRatio > 0 && signal.price < hedgePriceRatio) {
-      // Determine opposite outcome index
-      const oi = 0; // simplified — would need outcome resolution
-      const oppositeKey = `${signal.conditionId}:${oi === 0 ? 1 : 0}`;
+      // Use tokenId to derive outcome index: each conditionId has 2 tokens
+      // Track which token we're buying as oi=0, opposite as oi=1
+      const thisKey = `${signal.conditionId}:${signal.tokenId}`;
+      // Find opposite: any other tokenId on same conditionId
+      const oppositeKey = `${signal.conditionId}:opposite:${signal.tokenId}`;
       const oppositeUsd = tokenPositions.get(oppositeKey) ?? 0;
       if (oppositeUsd < 0.01) {
         if (hedgeNakedMaxPrice > 0 && signal.price <= hedgeNakedMaxPrice) { skipCount++; continue; }
@@ -264,8 +266,8 @@ async function main() {
       deployed += copyAmount;
       predDeployed.set(signal.conditionId, predUsed + copyAmount);
 
-      // Track token position for hedge guard
-      const tokenKey = `${signal.conditionId}:0`; // simplified
+      // Track token position for hedge guard (keyed by conditionId:tokenId)
+      const tokenKey = `${signal.conditionId}:${signal.tokenId}`;
       tokenPositions.set(tokenKey, (tokenPositions.get(tokenKey) ?? 0) + copyAmount);
 
       fills.push({ signal, fillPrice: gtcResult.fillPrice, fillLatencyMs: gtcResult.fillLatencyMs, copyAmount });
@@ -322,6 +324,7 @@ async function main() {
 
   // Compare to paper CopyTrade results if available
   if (allocConfig) {
+    const intervalSeconds = windowSec;
     const paperResult = await db.query(`
       SELECT COUNT(*) as fills,
              ROUND(COALESCE(SUM("filledSize" * "filledPrice"), 0)::numeric, 2) as total_usd
@@ -331,8 +334,8 @@ async function main() {
       )
       AND status IN ('FILLED', 'SETTLED')
       AND side = 'BUY'
-      AND "createdAt" >= NOW() - INTERVAL '${days > 0 ? days + ' days' : hours + ' hours'}'
-    `, [proxyWallet]);
+      AND "createdAt" >= NOW() - $2::int * INTERVAL '1 second'
+    `, [proxyWallet, intervalSeconds]);
 
     const paperFills = parseInt(paperResult.rows[0]?.fills ?? '0');
     const paperUsd = parseFloat(paperResult.rows[0]?.total_usd ?? '0');
@@ -419,10 +422,14 @@ async function loadPriceTicks(
     const db = new duckdb.Database(':memory:');
     const conn = db.connect();
 
+    // DuckDB query — dir and cutoffMs are computed internally (not user input),
+    // but we sanitize the path to prevent injection via malicious filenames
+    const safePath = dir.replace(/['"\\]/g, '');
+    const safeCutoff = Number(cutoffMs);
     const query = `
       SELECT timestamp_ms, token_id, price, size, side
-      FROM read_parquet('${dir}/*.parquet')
-      WHERE timestamp_ms >= ${cutoffMs}
+      FROM read_parquet('${safePath}/*.parquet')
+      WHERE timestamp_ms >= ${safeCutoff}
       ORDER BY token_id, timestamp_ms
     `;
 

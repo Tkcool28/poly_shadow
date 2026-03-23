@@ -131,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
             fill_rx,
             capital.clone(),
             ipc_tx.clone(),
+            client.clone(),
         );
         gtc_paper::spawn_timeout_sweeper(
             tracker.clone(),
@@ -141,8 +142,8 @@ async fn main() -> anyhow::Result<()> {
 
         (client, tracker)
     } else {
-        // Dummy — not used when GTC paper is disabled
-        let (client, _) = clob_ws::ClobWsClient::spawn("ws://unused".to_string());
+        // No WS connection or tasks when GTC paper is disabled
+        let client = clob_ws::ClobWsClient::new_disconnected();
         let tracker = Arc::new(gtc_paper::GtcPaperTracker::new(std::time::Duration::from_secs(10)));
         (client, tracker)
     };

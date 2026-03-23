@@ -63,6 +63,17 @@ impl ClobWsClient {
         }
     }
 
+    /// Create a disconnected client (no WS task). Used when GTC paper is disabled.
+    pub fn new_disconnected() -> Arc<Self> {
+        let (price_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let (sub_cmd_tx, _) = mpsc::channel(256);
+        Arc::new(Self {
+            price_tx,
+            subscribed: Arc::new(DashSet::new()),
+            sub_cmd_tx,
+        })
+    }
+
     /// Spawn the WS client task. Returns the client and a sender for direct commands.
     pub fn spawn(url: String) -> (Arc<Self>, mpsc::Sender<SubCommand>) {
         let (price_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
