@@ -86,8 +86,10 @@ impl ClobClient {
     }
 
     /// Place a FAK (Fill-And-Kill) order.
-    /// After placement, verifies fill via GET /data/order/:id because
-    /// POST /order doesn't return makingAmount/takingAmount.
+    /// When POST returns success + orderID but zero amounts (sports market delayed
+    /// matching), treats order as filled using requested amounts. GET /data/order
+    /// returns null for FAK orders, so inline verification is impossible.
+    /// Capital is committed immediately; Node.js reconciler corrects if genuinely unmatched.
     pub async fn place_fak_order(
         &self,
         token_id: &str,
@@ -104,11 +106,28 @@ impl ClobClient {
             .await;
         match result {
             Ok(fill) => {
-                // POST /order returns success=true but NO makingAmount/takingAmount.
-                // If we got an order_id, the order was accepted — verify fill via GET.
                 if fill.status == FillStatus::Skipped {
-                    if let Some(order_id) = fill.order_id.clone() {
-                        return self.verify_fak_fill(&order_id, side, fill).await;
+                    if let Some(ref order_id) = fill.order_id {
+                        // POST returned success + orderID but zero amounts.
+                        // CLOB accepted the order — sports markets delay matching ~3s.
+                        // GET /data/order returns null for FAK, so we can't verify.
+                        // Treat as FILLED using requested amounts to prevent capital leak.
+                        // If genuinely unmatched, Node.js reconciler corrects via getTrades.
+                        let shares = amount_usd / slip_price;
+                        tracing::info!(
+                            order_id,
+                            amount_usd,
+                            shares = format!("{:.4}", shares),
+                            slip_price = format!("{:.4}", slip_price),
+                            "FAK accepted with orderID — treating as filled (delayed matching)"
+                        );
+                        return FillResult {
+                            status: FillStatus::Filled,
+                            filled_size: shares,
+                            filled_price: slip_price,
+                            order_id: fill.order_id,
+                            execution_method: ExecutionMethod::Fak,
+                        };
                     }
                 }
                 fill
@@ -122,51 +141,6 @@ impl ClobClient {
                     order_id: None,
                     execution_method: ExecutionMethod::Fak,
                 }
-            }
-        }
-    }
-
-    /// Verify a FAK fill by querying GET /data/order/:id.
-    /// POST /order doesn't return makingAmount/takingAmount — only GET does.
-    async fn verify_fak_fill(
-        &self,
-        order_id: &str,
-        side: TradeSide,
-        original: FillResult,
-    ) -> FillResult {
-        // Sports markets have a ~3s matching delay. POST returns success+orderID
-        // but zero amounts. Wait for matching to settle before checking fill status.
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        match self.get_order(order_id).await {
-            Ok(resp) => {
-                let status = resp.status.as_deref().unwrap_or("unknown");
-                if status == "MATCHED" || status == "matched" {
-                    let making = resp.making_amount.as_deref().unwrap_or("0");
-                    let taking = resp.taking_amount.as_deref().unwrap_or("0");
-                    let (size, price) = parse_fill_amounts(making, taking, side);
-                    if size > 0.0 {
-                        tracing::info!(
-                            size,
-                            price,
-                            order_id,
-                            "FAK fill verified via GET /data/order"
-                        );
-                        return FillResult {
-                            status: FillStatus::Filled,
-                            filled_size: size,
-                            filled_price: price,
-                            order_id: original.order_id,
-                            execution_method: ExecutionMethod::Fak,
-                        };
-                    }
-                }
-                // After 3s, still not matched — genuinely unmatched FAK
-                tracing::info!(order_id, status, "FAK verify: not matched after 3s");
-                original
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, order_id, "FAK verify: get_order failed after 3s");
-                original
             }
         }
     }
