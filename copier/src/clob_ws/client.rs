@@ -191,14 +191,19 @@ async fn connect_and_stream(
                         if text == "PONG" {
                             continue;
                         }
+                        // Count raw messages for debugging
+                        static MSG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                        let n = MSG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if n == 0 || n == 10 || n == 100 {
+                            tracing::info!(n, len = text.len(), preview = %&text[..text.len().min(80)], "CLOB WS raw msg");
+                        }
                         if let Some(ticks) = parse_price_event(&text) {
                             for tick in &ticks {
                                 let _ = price_tx.send(tick.clone());
                             }
-                            // Log first price event per session
                             static LOGGED_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                             if !LOGGED_FIRST.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                tracing::info!(count = ticks.len(), "CLOB WS first price data received");
+                                tracing::info!(count = ticks.len(), "CLOB WS first price data parsed");
                             }
                         }
                     }
