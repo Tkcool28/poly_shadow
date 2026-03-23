@@ -161,15 +161,12 @@ async fn connect_and_stream(
 
     // Send subscription immediately — server disconnects if no subscription within ~20ms
     // Use a dummy token ID if nothing to subscribe to yet (server needs at least one sub message)
-    // Subscribe on connect — include a known active token to verify the connection works
-    let mut connect_ids: Vec<String> = subscribed.iter().map(|r| r.key().clone()).collect();
-    // Always include a known active BTC market token for connection verification
-    let test_token = "21742633143463906290569050155826241533067272736897614950488156847949938836455".to_string();
-    if !connect_ids.contains(&test_token) {
-        connect_ids.push(test_token);
+    // Re-subscribe tracked token IDs on reconnect
+    let current_ids: Vec<String> = subscribed.iter().map(|r| r.key().clone()).collect();
+    if !current_ids.is_empty() {
+        send_subscribe(&mut ws, &current_ids).await?;
+        tracing::info!(count = current_ids.len(), "CLOB WS subscribed on connect");
     }
-    send_subscribe(&mut ws, &connect_ids).await?;
-    tracing::info!(count = connect_ids.len(), "CLOB WS subscribed on connect");
 
     let ping_interval = tokio::time::Duration::from_millis(PING_INTERVAL_MS);
     let stale_threshold = tokio::time::Duration::from_millis(STALE_THRESHOLD_MS);
@@ -247,8 +244,7 @@ async fn send_subscribe(
     let msg = serde_json::json!({
         "assets_ids": token_ids,
         "type": "market",
-        "initial_dump": true,
-        "level": 2,
+        "custom_feature_enabled": true,
     });
     let msg_str = msg.to_string();
     tracing::info!(count = token_ids.len(), msg_len = msg_str.len(), "CLOB WS sending subscribe");

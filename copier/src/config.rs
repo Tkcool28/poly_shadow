@@ -128,7 +128,7 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(10_000);
         let clob_ws_url = std::env::var("CLOB_WS_URL")
-            .unwrap_or_else(|_| "wss://ws-subscriptions-frontend-clob.polymarket.com/ws/market".to_string());
+            .unwrap_or_else(|_| "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_string());
         let parquet_data_dir = std::env::var("PARQUET_DATA_DIR")
             .unwrap_or_else(|_| "data/prices".to_string());
         let parquet_flush_rows: usize = std::env::var("PARQUET_FLUSH_ROWS")
