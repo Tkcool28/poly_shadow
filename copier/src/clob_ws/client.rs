@@ -47,7 +47,10 @@ impl ClobWsClient {
             .cloned()
             .collect();
         if !new.is_empty() {
-            let _ = self.sub_cmd_tx.try_send(SubCommand::Subscribe(new));
+            tracing::info!(count = new.len(), first = %&new[0][..new[0].len().min(20)], "CLOB WS subscribing");
+            if let Err(e) = self.sub_cmd_tx.try_send(SubCommand::Subscribe(new)) {
+                tracing::warn!(error = %e, "CLOB WS subscribe send failed");
+            }
         }
     }
 
@@ -188,8 +191,13 @@ async fn connect_and_stream(
                             continue;
                         }
                         if let Some(ticks) = parse_price_event(&text) {
-                            for tick in ticks {
-                                let _ = price_tx.send(tick);
+                            for tick in &ticks {
+                                let _ = price_tx.send(tick.clone());
+                            }
+                            // Log first price event per session
+                            static LOGGED_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                            if !LOGGED_FIRST.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                tracing::info!(count = ticks.len(), "CLOB WS first price data received");
                             }
                         }
                     }
@@ -241,8 +249,9 @@ async fn send_subscribe(
         "type": "market",
         "custom_feature_enabled": true,
     });
-    ws.send(Message::Text(msg.to_string())).await?;
-    tracing::debug!(count = token_ids.len(), "CLOB WS subscribed");
+    let msg_str = msg.to_string();
+    tracing::info!(count = token_ids.len(), msg_len = msg_str.len(), "CLOB WS sending subscribe");
+    ws.send(Message::Text(msg_str)).await?;
     Ok(())
 }
 
