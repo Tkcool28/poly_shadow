@@ -12,9 +12,9 @@ export const COMMON_FLAGS = {
   'copy-percent': { type: 'string' as const },
   'max-trade': { type: 'string' as const },
   'max-pred': { type: 'string' as const },
-  'min-buy-price': { type: 'string' as const, default: '0.60' },
-  gate: { type: 'string' as const, default: '175' },
-  'exclude-slugs': { type: 'string' as const, default: 'updown-5m,updown-15m' },
+  'min-buy-price': { type: 'string' as const },
+  gate: { type: 'string' as const },
+  'exclude-slugs': { type: 'string' as const },
   'no-empirical-slippage': { type: 'boolean' as const, default: false },
   'no-capital-lockup': { type: 'boolean' as const, default: false },
   'no-majority': { type: 'boolean' as const, default: false },
@@ -41,7 +41,9 @@ export interface AllocRow {
   minBuyPrice?: number | null;
   excludeEventSlugPatterns?: string | null;
   majorityOnlyMode?: boolean;
-  currentCapital?: number | null;
+  initialCapital?: number | null;
+  copySells?: boolean;
+  committedSideLock?: boolean;
 }
 
 // ─── Config Builder ───
@@ -65,7 +67,7 @@ export function buildSimConfig(
     (args['min-buy-price'] as string) ?? String(allocConfig?.minBuyPrice ?? 0.60)
   );
   // Disable majority gate if: --no-majority, --follow-all, or DB allocation has majorityOnlyMode=false (unless --gate explicitly set)
-  const gateExplicitlySet = args.gate !== undefined && args.gate !== '175';
+  const gateExplicitlySet = args.gate !== undefined;
   const majorityGate = (args['no-majority'] || args['follow-all'])
     ? 0
     : (allocConfig?.majorityOnlyMode === false && !gateExplicitlySet)
@@ -74,7 +76,7 @@ export function buildSimConfig(
   const excludeSlugs = ((args['exclude-slugs'] as string) ?? allocConfig?.excludeEventSlugPatterns ?? 'updown-5m,updown-15m')
     .split(',').map(s => s.trim()).filter(Boolean);
   const startingCapital = parseFloat(
-    (args['starting-capital'] as string) ?? String(allocConfig?.currentCapital ?? 450)
+    (args['starting-capital'] as string) ?? String(allocConfig?.initialCapital ?? 450)
   );
 
   return {
@@ -86,8 +88,8 @@ export function buildSimConfig(
     majorityGate,
     excludeSlugs,
     useCapitalLockup: !args['no-capital-lockup'],
-    bothSides: !!(args['both-sides'] || args['follow-all']),
-    followSells: !!(args['follow-sells'] || args['follow-all']),
+    bothSides: !!(args['both-sides'] || args['follow-all'] || allocConfig?.committedSideLock === false),
+    followSells: !!(args['follow-sells'] || args['follow-all'] || allocConfig?.copySells),
     seed: parseInt((args.seed as string) ?? '42', 10),
     accumulatorWarmupSec: parseInt((args['warmup-hours'] as string) ?? '0', 10) * 3600,
     empiricalSlippage: calibration.slippage,

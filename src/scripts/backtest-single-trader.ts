@@ -47,7 +47,8 @@ async function main() {
   const allocResult = await db.query(`
     SELECT "proxyWallet", id, "initialCapital", "currentCapital", "deployedCapital",
            "copyTradePercent", "maxPositionUsd", "maxPredictionPositionUsd",
-           "minBuyPrice", "excludeEventSlugPatterns", "majorityOnlyMode", "copyMakerFills"
+           "minBuyPrice", "excludeEventSlugPatterns", "majorityOnlyMode", "copyMakerFills",
+           "copySells", "committedSideLock"
     FROM "FollowAllocation"
     WHERE id LIKE $1 OR "proxyWallet" LIKE $1
     LIMIT 1
@@ -62,7 +63,9 @@ async function main() {
       minBuyPrice: row.minBuyPrice,
       excludeEventSlugPatterns: row.excludeEventSlugPatterns,
       majorityOnlyMode: row.majorityOnlyMode,
-      currentCapital: row.currentCapital,
+      initialCapital: row.initialCapital,
+      copySells: row.copySells,
+      committedSideLock: row.committedSideLock,
     };
     proxyWallet = row.proxyWallet;
     console.log(`Found allocation: ${row.id}`);
