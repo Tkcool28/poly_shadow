@@ -53,6 +53,12 @@ export interface SimConfig {
   includeOpenMarkets?: boolean;
   trackPredictions?: boolean;
   accumulatorWarmupSec?: number;  // seconds from first trade: warm accumulator only, no copy trades
+  // Capital lockup
+  settlementDelaySec?: number;     // seconds after last trade to release capital (default 1800)
+  // Hedge guard (matches Rust filter step 16)
+  hedgePriceRatio?: number;        // price below this triggers hedge check (default 0.25)
+  hedgeNakedMaxPrice?: number;     // block naked buys at or below this (default 0.10)
+  hedgeMaxRatio?: number;          // max hedge as fraction of opposite position (default 0.20)
 }
 
 export interface PredictionBreakdown {
@@ -121,6 +127,7 @@ const FEE_RATE = 0.25;
 const FEE_EXPONENT = 2;
 const BUY_FAILURE_COOLDOWN_SEC = 15;
 const FALLBACK_LOCKUP_SEC = 7 * 24 * 60 * 60;
+const DEFAULT_SETTLEMENT_DELAY_SEC = 5 * 60; // 5 minutes after last trade
 export const FALLBACK_FAK_FAILURE_RATE = 0.12;
 
 // ─── Utility Functions ───
@@ -184,6 +191,26 @@ export function computeScore(
   return copyRoi * (1 - scalpPct / 100) * samplePenalty * (1 / (1 + maxDdPct / 20)) * (0.7 + 0.3 * frequencyFactor);
 }
 
+// ─── Resolution Time Pre-computation ───
+
+function precomputeResolutionTimes(
+  trades: TradeRow[],
+  settlementDelaySec: number,
+): Map<string, number> {
+  const lastTradeTs = new Map<string, number>();
+  const closedSet = new Set<string>();
+  for (const t of trades) {
+    const prev = lastTradeTs.get(t.conditionId) ?? 0;
+    if (t.timestamp > prev) lastTradeTs.set(t.conditionId, t.timestamp);
+    if (t.closed === true) closedSet.add(t.conditionId);
+  }
+  const map = new Map<string, number>();
+  for (const cid of closedSet) {
+    map.set(cid, (lastTradeTs.get(cid) ?? 0) + settlementDelaySec);
+  }
+  return map;
+}
+
 // ─── Main Simulation ───
 
 export function simulateCopy(
@@ -201,6 +228,10 @@ export function simulateCopy(
 
   const rng = mulberry32(seed);
   trades.sort((a, b) => a.timestamp - b.timestamp);
+
+  // Pre-compute resolution times for closed markets (last trade + settlement delay)
+  const resolutionTimes = precomputeResolutionTimes(
+    trades, config.settlementDelaySec ?? DEFAULT_SETTLEMENT_DELAY_SEC);
 
   // Warmup: early trades only build accumulator, no copy positions (simulates production cold-start)
   const warmupCutoff = config.accumulatorWarmupSec && trades.length > 0
@@ -229,6 +260,12 @@ export function simulateCopy(
   const traderAccum = new Map<string, Map<string, number>>();
   const buyFailureCooldown = new Map<string, number>();
   const followAllPositions = new Map<string, { shares: number; costBasis: number; outcomeWon: boolean; endDateTs: number }>();
+  const tokenPositions = new Map<string, number>(); // "conditionId:outcomeIndex" -> net USD
+
+  // Hedge guard config (extract once, not per-trade)
+  const hedgePriceRatio = config.hedgePriceRatio ?? 0.25;
+  const hedgeNakedMaxPrice = config.hedgeNakedMaxPrice ?? 0.10;
+  const hedgeMaxRatio = config.hedgeMaxRatio ?? 0.20;
 
   // Per-prediction tracking (optional for performance)
   const predBreakdown = trackPredictions ? new Map<string, PredictionBreakdown>() : null;
@@ -317,6 +354,11 @@ export function simulateCopy(
 
           const predUsed = predDeployed.get(trade.conditionId) ?? 0;
           predDeployed.set(trade.conditionId, Math.max(0, predUsed - costBasis));
+          const sellOi = resolveOutcomeIndex(trade);
+          if (sellOi != null) {
+            const sellKey = `${trade.conditionId}:${sellOi}`;
+            tokenPositions.set(sellKey, Math.max(0, (tokenPositions.get(sellKey) ?? 0) - costBasis));
+          }
           totalPnl += pnl;
           totalDeployed -= costBasis;
 
@@ -339,6 +381,11 @@ export function simulateCopy(
         // Gate mode: just reduce predDeployed for re-entry allowance
         const predUsed = predDeployed.get(trade.conditionId) ?? 0;
         predDeployed.set(trade.conditionId, Math.max(0, predUsed - fillUsd));
+        const sellOi = resolveOutcomeIndex(trade);
+        if (sellOi != null) {
+          const sellKey = `${trade.conditionId}:${sellOi}`;
+          tokenPositions.set(sellKey, Math.max(0, (tokenPositions.get(sellKey) ?? 0) - fillUsd));
+        }
       }
       continue;
     }
@@ -351,7 +398,21 @@ export function simulateCopy(
       if (excludeSlugs.some(p => slug.includes(p))) { skippedSlug++; continue; }
     }
 
-    // Count after slug exclusion so scalpPct/cryptoPct denominators are accurate
+    // Market closed gatekeep (matches Rust filter step 3)
+    if (trade.closed === true) {
+      const resolveTs = resolutionTimes.get(trade.conditionId);
+      if (resolveTs && trade.timestamp > resolveTs) continue;
+    }
+
+    // Crypto updown expiry (matches Rust filter step 4)
+    if (trade.endDate != null) {
+      const slug = trade.eventSlug.toLowerCase();
+      if ((slug.startsWith('btc-updown') || slug.startsWith('sol-updown')
+        || slug.startsWith('eth-updown') || slug.startsWith('xrp-updown'))
+        && trade.timestamp > trade.endDate) continue;
+    }
+
+    // Count after exclusions so scalpPct/cryptoPct denominators are accurate
     totalBuyCount++;
     catCounts.set(cat, (catCounts.get(cat) ?? 0) + 1);
 
@@ -421,13 +482,26 @@ export function simulateCopy(
     if (predRemaining < 1) { skippedPred++; continue; }
     if (copyAmount > predRemaining) copyAmount = predRemaining;
     if (copyAmount > available) copyAmount = available;
-    if (copyAmount < 1.0) continue;
 
-    // FAK failure with cooldown
-    const cooldownExpiry = buyFailureCooldown.get(trade.conditionId);
+    // Hedge guard (matches Rust filter step 16)
+    if (hedgePriceRatio > 0 && trade.price < hedgePriceRatio) {
+      const oppositeKey = `${trade.conditionId}:${oi === 0 ? 1 : 0}`;
+      const oppositeUsd = tokenPositions.get(oppositeKey) ?? 0;
+      if (oppositeUsd < 0.01) {
+        if (hedgeNakedMaxPrice > 0 && trade.price <= hedgeNakedMaxPrice) continue;
+      } else {
+        copyAmount = Math.min(copyAmount, oppositeUsd * hedgeMaxRatio);
+      }
+    }
+
+    if (copyAmount < 0.50) continue;
+
+    // FAK failure with per-token cooldown (matches Rust copier)
+    const tokenCooldownKey = `${trade.conditionId}:${oi}`;
+    const cooldownExpiry = buyFailureCooldown.get(tokenCooldownKey);
     if (cooldownExpiry && trade.timestamp < cooldownExpiry) { skippedFak++; continue; }
     if (rng() < fakFailureRate) {
-      buyFailureCooldown.set(trade.conditionId, trade.timestamp + BUY_FAILURE_COOLDOWN_SEC);
+      buyFailureCooldown.set(tokenCooldownKey, trade.timestamp + BUY_FAILURE_COOLDOWN_SEC);
       skippedFak++;
       continue;
     }
@@ -461,6 +535,8 @@ export function simulateCopy(
 
     // Track results
     predDeployed.set(trade.conditionId, predUsed + copyAmount);
+    const tokenKey = `${trade.conditionId}:${oi}`;
+    tokenPositions.set(tokenKey, (tokenPositions.get(tokenKey) ?? 0) + copyAmount);
     if (majorityGate > 0 && !bothSides) {
       const committed = committedSides.get(trade.conditionId);
       if (!committed) committedSides.set(trade.conditionId, trade.outcome);
@@ -484,7 +560,8 @@ export function simulateCopy(
       held.shares += netShares;
       held.costBasis += copyAmount;
       held.outcomeWon = outcomeWon;
-      held.endDateTs = trade.endDate ?? (trade.timestamp + FALLBACK_LOCKUP_SEC);
+      held.endDateTs = resolutionTimes.get(trade.conditionId)
+        ?? trade.endDate ?? (trade.timestamp + FALLBACK_LOCKUP_SEC);
       followAllPositions.set(posKey, held);
     }
 
@@ -493,7 +570,8 @@ export function simulateCopy(
       dailyPnl.set(day, (dailyPnl.get(day) ?? 0) + 0); // ensure day exists
       dailyDeployed.set(day, (dailyDeployed.get(day) ?? 0) + copyAmount);
     } else if (useCapitalLockup) {
-      const endDateTs = trade.endDate ?? (trade.timestamp + FALLBACK_LOCKUP_SEC);
+      const endDateTs = resolutionTimes.get(trade.conditionId)
+        ?? trade.endDate ?? (trade.timestamp + FALLBACK_LOCKUP_SEC);
       // Binary insert to maintain sorted order by resolvesAt
       let lo = lockupReleasePtr, hi = lockupQueue.length;
       while (lo < hi) {

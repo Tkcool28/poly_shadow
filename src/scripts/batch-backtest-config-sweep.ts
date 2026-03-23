@@ -135,7 +135,7 @@ async function main() {
     } else {
       tradeQuery = `SELECT t."conditionId", t.outcome, t."outcomeIndex",
                t.price, t.size, t.timestamp, t.side, t."eventSlug",
-               m."outcomePrices", m.outcomes, m."endDate"
+               m."outcomePrices", m.outcomes, m."endDate", m.closed
          FROM "Trade" t JOIN "Market" m ON t."conditionId" = m."conditionId"
          WHERE t."proxyWallet" = $1 AND m.closed = true
          ORDER BY t.timestamp ASC`;
@@ -155,7 +155,7 @@ async function main() {
       outcomePrices: r.outcomePrices || '[]',
       outcomes: r.outcomes || '[]',
       endDate: r.endDate ? Math.floor(new Date(r.endDate).getTime() / 1000) : null,
-      ...(timeWindow || includeOpen ? { closed: r.closed ?? true } : {}),
+      closed: r.closed ?? true,
     }));
 
     const buyTrades = trades.filter(t => t.side === 'BUY');

@@ -94,6 +94,10 @@ export function buildSimConfig(
     accumulatorWarmupSec: parseInt((args['warmup-hours'] as string) ?? '0', 10) * 3600,
     empiricalSlippage: calibration.slippage,
     fakFailureRate: calibration.fakFailureRate,
+    settlementDelaySec: 5 * 60,
+    hedgePriceRatio: 0.25,
+    hedgeNakedMaxPrice: 0.10,
+    hedgeMaxRatio: 0.20,
     ...overrides,
   };
 }
