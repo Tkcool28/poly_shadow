@@ -170,7 +170,8 @@ async fn connect_and_stream(
         let init_msg = serde_json::json!({
             "assets_ids": [],
             "type": "market",
-            "custom_feature_enabled": true,
+            "initial_dump": true,
+        "level": 2,
         });
         ws.send(Message::Text(init_msg.to_string())).await?;
         tracing::info!("CLOB WS sent init subscription (empty)");
@@ -247,7 +248,8 @@ async fn send_subscribe(
     let msg = serde_json::json!({
         "assets_ids": token_ids,
         "type": "market",
-        "custom_feature_enabled": true,
+        "initial_dump": true,
+        "level": 2,
     });
     let msg_str = msg.to_string();
     tracing::info!(count = token_ids.len(), msg_len = msg_str.len(), "CLOB WS sending subscribe");
@@ -287,11 +289,10 @@ fn parse_price_event(text: &str) -> Option<Vec<PriceTick>> {
         return Some(vec![tick]);
     }
 
-    // price_change wrapper
-    if let Some(changes) = v.get("price_changes").and_then(|c| c.as_array()) {
-        let ticks: Vec<PriceTick> = changes.iter().filter_map(parse_single_event).collect();
-        if ticks.is_empty() { return None; }
-        return Some(ticks);
+    // price_change event with nested price_changes array
+    if v.get("event_type").and_then(|e| e.as_str()) == Some("price_change") {
+        let ticks = parse_price_changes(&v);
+        if !ticks.is_empty() { return Some(ticks); }
     }
 
     None
@@ -299,24 +300,65 @@ fn parse_price_event(text: &str) -> Option<Vec<PriceTick>> {
 
 fn parse_single_event(v: &serde_json::Value) -> Option<PriceTick> {
     let event_type = v.get("event_type")?.as_str()?;
-    if event_type != "last_trade_price" && event_type != "price_change" {
-        return None;
+
+    match event_type {
+        "last_trade_price" => {
+            let asset_id = v.get("asset_id")?.as_str()?;
+            let price: f64 = v.get("price").and_then(|p| {
+                p.as_str().and_then(|s| s.parse().ok()).or_else(|| p.as_f64())
+            })?;
+            let size: f64 = v.get("size").and_then(|s| {
+                s.as_str().and_then(|s| s.parse().ok()).or_else(|| s.as_f64())
+            }).unwrap_or(0.0);
+            let side = v.get("side").and_then(|s| s.as_str()).unwrap_or("").to_string();
+            let timestamp_ms: i64 = v.get("timestamp").and_then(|t| {
+                t.as_str().and_then(|s| s.parse().ok()).or_else(|| t.as_i64())
+            }).unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+
+            Some(PriceTick { timestamp_ms, token_id: asset_id.to_string(), price, size, side })
+        }
+        "book" => {
+            // Orderbook snapshot — extract best ask as a price tick (for GTC fill detection)
+            let asset_id = v.get("asset_id")?.as_str()?;
+            let asks = v.get("asks")?.as_array()?;
+            if asks.is_empty() { return None; }
+            // Best ask = lowest price in asks array
+            let best_ask = asks.iter()
+                .filter_map(|a| a.get("price").and_then(|p| p.as_str()?.parse::<f64>().ok()))
+                .fold(f64::MAX, f64::min);
+            if best_ask >= 1.0 { return None; }
+            Some(PriceTick {
+                timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                token_id: asset_id.to_string(),
+                price: best_ask,
+                size: 0.0,
+                side: "ASK".to_string(),
+            })
+        }
+        _ => None,
     }
+}
 
-    let asset_id = v.get("asset_id")?.as_str()?;
-    let price: f64 = v.get("price")?.as_str()?.parse().ok()?;
-    let size: f64 = v.get("size").and_then(|s| s.as_str()?.parse().ok()).unwrap_or(0.0);
-    let side = v.get("side").and_then(|s| s.as_str()).unwrap_or("").to_string();
-    let timestamp_ms: i64 = v
-        .get("timestamp")
-        .and_then(|t| t.as_str()?.parse().ok())
-        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
-
-    Some(PriceTick {
-        timestamp_ms,
-        token_id: asset_id.to_string(),
-        price,
-        size,
-        side,
-    })
+/// Parse price_change events with nested price_changes array.
+fn parse_price_changes(v: &serde_json::Value) -> Vec<PriceTick> {
+    let mut ticks = Vec::new();
+    let asset_id = match v.get("asset_id").and_then(|a| a.as_str()) {
+        Some(id) => id,
+        None => return ticks,
+    };
+    let changes = match v.get("price_changes").and_then(|c| c.as_array()) {
+        Some(arr) => arr,
+        None => return ticks,
+    };
+    let ts = chrono::Utc::now().timestamp_millis();
+    for pc in changes {
+        let price: f64 = match pc.get("price").and_then(|p| p.as_str()?.parse().ok()) {
+            Some(p) => p,
+            None => continue,
+        };
+        let size: f64 = pc.get("size").and_then(|s| s.as_str()?.parse().ok()).unwrap_or(0.0);
+        let side = pc.get("side").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        ticks.push(PriceTick { timestamp_ms: ts, token_id: asset_id.to_string(), price, size, side });
+    }
+    ticks
 }
