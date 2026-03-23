@@ -418,6 +418,7 @@ async function loadPriceTicks(
 
   // Try DuckDB for parquet reading
   try {
+    // @ts-ignore — duckdb is an optional dependency, only needed when running this script
     const duckdb = await import('duckdb');
     const db = new duckdb.Database(':memory:');
     const conn = db.connect();
