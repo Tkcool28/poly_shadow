@@ -2,7 +2,7 @@ use dashmap::DashSet;
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::Message;
 
 const INITIAL_RECONNECT_MS: u64 = 1000;
 const MAX_RECONNECT_MS: u64 = 30_000;
@@ -129,7 +129,19 @@ async fn connect_and_stream(
     subscribed: &Arc<DashSet<String>>,
     sub_cmd_rx: &mut mpsc::Receiver<SubCommand>,
 ) -> anyhow::Result<()> {
-    let (mut ws, _) = connect_async(url).await?;
+    // Force HTTP/1.1 ALPN — Cloudflare rejects WebSocket upgrade over HTTP/2
+    let tls_connector = {
+        let mut builder = native_tls::TlsConnector::builder();
+        builder.request_alpns(&["http/1.1"]);
+        let connector = builder.build()?;
+        tokio_tungstenite::Connector::NativeTls(connector)
+    };
+    let (mut ws, _) = tokio_tungstenite::connect_async_tls_with_config(
+        url,
+        None,
+        false,
+        Some(tls_connector),
+    ).await?;
     tracing::info!("CLOB WS connected");
 
     // Send initial PING to keep connection alive (server may close idle connections)

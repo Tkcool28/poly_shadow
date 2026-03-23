@@ -3417,6 +3417,7 @@ dependencies = [
  "hex",
  "hmac",
  "lru",
+ "native-tls",
  "parking_lot",
  "parquet",
  "rand 0.8.5",

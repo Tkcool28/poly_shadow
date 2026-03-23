@@ -9,6 +9,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 
 # WebSocket
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+native-tls = { version = "0.2", features = ["alpn"] }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json", "native-tls"] }
