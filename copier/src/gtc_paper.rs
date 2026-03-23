@@ -178,29 +178,29 @@ pub fn spawn_fill_monitor(
                         );
 
                         // Send CopyTradeResult IPC
-                        let _ = ipc_tx
-                            .send(OutboundMessage::CopyTradeResult {
-                                detected_trade_id: Some(order.transaction_hash.clone()),
-                                allocation_id: order.alloc_id,
-                                proxy_wallet: order.proxy_wallet,
-                                condition_id: order.condition_id,
-                                token_id: order.token_id,
-                                side: match order.side {
-                                    TradeSide::Buy => "BUY".to_string(),
-                                    TradeSide::Sell => "SELL".to_string(),
-                                },
-                                status: "FILLED".to_string(),
-                                filled_price: fill_price,
-                                filled_size: fill_size,
-                                requested_amount: order.amount_usd,
-                                requested_price: order.price,
-                                order_id: None,
-                                execution_method: ExecutionMethod::GtcPaper.as_str().to_string(),
-                                latency_ms,
-                                fail_reason: None,
-                                is_paper: true,
-                            })
-                            .await;
+                        if let Err(e) = ipc_tx.try_send(OutboundMessage::CopyTradeResult {
+                            detected_trade_id: Some(order.transaction_hash.clone()),
+                            allocation_id: order.alloc_id.clone(),
+                            proxy_wallet: order.proxy_wallet,
+                            condition_id: order.condition_id,
+                            token_id: order.token_id.clone(),
+                            side: match order.side {
+                                TradeSide::Buy => "BUY".to_string(),
+                                TradeSide::Sell => "SELL".to_string(),
+                            },
+                            status: "FILLED".to_string(),
+                            filled_price: fill_price,
+                            filled_size: fill_size,
+                            requested_amount: order.amount_usd,
+                            requested_price: order.price,
+                            order_id: None,
+                            execution_method: ExecutionMethod::GtcPaper.as_str().to_string(),
+                            latency_ms,
+                            fail_reason: None,
+                            is_paper: true,
+                        }) {
+                            tracing::warn!(error = %e, "GTC_PAPER fill IPC send failed");
+                        }
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -237,37 +237,37 @@ pub fn spawn_timeout_sweeper(
                     clob_ws.unsubscribe(&[order.token_id.clone()]);
                 }
 
-                tracing::debug!(
+                tracing::info!(
                     alloc = %&order.alloc_id[..order.alloc_id.len().min(12)],
                     side = ?order.side,
                     token = %&order.token_id[..order.token_id.len().min(16)],
                     "GTC_PAPER expired"
                 );
 
-                // Send SKIPPED IPC result
-                let _ = ipc_tx
-                    .send(OutboundMessage::CopyTradeResult {
-                        detected_trade_id: Some(order.transaction_hash.clone()),
-                        allocation_id: order.alloc_id,
-                        proxy_wallet: order.proxy_wallet,
-                        condition_id: order.condition_id,
-                        token_id: order.token_id,
-                        side: match order.side {
-                            TradeSide::Buy => "BUY".to_string(),
-                            TradeSide::Sell => "SELL".to_string(),
-                        },
-                        status: "SKIPPED".to_string(),
-                        filled_price: 0.0,
-                        filled_size: 0.0,
-                        requested_amount: order.amount_usd,
-                        requested_price: order.price,
-                        order_id: None,
-                        execution_method: ExecutionMethod::GtcPaper.as_str().to_string(),
-                        latency_ms: order.created_at.elapsed().as_millis() as u64,
-                        fail_reason: Some("GTC paper expired".to_string()),
-                        is_paper: true,
-                    })
-                    .await;
+                // Send SKIPPED IPC result (non-blocking)
+                if let Err(e) = ipc_tx.try_send(OutboundMessage::CopyTradeResult {
+                    detected_trade_id: Some(order.transaction_hash.clone()),
+                    allocation_id: order.alloc_id.clone(),
+                    proxy_wallet: order.proxy_wallet,
+                    condition_id: order.condition_id,
+                    token_id: order.token_id.clone(),
+                    side: match order.side {
+                        TradeSide::Buy => "BUY".to_string(),
+                        TradeSide::Sell => "SELL".to_string(),
+                    },
+                    status: "SKIPPED".to_string(),
+                    filled_price: 0.0,
+                    filled_size: 0.0,
+                    requested_amount: order.amount_usd,
+                    requested_price: order.price,
+                    order_id: None,
+                    execution_method: ExecutionMethod::GtcPaper.as_str().to_string(),
+                    latency_ms: order.created_at.elapsed().as_millis() as u64,
+                    fail_reason: Some("GTC paper expired".to_string()),
+                    is_paper: true,
+                }) {
+                    tracing::warn!(error = %e, "GTC_PAPER expired IPC send failed");
+                }
             }
         }
     });
