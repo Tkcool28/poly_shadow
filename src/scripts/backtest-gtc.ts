@@ -16,12 +16,14 @@
  */
 
 import { parseArgs } from 'util';
-import { readdirSync, existsSync } from 'fs';
-import { join } from 'path';
 import { connectBacktestDb } from './lib/backtest-db';
 import { buildSimConfig, type AllocRow } from './lib/backtest-cli';
-import { resolveOutcomeIndex } from './lib/backtest-engine';
 import type { CalibrationData } from './lib/backtest-db';
+import {
+  simulateGtcFill,
+  loadPriceTicks,
+  type DetectedSignal,
+} from './lib/backtest-gtc-lib';
 
 const { values: args } = parseArgs({
   options: {
@@ -47,35 +49,6 @@ if (!args.trader) {
 const GTC_TIMEOUT_SEC = parseInt(args['gtc-timeout'] ?? '10', 10);
 const PRICE_DIR = args['price-dir'] ?? 'data/prices';
 const VERBOSE = args.verbose ?? false;
-
-interface DetectedSignal {
-  id: string;
-  proxyWallet: string;
-  side: string;
-  conditionId: string;
-  tokenId: string;
-  size: number;
-  price: number;
-  outcome: string;
-  eventSlug: string;
-  title: string;
-  timestamp: number; // unix seconds
-  detectedAtMs: number; // unix ms
-}
-
-interface PriceTick {
-  timestamp_ms: number;
-  token_id: string;
-  price: number;
-  size: number;
-  side: string;
-}
-
-interface GtcFillResult {
-  filled: boolean;
-  fillPrice: number;
-  fillLatencyMs: number;
-}
 
 async function main() {
   const db = await connectBacktestDb();
@@ -236,12 +209,15 @@ async function main() {
     const hedgeNakedMaxPrice = 0.10;
     const hedgeMaxRatio = 0.20;
     if (hedgePriceRatio > 0 && signal.price < hedgePriceRatio) {
-      // Use tokenId to derive outcome index: each conditionId has 2 tokens
-      // Track which token we're buying as oi=0, opposite as oi=1
+      // Track positions by conditionId:tokenId — opposite is any other token on same conditionId
       const thisKey = `${signal.conditionId}:${signal.tokenId}`;
-      // Find opposite: any other tokenId on same conditionId
-      const oppositeKey = `${signal.conditionId}:opposite:${signal.tokenId}`;
-      const oppositeUsd = tokenPositions.get(oppositeKey) ?? 0;
+      // Check if we have a position on the opposite outcome
+      let oppositeUsd = 0;
+      for (const [key, val] of tokenPositions) {
+        if (key.startsWith(`${signal.conditionId}:`) && key !== thisKey) {
+          oppositeUsd += val;
+        }
+      }
       if (oppositeUsd < 0.01) {
         if (hedgeNakedMaxPrice > 0 && signal.price <= hedgeNakedMaxPrice) { skipCount++; continue; }
       } else {
@@ -349,118 +325,6 @@ async function main() {
   }
 
   await db.end();
-}
-
-/**
- * Simulate a GTC fill: check if any price tick within the timeout window
- * crosses the limit price for a BUY order.
- * BUY fills if tick.price <= limitPrice (someone sells at our bid).
- */
-function simulateGtcFill(
-  tokenId: string,
-  limitPrice: number,
-  signalTimestampMs: number,
-  timeoutMs: number,
-  priceTicks: Map<string, PriceTick[]>,
-): GtcFillResult {
-  const ticks = priceTicks.get(tokenId);
-  if (!ticks) return { filled: false, fillPrice: 0, fillLatencyMs: 0 };
-
-  const endMs = signalTimestampMs + timeoutMs;
-
-  // Binary search for first tick >= signalTimestampMs
-  let lo = 0, hi = ticks.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >>> 1;
-    if (ticks[mid].timestamp_ms < signalTimestampMs) lo = mid + 1;
-    else hi = mid;
-  }
-
-  // Scan ticks within timeout window
-  for (let i = lo; i < ticks.length && ticks[i].timestamp_ms <= endMs; i++) {
-    if (ticks[i].price <= limitPrice) {
-      return {
-        filled: true,
-        fillPrice: ticks[i].price,
-        fillLatencyMs: ticks[i].timestamp_ms - signalTimestampMs,
-      };
-    }
-  }
-
-  return { filled: false, fillPrice: 0, fillLatencyMs: 0 };
-}
-
-/**
- * Load price ticks from parquet files in the data directory.
- * Returns a Map of tokenId -> sorted PriceTick[].
- *
- * Falls back to CSV if parquet reader isn't available.
- */
-async function loadPriceTicks(
-  dir: string,
-  cutoffMs: number,
-): Promise<Map<string, PriceTick[]>> {
-  const result = new Map<string, PriceTick[]>();
-
-  if (!existsSync(dir)) {
-    console.warn(`Price data directory not found: ${dir}`);
-    console.warn('Download from server: scp aws_ireland_dockerapps:/data/prices/*.parquet data/prices/');
-    return result;
-  }
-
-  const files = readdirSync(dir).filter(f => f.endsWith('.parquet')).sort();
-  if (files.length === 0) {
-    console.warn(`No parquet files found in ${dir}`);
-    return result;
-  }
-
-  console.log(`  Found ${files.length} parquet files`);
-
-  // Try DuckDB for parquet reading
-  try {
-    // @ts-ignore — duckdb is an optional dependency, only needed when running this script
-    const duckdb = await import('duckdb');
-    const db = new duckdb.Database(':memory:');
-    const conn = db.connect();
-
-    // DuckDB query — dir and cutoffMs are computed internally (not user input),
-    // but we sanitize the path to prevent injection via malicious filenames
-    const safePath = dir.replace(/['"\\]/g, '');
-    const safeCutoff = Number(cutoffMs);
-    const query = `
-      SELECT timestamp_ms, token_id, price, size, side
-      FROM read_parquet('${safePath}/*.parquet')
-      WHERE timestamp_ms >= ${safeCutoff}
-      ORDER BY token_id, timestamp_ms
-    `;
-
-    await new Promise<void>((resolve, reject) => {
-      conn.all(query, (err: any, rows: any[]) => {
-        if (err) { reject(err); return; }
-        for (const row of rows) {
-          const tick: PriceTick = {
-            timestamp_ms: Number(row.timestamp_ms),
-            token_id: String(row.token_id),
-            price: Number(row.price),
-            size: Number(row.size),
-            side: String(row.side),
-          };
-          const arr = result.get(tick.token_id) ?? [];
-          arr.push(tick);
-          result.set(tick.token_id, arr);
-        }
-        resolve();
-      });
-    });
-
-    conn.close();
-    db.close();
-  } catch (e: any) {
-    console.warn(`DuckDB not available (${e.message}). Install: npm install duckdb`);
-    console.warn('Falling back to empty price data — GTC fills will all expire.');
-  }
-
-  return result;
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
