@@ -238,6 +238,35 @@ async function main() {
     });
   }
 
+  // Fallback: fetch missing markets from Gamma API
+  const missingIds = conditionIds.filter(id => !marketsMap.has(id));
+  if (missingIds.length > 0) {
+    console.log(`  ${marketsMap.size} in DB, ${missingIds.length} missing — fetching from Gamma API...`);
+    const GAMMA_URL = 'https://gamma-api.polymarket.com/markets';
+    const batchSize = 10;
+    for (let i = 0; i < missingIds.length; i += batchSize) {
+      const batch = missingIds.slice(i, i + batchSize);
+      const promises = batch.map(async (cid) => {
+        try {
+          const resp = await fetch(`${GAMMA_URL}?conditionId=${cid}`);
+          if (!resp.ok) return;
+          const markets = await resp.json() as any[];
+          const m = markets[0];
+          if (!m) return;
+          marketsMap.set(cid, {
+            conditionId: cid,
+            outcomePrices: m.outcomePrices || '[]',
+            outcomes: m.outcomes || '[]',
+            endDate: m.endDate || null,
+            closed: m.closed ?? false,
+          });
+        } catch { /* skip */ }
+      });
+      await Promise.all(promises);
+    }
+    console.log(`  After Gamma: ${marketsMap.size} total markets`);
+  }
+
   const resolvedCount = Array.from(marketsMap.values()).filter(m => m.closed).length;
   console.log(`  ${marketsMap.size} markets found (${resolvedCount} resolved, ${marketsMap.size - resolvedCount} open)`);
 
@@ -315,7 +344,20 @@ async function main() {
 
   const elapsed = ((Date.now() - startMs) / 1000).toFixed(1);
   const profitable = results.filter(r => r.score > 0 && r.buysPerDay >= MIN_BUYS_PER_DAY);
-  console.log(`  Done in ${elapsed}s — ${profitable.length}/${sweepConfigs.length} profitable (>= ${MIN_BUYS_FOR_RANKING} buys, >= ${MIN_BUYS_PER_DAY} buys/day)\n`);
+
+  // Debug: show best configs even if unprofitable
+  const allWithBuys = results.filter(r => r.buys > 0);
+  if (allWithBuys.length > 0 && profitable.length === 0) {
+    allWithBuys.sort((a, b) => b.pnl - a.pnl);
+    console.log(`  Done in ${elapsed}s — 0 profitable but ${allWithBuys.length} configs had fills:`);
+    const best = allWithBuys[0];
+    console.log(`  Best: PnL=$${best.pnl.toFixed(2)} ROI=${best.roi.toFixed(1)}% Buys=${best.buys} WR=${best.holdWr.toFixed(0)}% FillR=${best.fillRate.toFixed(1)}% (minBuy=${best.sweepCfg.minBuyPrice} maxTr=$${best.sweepCfg.maxTrade} maxPr=$${best.sweepCfg.maxPred} copy=${best.sweepCfg.copyPercent} tmout=${best.sweepCfg.gtcTimeout}s)`);
+    const worst = allWithBuys[allWithBuys.length - 1];
+    console.log(`  Worst: PnL=$${worst.pnl.toFixed(2)} Buys=${worst.buys} WR=${worst.holdWr.toFixed(0)}%`);
+    console.log(`  Median: PnL=$${allWithBuys[Math.floor(allWithBuys.length/2)].pnl.toFixed(2)} Buys=${allWithBuys[Math.floor(allWithBuys.length/2)].buys}\n`);
+  } else {
+    console.log(`  Done in ${elapsed}s — ${profitable.length}/${sweepConfigs.length} profitable (>= ${MIN_BUYS_FOR_RANKING} buys, >= ${MIN_BUYS_PER_DAY} buys/day)\n`);
+  }
 
   // Sort and deduplicate
   profitable.sort((a, b) => b.score - a.score);
@@ -620,7 +662,8 @@ function runSimulation(
   const scalpCats = (catCounts.get('5m') ?? 0) + (catCounts.get('15m') ?? 0);
   const scalpPct = scalpCats / totalCats * 100;
 
-  const score = computeScore(totalPnl, roi, scalpPct, fillCount, maxDdPct, MIN_BUYS_FOR_RANKING, buysPerDay);
+  // scalpPct penalty disabled for GTC sweep — updown markets are the intended target
+  const score = computeScore(totalPnl, roi, 0, fillCount, maxDdPct, MIN_BUYS_FOR_RANKING, buysPerDay);
 
   return {
     pnl: totalPnl,
