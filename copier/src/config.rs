@@ -38,6 +38,9 @@ pub struct Config {
     pub slippage_upside_fraction: f64,
     pub slippage_min_absolute: f64,
 
+    // Market scanner (permanent updown market subscriptions for CLOB WS)
+    pub market_scanner_enabled: bool,
+
     // GTC paper mode (replaces instant simulate_paper_fill)
     pub gtc_paper_enabled: bool,
     pub gtc_paper_timeout_ms: u64,
@@ -119,6 +122,11 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(0.01);
 
+        let market_scanner_enabled = std::env::var("MARKET_SCANNER_ENABLED")
+            .ok()
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
         let gtc_paper_enabled = std::env::var("GTC_PAPER_ENABLED")
             .ok()
             .map(|v| v == "true" || v == "1")
@@ -163,6 +171,7 @@ impl Config {
             gtc_fallback_rest_ms,
             slippage_upside_fraction,
             slippage_min_absolute,
+            market_scanner_enabled,
             gtc_paper_enabled,
             gtc_paper_timeout_ms,
             clob_ws_url,

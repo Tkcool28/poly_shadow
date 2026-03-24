@@ -3,6 +3,7 @@ mod clob_ws;
 mod config;
 mod filter;
 mod gtc_paper;
+mod market_scanner;
 #[cfg(unix)]
 mod ipc;
 #[cfg(not(unix))]
@@ -147,6 +148,12 @@ async fn main() -> anyhow::Result<()> {
         let tracker = Arc::new(gtc_paper::GtcPaperTracker::new(std::time::Duration::from_secs(10)));
         (client, tracker)
     };
+
+    // ── Market Scanner: permanent updown market subscriptions ──
+    if cfg.market_scanner_enabled && cfg.gtc_paper_enabled {
+        tracing::info!("market scanner enabled — discovering updown markets");
+        market_scanner::spawn_market_scanner(clob_ws_client.clone());
+    }
 
     // ── WSS pipeline ──
     let (event_tx, mut event_rx) = mpsc::channel::<wss::RawLogEvent>(4096);
