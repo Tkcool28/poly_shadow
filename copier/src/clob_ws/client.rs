@@ -8,6 +8,8 @@ const INITIAL_RECONNECT_MS: u64 = 1000;
 const MAX_RECONNECT_MS: u64 = 30_000;
 const PING_INTERVAL_MS: u64 = 10_000;
 const STALE_THRESHOLD_MS: u64 = 30_000;
+const DATA_STALE_THRESHOLD_MS: u64 = 60_000; // force reconnect if no DATA (not PONG) for 60s
+const MAX_CONNECTION_LIFETIME_MS: u64 = 300_000; // force reconnect every 5 minutes
 const BROADCAST_CAPACITY: usize = 4096;
 
 /// A single price tick from CLOB Market WS.
@@ -115,6 +117,11 @@ async fn run_ws_loop(
                 reconnect_delay = INITIAL_RECONNECT_MS;
             }
             Err(e) => {
+                let msg = e.to_string();
+                // Reset backoff for expected lifecycle events (not real errors)
+                if msg.contains("max lifetime") || msg.contains("data stale") {
+                    reconnect_delay = INITIAL_RECONNECT_MS;
+                }
                 tracing::error!(error = %e, "CLOB WS connection failed");
             }
         }
@@ -170,8 +177,12 @@ async fn connect_and_stream(
 
     let ping_interval = tokio::time::Duration::from_millis(PING_INTERVAL_MS);
     let stale_threshold = tokio::time::Duration::from_millis(STALE_THRESHOLD_MS);
+    let data_stale_threshold = tokio::time::Duration::from_millis(DATA_STALE_THRESHOLD_MS);
+    let max_lifetime = tokio::time::Duration::from_millis(MAX_CONNECTION_LIFETIME_MS);
     let mut ping_timer = tokio::time::interval(ping_interval);
     let mut last_activity = tokio::time::Instant::now();
+    let mut last_data = tokio::time::Instant::now(); // tracks actual data, not PONG
+    let connect_time = tokio::time::Instant::now();
 
     loop {
         tokio::select! {
@@ -182,10 +193,11 @@ async fn connect_and_stream(
                         if text == "PONG" {
                             continue;
                         }
+                        last_data = tokio::time::Instant::now();
                         // Count raw messages for debugging
                         static MSG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                         let n = MSG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if n == 0 || n == 10 || n == 100 {
+                        if n == 0 || n == 10 || n == 100 || n % 10000 == 0 {
                             tracing::info!(n, len = text.len(), preview = %&text[..text.len().min(80)], "CLOB WS raw msg");
                         }
                         if let Some(ticks) = parse_price_event(&text) {
@@ -212,12 +224,29 @@ async fn connect_and_stream(
                 }
             }
             _ = ping_timer.tick() => {
+                // Check transport-level stale (no messages at all, including PONG)
                 if last_activity.elapsed() > stale_threshold {
                     tracing::warn!(
                         stale_ms = last_activity.elapsed().as_millis() as u64,
-                        "CLOB WS stale, forcing reconnect"
+                        "CLOB WS stale (no activity), forcing reconnect"
                     );
                     return Err(anyhow::anyhow!("CLOB WS stale"));
+                }
+                // Check data-level stale (PONG works but no actual market data)
+                if last_data.elapsed() > data_stale_threshold {
+                    tracing::warn!(
+                        data_stale_ms = last_data.elapsed().as_millis() as u64,
+                        "CLOB WS data stale (PONG alive but no market data), forcing reconnect"
+                    );
+                    return Err(anyhow::anyhow!("CLOB WS data stale"));
+                }
+                // Force reconnect after max lifetime to prevent silent degradation
+                if connect_time.elapsed() > max_lifetime {
+                    tracing::info!(
+                        lifetime_ms = connect_time.elapsed().as_millis() as u64,
+                        "CLOB WS max lifetime reached, cycling connection"
+                    );
+                    return Err(anyhow::anyhow!("CLOB WS max lifetime"));
                 }
                 let _ = ws.send(Message::Text("PING".to_string())).await;
             }
