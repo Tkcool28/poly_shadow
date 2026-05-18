@@ -37,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    tracing::info!("polymarket-copier v0.2.0 starting (Phase 7: paper validation)");
+    tracing::info!("polymarket-copier v0.2.0 starting");
 
     let cfg = config::Config::from_env()?;
     let filter_config = FilterConfig::from_env();

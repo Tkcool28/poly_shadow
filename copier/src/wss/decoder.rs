@@ -161,10 +161,10 @@ mod tests {
 
     #[test]
     fn test_extract_address() {
-        let topic = "0x00000000000000000000000063ce342161250d705dc0b16df89036c8e5f9ba9a";
+        let topic = "0x0000000000000000000000001234567890abcdef1234567890abcdef12345678";
         assert_eq!(
             extract_address(topic),
-            Some("0x63ce342161250d705dc0b16df89036c8e5f9ba9a".to_string())
+            Some("0x1234567890abcdef1234567890abcdef12345678".to_string())
         );
     }
 

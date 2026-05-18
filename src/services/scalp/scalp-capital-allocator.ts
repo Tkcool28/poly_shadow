@@ -258,7 +258,7 @@ export function generateLaunchScript(allocations: MatchAllocation[]): string {
     '# Auto-generated multi-match launch with capital allocation',
     `# Generated at ${new Date().toISOString()}`,
     '',
-    'PROJECT_DIR="/Users/mantotan/Documents/Projects/Hatolabs/polymarket-copy-trade"',
+    'PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"',
     'LOG_DIR="$PROJECT_DIR/logs/paper-mm"',
     'mkdir -p "$LOG_DIR"',
     '',

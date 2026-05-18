@@ -1,6 +1,28 @@
-# Scalp Agent Activity Log
+# Scalp Research Log
 
-Append-only. Newest at bottom. Compress oldest entries if >300 lines.
+Append-only working notes from a research strand exploring real-time
+market-making on Polymarket in-play sports markets. Each entry is the
+contemporaneous engineering / decision log for a single working session.
+
+## Research Outcome — Summary
+
+After ~10 days of paper trading across multiple matches, the in-play MM
+strategy was retired. The full reasoning is at the bottom of this log under
+"Verdict"; the short version:
+
+- **Hypothesis:** in-play sports markets on Polymarket have wide enough spreads
+  during goal/score events to make passive market-making profitable with a
+  fast goal-detection feed protecting against adverse selection.
+- **Finding:** the hypothesized edge does not exist on high-volume matches.
+  Professional MMs keep the spread at 1c throughout; any quote outside BBO
+  only fills when price has already moved against it (100% adverse-selection
+  flow). On low-volume matches, spreads are wide but fill rate collapses.
+- **Decision:** retire the strand. Copy-trade remains the primary product;
+  scalp code is kept for reference and capital is fully isolated
+  (`ScalpCapital`), so leaving the processes deployed has no effect on
+  copy-trade operations.
+
+The rest of this file is the raw working notes that led to that conclusion.
 
 ---
 
@@ -359,4 +381,6 @@ Config: spread=4c, size=$10, maxInventory=$50, queue=$100, eventPause=30s.
 
 ### Verdict
 
-**The MM strategy on Polymarket sports is structurally unviable.** The competitive landscape is dominated by professional MMs with superior speed, capital, and data feeds. Our hypothesized edge (wide in-play spreads + event feed protection) does not exist in reality. This is not a parameter tuning problem — it's a fundamental market structure problem.
+**Retiring the in-play MM strand for a non-pro participant on Polymarket sports.** The competitive landscape is dominated by professional MMs with superior speed, capital, and data feeds; the hypothesized edge (wide in-play spreads protected by a faster event feed) does not survive contact with high-volume matches. This is not a parameter-tuning problem — it's a market-structure problem that any further iteration would still hit.
+
+This is a clean negative result: the strategy was paper-traded for ~10 days across 9 markets / 3 matches / 55 round trips with no positive avg-spread-capture in any configuration we could reach. Code retained for reference; capital and processes are isolated from copy-trade.

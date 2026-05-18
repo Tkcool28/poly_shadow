@@ -1,7 +1,7 @@
 {
   "name": "polymarket-copy-trade",
   "version": "1.0.0",
-  "description": "",
+  "description": "Production copy-trading system for Polymarket: Node.js orchestration + Rust executor, sub-second WSS trade detection with on-chain Polygon fallback, IPC-bridged FAK/GTC order routing on the CLOB.",
   "main": "index.js",
   "scripts": {
     "build": "tsc",
@@ -19,9 +19,20 @@
     "type": "git",
     "url": "git+https://github.com/mantotan/polymarket-copy-trade.git"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "polymarket",
+    "copy-trading",
+    "prediction-markets",
+    "polygon",
+    "websocket",
+    "rust",
+    "typescript",
+    "clob",
+    "ipc",
+    "trading-systems"
+  ],
+  "author": "Hermanto Tan (@mantotan)",
+  "license": "MIT",
   "type": "commonjs",
   "bugs": {
     "url": "https://github.com/mantotan/polymarket-copy-trade/issues"

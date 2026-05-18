@@ -265,7 +265,7 @@ mod tests {
 
         let trade = make_trade(
             "0xabc123def456abc123",
-            "0x63ce342161250d705dc0b16df89036c8e5f9ba9a",
+            "0x1234567890abcdef1234567890abcdef12345678",
             TradeSide::Buy,
             true,
             10.0,
@@ -291,7 +291,7 @@ mod tests {
 
         let trade = make_trade(
             "0xabc123def456abc123",
-            "0x63ce342161250d705dc0b16df89036c8e5f9ba9a",
+            "0x1234567890abcdef1234567890abcdef12345678",
             TradeSide::Buy,
             false,
             10.0,
@@ -321,7 +321,7 @@ mod tests {
         // Taker phantom arrives first
         let taker = make_trade(
             "0xabc123def456abc123",
-            "0x63ce342161250d705dc0b16df89036c8e5f9ba9a",
+            "0x1234567890abcdef1234567890abcdef12345678",
             TradeSide::Sell,
             false,
             5.0,
@@ -333,7 +333,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(30)).await;
         let maker = make_trade(
             "0xabc123def456abc123",
-            "0x63ce342161250d705dc0b16df89036c8e5f9ba9a",
+            "0x1234567890abcdef1234567890abcdef12345678",
             TradeSide::Buy,
             true,
             5.0,
@@ -364,7 +364,7 @@ mod tests {
         // First taker fill
         let t1 = make_trade(
             "0xabc123def456abc123",
-            "0x63ce342161250d705dc0b16df89036c8e5f9ba9a",
+            "0x1234567890abcdef1234567890abcdef12345678",
             TradeSide::Buy,
             false,
             10.0,
@@ -376,7 +376,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         let mut t2 = make_trade(
             "0xabc123def456abc123",
-            "0x63ce342161250d705dc0b16df89036c8e5f9ba9a",
+            "0x1234567890abcdef1234567890abcdef12345678",
             TradeSide::Buy,
             false,
             20.0,
@@ -407,7 +407,7 @@ mod tests {
         // First taker (BUY)
         let t1 = make_trade(
             "0xabc123def456abc123",
-            "0x63ce342161250d705dc0b16df89036c8e5f9ba9a",
+            "0x1234567890abcdef1234567890abcdef12345678",
             TradeSide::Buy,
             false,
             10.0,
@@ -419,7 +419,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         let mut t2 = make_trade(
             "0xabc123def456abc123",
-            "0x63ce342161250d705dc0b16df89036c8e5f9ba9a",
+            "0x1234567890abcdef1234567890abcdef12345678",
             TradeSide::Sell,
             false,
             10.0,

@@ -6,12 +6,12 @@
  * then resolves PnL from Market table outcomes.
  *
  * Usage:
- *   ssh -f -N -L 15438:localhost:5438 aws_ireland_dockerapps
- *   scp aws_ireland_dockerapps:/data/prices/*.parquet data/prices/
+ *   ssh -f -N -L 15438:localhost:5438 $PROD_SSH_HOST
+ *   scp $PROD_SSH_HOST:/data/prices/*.parquet data/prices/
  *
- *   npx tsx src/scripts/backtest-gtc-sweep.ts --trader 0x63ce --days 1
+ *   npx tsx src/scripts/backtest-gtc-sweep.ts --trader 0xabcd --days 1
  *   npx tsx src/scripts/backtest-gtc-sweep.ts --trader 0xd189 --days 3 --top 10
- *   npx tsx src/scripts/backtest-gtc-sweep.ts --trader 0x63ce --hours 12 --include-open
+ *   npx tsx src/scripts/backtest-gtc-sweep.ts --trader 0xabcd --hours 12 --include-open
  */
 
 import { parseArgs } from 'util';

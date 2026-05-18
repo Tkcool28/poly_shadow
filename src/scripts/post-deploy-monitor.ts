@@ -2,24 +2,48 @@
 /**
  * Post-Deploy Health Monitor
  *
- * Checks 9 production health metrics for the 0x8dxd allocation after deploying
- * FAK cooldown fix + signal age fix + G175/P30/T8 config upgrade.
+ * Checks 11 production health metrics for a copy-trade allocation after deploy.
  *
  * Runs a SINGLE SSH session to production to avoid rate limiting, pipes all
- * 9 SQL queries in one psql invocation, then parses results in Node.
+ * SQL queries in one psql invocation, then parses results in Node.
+ *
+ * Required env:
+ *   ALLOCATION_ID    Follow-allocation row id (e.g. fa_<wallet>_live_<ts>)
+ *   WATCHED_WALLET   Trader proxy wallet address being copied
+ *   DEPLOY_SSH_HOST  SSH host alias of the production box
+ *   DEPLOY_PG_USER   Postgres role
+ *   DEPLOY_PG_DB     Postgres database name
+ *   DEPLOY_PG_CONTAINER  docker container name running postgres
  *
  * Usage:
+ *   ALLOCATION_ID=... WATCHED_WALLET=0x... \
+ *   DEPLOY_SSH_HOST=... DEPLOY_PG_USER=... DEPLOY_PG_DB=... DEPLOY_PG_CONTAINER=... \
  *   npx tsx src/scripts/post-deploy-monitor.ts
- *   # or with /loop 20m
  *
  * Exit codes: 0 = PASS, 1 = WARN, 2 = ALERT
  */
 
 import { execSync } from 'child_process';
 
-const ALLOCATION_ID = 'fa_0x8dxd_live_1773336058';
+const ALLOCATION_ID = process.env.ALLOCATION_ID ?? '';
+const WATCHED_WALLET = process.env.WATCHED_WALLET ?? '';
+const DEPLOY_SSH_HOST = process.env.DEPLOY_SSH_HOST ?? '';
+const DEPLOY_PG_USER = process.env.DEPLOY_PG_USER ?? '';
+const DEPLOY_PG_DB = process.env.DEPLOY_PG_DB ?? '';
+const DEPLOY_PG_CONTAINER = process.env.DEPLOY_PG_CONTAINER ?? '';
 
-// ─── Run all 9 queries in a single SSH + psql session ───
+const required = { ALLOCATION_ID, WATCHED_WALLET, DEPLOY_SSH_HOST, DEPLOY_PG_USER, DEPLOY_PG_DB, DEPLOY_PG_CONTAINER };
+for (const [k, v] of Object.entries(required)) {
+  if (!v) { console.error(`Missing required env: ${k}`); process.exit(2); }
+}
+
+// Validate wallet format — value is interpolated into a SQL string below
+if (!/^0x[a-fA-F0-9]{40}$/.test(WATCHED_WALLET)) {
+  console.error('WATCHED_WALLET must be a 0x-prefixed 40-hex-char EVM address');
+  process.exit(2);
+}
+
+// ─── Run all queries in a single SSH + psql session ───
 
 function runQueries(): string {
   const sql = `
@@ -87,13 +111,13 @@ WHERE "followAllocationId" = '${ALLOCATION_ID}'
 
 -- Q11: RAPID_POLL disabled? (should be zero for copyMakerFills wallets)
 SELECT 'Q11', COUNT(*) FROM "DetectedTrade"
-WHERE "proxyWallet" = '0x63ce342161250d705dc0b16df89036c8e5f9ba9a'
+WHERE "proxyWallet" = '${WATCHED_WALLET}'
   AND "detectionSource" = 'RAPID_POLL'
   AND "detectedAt" > NOW() - INTERVAL '20 minutes';
 `;
 
-  const result = execSync(`ssh hetzner_finland_dockerapps bash -s <<'OUTER'
-docker exec -i polymarket_postgres psql -U polymarket -d polymarket_copytrade -t -A -F'|' <<'EOSQL'
+  const result = execSync(`ssh ${DEPLOY_SSH_HOST} bash -s <<'OUTER'
+docker exec -i ${DEPLOY_PG_CONTAINER} psql -U ${DEPLOY_PG_USER} -d ${DEPLOY_PG_DB} -t -A -F'|' <<'EOSQL'
 ${sql}
 EOSQL
 OUTER`, { encoding: 'utf-8', timeout: 30000 });

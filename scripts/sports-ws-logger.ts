@@ -12,6 +12,7 @@
 
 import WebSocket from 'ws';
 import * as fs from 'fs';
+import * as path from 'path';
 
 const args = process.argv.slice(2);
 function getArg(name: string): string | undefined {
@@ -21,7 +22,7 @@ function getArg(name: string): string | undefined {
 
 const leagueFilter = getArg('league')?.toLowerCase() ?? '';  // empty = log all
 const runtimeMin = parseInt(getArg('runtime') ?? '180', 10);
-const logDir = '/Users/mantotan/Documents/Projects/Hatolabs/polymarket-copy-trade/logs/paper-mm';
+const logDir = path.resolve(__dirname, '..', 'logs', 'paper-mm');
 const logFile = `${logDir}/sports-ws-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.jsonl`;
 
 // Ensure log dir

@@ -6,7 +6,7 @@
  *   - Capital lockup, slug exclusion, empirical slippage/FAK, net position tracking
  *
  * Usage:
- *   ssh -f -N -L 15438:localhost:5438 aws_ireland_dockerapps
+ *   ssh -f -N -L 15438:localhost:5438 $PROD_SSH_HOST
  *   npx tsx src/scripts/batch-backtest-config-sweep.ts --trader FloatyBoi --trader LampStore
  *   npx tsx src/scripts/batch-backtest-config-sweep.ts --trader 0x38c6fd3ae5db...
  *   npx tsx src/scripts/batch-backtest-config-sweep.ts --exclude-slugs "" --no-capital-lockup

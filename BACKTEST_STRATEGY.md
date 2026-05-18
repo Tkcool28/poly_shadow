@@ -17,11 +17,11 @@ All three scripts share a common simulation engine (`src/scripts/lib/backtest-en
 All scripts connect to the production DB via SSH tunnel on port 15438.
 
 ```bash
-# Establish tunnel (Ireland)
-ssh -f -N -L 15438:localhost:5438 aws_ireland_dockerapps
+# Establish tunnel to production DB
+ssh -f -N -L 15438:localhost:5438 $PROD_SSH_HOST
 
 # Set DB password (required)
-export HETZNER_PG_PASSWORD='...'
+export PROD_PG_PASSWORD='...'
 ```
 
 ---

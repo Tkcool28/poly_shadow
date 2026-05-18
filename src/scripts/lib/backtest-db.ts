@@ -2,7 +2,7 @@
  * Shared DB connection and calibration for backtest scripts.
  *
  * All scripts connect to the production DB via SSH tunnel:
- *   ssh -f -N -L 15438:localhost:5438 aws_ireland_dockerapps
+ *   ssh -f -N -L 15438:localhost:5438 $PROD_SSH_HOST
  */
 
 import { Client } from 'pg';
@@ -19,7 +19,7 @@ export async function connectBacktestDb(): Promise<Client> {
     host: 'localhost',
     port: parseInt(process.env.BACKTEST_DB_PORT ?? '15438', 10),
     user: 'polymarket',
-    password: process.env.HETZNER_PG_PASSWORD ?? '',
+    password: process.env.PROD_PG_PASSWORD ?? '',
     database: 'polymarket_copytrade',
   });
   await db.connect();

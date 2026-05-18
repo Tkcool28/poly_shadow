@@ -94,7 +94,7 @@ export async function loadPriceTicks(
 
   if (!existsSync(dir)) {
     console.warn(`Price data directory not found: ${dir}`);
-    console.warn('Download from server: scp aws_ireland_dockerapps:/data/prices/*.parquet data/prices/');
+    console.warn('Download from server: scp $PROD_SSH_HOST:/data/prices/*.parquet data/prices/');
     return result;
   }
 

@@ -10,7 +10,7 @@
  *   - Prior trade warm-up for majority gate
  *
  * Usage:
- *   ssh -f -N -L 15438:localhost:5438 aws_ireland_dockerapps
+ *   ssh -f -N -L 15438:localhost:5438 $PROD_SSH_HOST
  *   npx tsx src/scripts/backtest-single-trader.ts --trader 0x8dxd --hours 24
  *   npx tsx src/scripts/backtest-single-trader.ts --trader LampStore --days 7 --exclude-slugs ""
  */

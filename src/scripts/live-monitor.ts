@@ -24,8 +24,13 @@ const WARN_SKIP_RATE = 0.50;     // Warn if >50% skipped in last hour
 const WARN_STALE_HOURS = 2;      // Warn if no activity for 2h
 const WARN_SLIPPAGE_BPS = 500;   // Warn if avg slippage > 500bps
 
-const SSH_HOST = 'aws_ireland_dockerapps';
+const SSH_HOST = process.env.PROD_SSH_HOST ?? '';
 const PSQL_CMD = 'docker exec -i polymarket_postgres psql -U polymarket -d polymarket_copytrade -t -A -F\'|\'';
+
+if (!SSH_HOST) {
+  console.error('Missing required env: PROD_SSH_HOST');
+  process.exit(2);
+}
 
 // ─── SQL Queries (single session) ───
 

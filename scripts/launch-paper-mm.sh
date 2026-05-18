@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-PROJECT_DIR="/Users/mantotan/Documents/Projects/Hatolabs/polymarket-copy-trade"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="$PROJECT_DIR/logs/paper-mm"
 DATE=$(date -u +%Y-%m-%d)
 

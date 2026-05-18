@@ -7,9 +7,9 @@
  * price tick data from parquet files.
  *
  * Usage:
- *   ssh -f -N -L 15438:localhost:5438 aws_ireland_dockerapps
+ *   ssh -f -N -L 15438:localhost:5438 $PROD_SSH_HOST
  *   # Download parquet files from server first:
- *   scp aws_ireland_dockerapps:/data/prices/*.parquet data/prices/
+ *   scp $PROD_SSH_HOST:/data/prices/*.parquet data/prices/
  *
  *   npx tsx src/scripts/backtest-gtc.ts --trader SeniorLaghetto --days 3
  *   npx tsx src/scripts/backtest-gtc.ts --trader cmmy2c3jxd0e3b9de --hours 24 --gtc-timeout 10

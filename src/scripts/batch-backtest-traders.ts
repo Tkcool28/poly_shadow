@@ -8,7 +8,7 @@
  *   - Independent flags: --both-sides, --follow-sells, --no-majority (or --follow-all for all 3)
  *
  * Usage:
- *   ssh -f -N -L 15438:localhost:5438 aws_ireland_dockerapps
+ *   ssh -f -N -L 15438:localhost:5438 $PROD_SSH_HOST
  *   npx tsx src/scripts/batch-backtest-traders.ts [--limit N] [--min-positions 20] [--gate 175]
  *   npx tsx src/scripts/batch-backtest-traders.ts --exclude-slugs "" --min-buy-price 0.40 --no-capital-lockup
  *   npx tsx src/scripts/batch-backtest-traders.ts --trader LampStore --hours 24 --verbose
