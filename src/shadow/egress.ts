@@ -51,3 +51,32 @@ export async function rpcCall<T>(
   if (json.error) throw new Error(`RPC error for ${method}: ${json.error.message}`);
   return json.result as T;
 }
+
+/** Result of a read-only REST GET through the egress boundary. */
+export interface RestGetResult {
+  status: number;
+  /** Freshness/cache headers when exposed (CDN cache behavior is measured). */
+  headers: { age: string | null; cacheControl: string | null; etag: string | null; date: string | null };
+  body: unknown;
+}
+
+/** Read-only REST GET through the egress boundary (allowlisted hosts only). */
+export async function restGet(url: string, timeoutMs = 15_000): Promise<RestGetResult> {
+  assertAllowedUrl(url, []);
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const body = await res.json().catch(() => null);
+  return {
+    status: res.status,
+    headers: {
+      age: res.headers.get('age'),
+      cacheControl: res.headers.get('cache-control'),
+      etag: res.headers.get('etag'),
+      date: res.headers.get('date'),
+    },
+    body,
+  };
+}

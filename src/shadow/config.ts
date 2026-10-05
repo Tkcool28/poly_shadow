@@ -60,6 +60,11 @@ export interface ShadowConfig {
   staleMs: number;
   verifyIntervalMs: number;
   backfillChunkBlocks: number;
+  /** Data API base (read-only REST sources). */
+  dataApiBaseUrl: string;
+  /** Independently justified bounded cadences (measured, not Poly2's). */
+  tradesPollMs: number;
+  activityPollMs: number;
 }
 
 function parseWallets(csv: string | undefined): Set<string> {
@@ -92,5 +97,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ShadowConfig {
     staleMs: Number(env.SHADOW_STALE_MS ?? 25_000),
     verifyIntervalMs: Number(env.SHADOW_VERIFY_INTERVAL_MS ?? 60_000),
     backfillChunkBlocks: Number(env.SHADOW_BACKFILL_CHUNK_BLOCKS ?? 200),
+    dataApiBaseUrl: env.SHADOW_DATA_API_BASE_URL ?? 'https://data-api.polymarket.com',
+    // 10s trades: discovery-latency-relevant but bounded (6 req/min/wallet);
+    // 30s activity: secondary population, lower discovery priority.
+    // Neither cadence is derived from Poly2; actual freshness is measured
+    // (poll telemetry records cache headers and source timestamps).
+    tradesPollMs: Number(env.SHADOW_TRADES_POLL_MS ?? 10_000),
+    activityPollMs: Number(env.SHADOW_ACTIVITY_POLL_MS ?? 30_000),
   };
 }

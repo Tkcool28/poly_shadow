@@ -119,6 +119,13 @@ export class ChainWatcher {
     private store: ShadowStore,
     private nowIso: () => string = () => new Date().toISOString(),
     private rpc: RpcFn = rpcCall,
+    /**
+     * PHASE 3 interface extension (documented): called synchronously after
+     * each observation commits, so the source-racing layer can record
+     * FIRST/CORROBORATOR membership. Default no-op — Phase 2 behavior and
+     * tests are unchanged.
+     */
+    private onObservation: (obs: import('./storage.js').ObservationRow) => void = () => {},
   ) {}
 
   start(): void {
@@ -390,7 +397,7 @@ export class ChainWatcher {
       // computed later, offline, by src/compare/poly2-adapter.ts — never here.
       const eventId = `${this.cfg.chainId}:${decoded.emitter}:${log.transactionHash}:${logIndex}`;
 
-      this.store.appendObservation({
+      const obsRow: import('./storage.js').ObservationRow = {
         eventId,
         role: cls.role,
         wallet: cls.wallet,
@@ -407,7 +414,10 @@ export class ChainWatcher {
           chainId: this.cfg.chainId, emitter: decoded.emitter,
           txHash: log.transactionHash, logIndex, blockHash: log.blockHash,
         },
-      });
+      };
+      this.store.appendObservation(obsRow);
+      // Phase 3: source racing records this source's first-seen evidence.
+      this.onObservation(obsRow);
 
       // 4) Only now is the event fully committed.
       finish('OBSERVED');

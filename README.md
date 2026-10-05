@@ -1,88 +1,91 @@
 # Poly-Shadow
 
-**Independent, read-only trade-discovery shadow for the Poly2 system.**
+**Independent, read-only, multi-source trade-discovery shadow for the Poly2 system.**
 
-Poly-Shadow watches approved Polymarket wallets through public, read-only
-sources (Polygon V2 exchange events, Data API REST) and records what it sees,
-when it saw it, and the native chain identity of each observed event —
-so Poly2's discovery completeness and freshness can be measured against an
-independent observer.
+Poly-Shadow watches approved Polymarket wallets through several independent
+public sources — Polygon V2 exchange events, the Data API `/trades` and
+`/activity` endpoints — records what each source saw and when, and races the
+sources against each other. The question it exists to answer:
 
-**It cannot trade.** There is no order submission, no transaction signing, no
-private-key handling, no authenticated CLOB access, no capital movement, and
-no redemption path anywhere in this repository. Credential material in the
+> Can an independently designed multi-source observer detect relevant wallet
+> activity faster and/or more completely than Poly2's current discovery path?
+
+**It cannot trade.** No order submission, no transaction signing, no
+private-key handling, no authenticated CLOB access, no capital movement, no
+redemption path — anywhere in this repository. Credential material in the
 environment is a startup error, not a configuration option.
+
+**It is not a Poly2 rewrite.** It keeps Poly2's discoveries scientifically
+testable: Shadow applies no freshness rejection, no scoring, no scheduling,
+and never discards an observation Poly2 would ignore. Comparison happens
+offline (Phase 4) from exported, read-only Poly2 records.
 
 ## Provenance
 
 Forked from [`mantotan/polymarket-copy-trade`](https://github.com/mantotan/polymarket-copy-trade)
-@ `9f3e76ce7a8c9f6003cf356ac223870dec4ef56a` (MIT, © Hermanto Tan — see
-`LICENSE`). Upstream is a live-money copy-trading system targeting the legacy
-V1 exchange contracts; it is used here as an **architectural reference only**
-(watcher lifecycle, reconnect/backfill, source racing). All execution code
-has been removed; the V2 decoder and shadow pipeline are new code.
+@ `9f3e76ce7a8c9f6003cf356ac223870dec4ef56a` (MIT, © Hermanto Tan — `LICENSE`).
+Upstream is a live-money copy-trading system on legacy V1 contracts; used
+here as an **architectural reference only** (watcher lifecycle,
+reconnect/backfill, source racing). All execution code has been removed.
 
-Audit trail and phase plans live in `docs/shadow/`:
+## Status
 
-- `UPSTREAM_PIN.md` — fork provenance and pin
-- `PHASE1_ASSESSMENT.md` — security/architecture audit (PR #1)
-- `PHASE2_REMOVAL_PLAN.md` — execution-capability excision plan and gate
-- `INDEPENDENCE.md` — architectural independence rules (Phase 2 review)
+| Phase | State |
+|---|---|
+| 1 — upstream/security assessment | ✅ merged (PR #1) |
+| 2 — execution excision + reliable V2 chain observer | ✅ merged (PR #2, merge `aa223757…`) |
+| 3 — multi-source discovery + source racing | 🔨 current (draft PR) |
+| 4 — offline Poly2 comparison | planned |
 
-## Layout
+**Start at [`docs/shadow/PROJECT_STATE.md`](docs/shadow/PROJECT_STATE.md)** —
+the authoritative handoff (exact SHAs, invariants, limitations).
+
+## Architecture (Phase 3)
+
+Three independent sources feed one append-only evidence store; a racer
+records which source saw each economic-trade candidate first. No source
+validates another; unmatched records stay visible.
 
 ```
-src/shadow/
-  v2constants.ts  Verified V2 exchange addresses + event topics (Hermes-verified)
-  decoder.ts      V2 OrderFilled/OrdersMatched decode, role classification,
-                  gross normalization (BigInt only, no floats)
-  decimal.ts      Exact 6-dp shares / 10-dp half-up gross price rendering
-  storage.ts      Append-only NDJSON evidence store, reorg tombstones,
-                  durable dispositions, native event identity
-  watcher.ts      Completeness-first WSS + eth_getLogs backfill watcher;
-                  single-flight recovery, generation-guarded concurrency
-  config.ts       Fail-closed config (refuses to start with any key material)
-  egress.ts       Application-level egress allowlist (RPC + public data APIs only)
-  main.ts         Entrypoint
-src/compare/
-  poly2-adapter.ts  Phase 4 ONLY: maps Shadow observations to candidate Poly2
-                    canonical keys; unmatched records stay visible. Never
-                    imported by the collector.
-scripts/
-  static-safety.mjs  CI gate: banned deps, network-client confinement,
-                     signing-API ban — exits non-zero on any violation
-tests/
-  exit-audit.test.ts   Phase 2 exit-audit acceptance matrix (8 cases)
-  fixtures/v2_fills.json  Real production receipts (5 trades, 3 wallets,
-                          both exchanges, BUY+SELL, rounding + fee cases,
-                          the 37-fill multi-fill transaction)
+Polygon RPC ─► CHAIN watcher (WSS + backfill, reorg-safe) ─┐
+data-api ────► REST_TRADES poller  (/trades takerOnly=F)   ├─► source racer ─► NDJSON evidence
+data-api ────► REST_ACTIVITY poller(/activity)            ─┘   (FIRST/CORROBORATOR)
 ```
+
+Full detail: [`docs/shadow/ARCHITECTURE.md`](docs/shadow/ARCHITECTURE.md).
+WS trade source: investigated and rejected —
+[`docs/shadow/WS_FEASIBILITY.md`](docs/shadow/WS_FEASIBILITY.md).
 
 ## Run
 
 ```bash
 npm ci --ignore-scripts
-npm test        # vitest: fixtures from real Polygon receipts + acceptance matrix
-npm run build   # tsc --noEmit
-npm run safety  # static safety gate
+npm test          # 63 tests: fixtures, watcher, exit-audit matrix, source racing
+npm run build     # tsc --noEmit
+npm run safety    # static no-trading safety gate
 
-SHADOW_WATCHED_WALLETS=0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029 \
-  npm start     # observation only; writes to ./shadow-data/
+# Bounded observation run (read-only, zero credentials):
+SHADOW_WATCHED_WALLETS=0x<wallet1>[,0x<wallet2>…] \
+SHADOW_DATA_DIR=./shadow-data \
+  timeout 300 npm start
+
+# Frozen-run metrics afterwards:
+node scripts/multisource-metrics.mjs ./shadow-data
 ```
 
-## Scope
+Cadences (independently chosen, overridable): `SHADOW_TRADES_POLL_MS`
+(default 10 000), `SHADOW_ACTIVITY_POLL_MS` (default 30 000).
 
-Phase 2 (current) is the **chain-observer foundation**: the Polygon V2 event
-watcher above. Fast REST discovery, validated WebSocket trade observation,
-and independent source racing are Phase 3; comparison against Poly2 via
-`src/compare/` is Phase 4. This is not yet a finished head-to-head
-alternative to Poly2.
+## Explicitly NOT implemented
+
+Trading, signing, keys, relayer, redemption, bankroll, strategy, scoring,
+Poly2's scheduling/canonical identity/freshness rejection, deployment
+automation, any Poly2 connection, any authenticated CLOB client. The
+WebSocket wallet-trade source is rejected with evidence (WS_FEASIBILITY.md).
 
 ## Hard boundaries
 
-- GitHub Actions in this repo are test-only (`.github/workflows/test.yml`):
-  typecheck, fixture tests, the static safety gate, and bounded startup
-  smoke checks. No deployment automation exists.
-- No connection to Poly2's production database, hosts, or credentials.
-- Comparison against Poly2 uses exported, read-only records only (Phase 4).
+- GitHub Actions are test-only (`contents: read`): typecheck, tests, static
+  safety gate, bounded startup smokes.
+- No connection to Poly2's database, hosts, or credentials — ever.
 - Upstream updates are never merged automatically.

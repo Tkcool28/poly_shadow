@@ -87,6 +87,9 @@ function cfg(dataDir: string): ShadowConfig {
     staleMs: 5000,
     verifyIntervalMs: 60_000,
     backfillChunkBlocks: 200,
+    dataApiBaseUrl: 'https://data-api.test',
+    tradesPollMs: 10_000,
+    activityPollMs: 30_000,
   };
 }
 

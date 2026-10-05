@@ -1,10 +1,8 @@
 /**
- * Watcher evidence-safety tests (independent re-review findings):
- * removed-log handling, transient failure + replay, restart/reorg
- * recovery, restart-after-failure durable replay, and concurrent-delivery
- * deduplication. These exercise the real ChainWatcher against in-memory
- * RPC mocks and a real ShadowStore in a temp dir — not storage methods
- * in isolation.
+ * Watcher evidence-safety tests (independent re-review findings 1–3):
+ * removed-log handling, transient failure + replay, restart/reorg recovery.
+ * These exercise the real ChainWatcher against an in-memory RPC mock and a
+ * real ShadowStore in a temp dir — not storage methods in isolation.
  */
 
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -67,6 +65,9 @@ function cfg(dataDir: string): ShadowConfig {
     staleMs: 5000,
     verifyIntervalMs: 60_000,
     backfillChunkBlocks: 200,
+    dataApiBaseUrl: 'https://data-api.test',
+    tradesPollMs: 10_000,
+    activityPollMs: 30_000,
   };
 }
 
