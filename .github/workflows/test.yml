@@ -1,0 +1,42 @@
+name: shadow-tests
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Typecheck + fixture tests + safety gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - run: npm ci --ignore-scripts
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+      # PHASE2_REMOVAL_PLAN §6: static dependency / network-client /
+      # signing-API guard.
+      - run: node scripts/static-safety.mjs
+      # Bounded zero-credential smoke: set-but-empty banned var must refuse.
+      - name: smoke — empty PRIVATE_KEY refuses startup
+        run: |
+          set +e
+          PRIVATE_KEY='' SHADOW_WATCHED_WALLETS=0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029 \
+            npx tsx src/shadow/main.ts > /tmp/smoke1.log 2>&1
+          code=$?
+          set -e
+          [ $code -ne 0 ] && grep -q CredentialGuardError /tmp/smoke1.log
+      # Bounded smoke: no watched wallets must refuse.
+      - name: smoke — missing watched wallets refuses startup
+        run: |
+          set +e
+          npx tsx src/shadow/main.ts > /tmp/smoke2.log 2>&1
+          code=$?
+          set -e
+          [ $code -ne 0 ] && grep -q SHADOW_WATCHED_WALLETS /tmp/smoke2.log
