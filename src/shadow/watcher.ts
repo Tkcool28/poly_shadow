@@ -18,11 +18,12 @@
  *   rows are never replayed, and no observation is ever stranded.
  * - seenRaw is marked only after full commit; concurrent deliveries of the
  *   same blockHash-aware identity are serialized through an in-flight map.
- * - Reorg recovery is fork-aware: a common ancestor must be PROVED against
- *   stored checkpoint hashes, or recovery fails closed (quarantine +
- *   explicit bounded rewind, labeled unverified). Conflicting raw
- *   identities are invalidated (HASH_CONFLICT tombstone + TERMINAL) so
- *   replay cannot revive them.
+ * - Reorg recovery is fork-aware: dense checkpoints (spacing < lookback) let
+ *   a common ancestor be PROVED against stored hashes. With no provable
+ *   ancestor, recovery FAILS CLOSED (recoveryRequired quarantine; cursor not
+ *   advanced; no automatic resume). A removal/reorg/HASH_CONFLICT tombstone
+ *   dominates any PENDING disposition for that exact identity forever —
+ *   only a new raw row under a NEW blockHash is new evidence.
  * - Recovery/scan/validation are single-flight (serialized); a generation
  *   counter invalidates handlers that were mid-flight across a rewind.
  * - First start: live coverage begins only after the subscription is
@@ -54,6 +55,13 @@ export class ReorgSignal extends Error {
 
 /** How far back common-ancestor search may walk (blocks). */
 const REORG_LOOKBACK = 128;
+/**
+ * Block-hash checkpoint spacing while scanning. Guaranteed < REORG_LOOKBACK
+ * so a common ancestor within the supported reorg depth can always be
+ * PROVED against a genuinely stored hash (≥ lookback/spacing checkpoints
+ * inside any walk window).
+ */
+const CHECKPOINT_SPACING = 16;
 /** First-start backfill overlap: covers the subscribe-handshake window. */
 const FIRST_START_OVERLAP_BLOCKS = 64;
 /** Bounds for in-memory diagnostic maps (Phase 2 bounded-run foundation). */
@@ -98,6 +106,13 @@ export class ChainWatcher {
   private generation = 0;
   /** Single-flight chain for validate/scan/replay/recovery transitions. */
   private exclusive: Promise<void> = Promise.resolve();
+  /**
+   * Hard recovery-required state: set when no PROVED common ancestor exists
+   * within the supported window. Automatic recovery STOPS — the cursor is
+   * not advanced to an unverified provider hash and scanning does not
+   * resume. A bounded manual/explicit recovery is a later operator action.
+   */
+  recoveryRequired = false;
 
   constructor(
     private cfg: ShadowConfig,
@@ -240,6 +255,17 @@ export class ChainWatcher {
           txHash: log.transactionHash, logIndex, blockHash: log.blockHash,
           removedAtUtc: this.nowIso(), reason: 'REMOVED_FLAG',
         });
+        // A removal DOMINATES any PENDING state for this exact identity,
+        // durably — retry or restart replay can never turn it into a false
+        // observation. Only a new raw row under a NEW blockHash is evidence.
+        this.recordDisposition(log, 'REMOVED_INVALID');
+        // Purge any queued in-memory retry for the removed identity.
+        this.retryQueue = this.retryQueue.filter(
+          (item) =>
+            `${item.log.address.toLowerCase()}:${item.log.transactionHash}:` +
+            `${Number(item.log.logIndex)}:${item.log.blockHash.toLowerCase()}` !==
+            `${emitter}:${log.transactionHash}:${logIndex}:${log.blockHash.toLowerCase()}`,
+        );
       }
       return;
     }
@@ -247,6 +273,14 @@ export class ChainWatcher {
     // 2) Dedup includes blockHash — re-inclusion in a different block is new.
     const dedupKey = `${removedKey}:${log.blockHash.toLowerCase()}`;
     if (this.seenRaw.has(dedupKey)) return;
+
+    // 2a) Tombstone dominance: this exact identity was removed/rewound (or
+    //    conflicted) — terminalize, never process. (Covers PENDING rows
+    //    delivered again after a removal, and post-rewind redeliveries.)
+    if (this.seenRemoved.has(dedupKey)) {
+      this.recordDisposition(log, 'REMOVED_INVALID');
+      return;
+    }
 
     // 2b) Serialize concurrent deliveries of the same identity (WSS racing
     // backfill): the second caller awaits the in-flight work; the commit
@@ -337,6 +371,12 @@ export class ChainWatcher {
         return;
       }
 
+      // A removal/rewind tombstoned this exact identity while we awaited.
+      if (this.seenRemoved.has(dedupKey)) {
+        finish('REMOVED_INVALID');
+        return;
+      }
+
       const norm = normalizeGross(decoded);
 
       if (cls.role === 'TAKER_AGGREGATE') {
@@ -381,6 +421,7 @@ export class ChainWatcher {
           txHash: log.transactionHash, logIndex, blockHash: log.blockHash,
           removedAtUtc: this.nowIso(), reason: 'HASH_CONFLICT',
         });
+        this.seenRemoved.add(dedupKey);
         this.store.appendQuarantine({
           kind: 'REORG_ANOMALY',
           detail: { blockNumber, logBlockHash: log.blockHash, error: String(err) },
@@ -442,10 +483,16 @@ export class ChainWatcher {
 
   /**
    * Validate the stored cursor against the provider. On mismatch, walk back
-   * over stored checkpoint hashes to a PROVED common ancestor. If no stored
-   * checkpoint matches within REORG_LOOKBACK, fail closed: quarantine an
-   * explicitly UNVERIFIED bounded rewind — never label an unproved block as
-   * the common ancestor.
+   * over stored checkpoint hashes to a PROVED common ancestor (checkpoint
+   * spacing is guaranteed < REORG_LOOKBACK, so a routine shallow reorg
+   * always has genuinely stored hashes inside the walk window).
+   *
+   * If NO stored checkpoint matches within the lookback, recovery FAILS
+   * CLOSED: quarantine a hard recovery-required state and stop. The cursor
+   * is NOT advanced to an unverified provider hash, nothing is tombstoned,
+   * and automatic scanning does not resume — silently continuing from an
+   * unproved point could leave stale old-fork evidence alive below the
+   * rewind target. A bounded manual recovery is a later operator action.
    */
   async validateCursor(): Promise<void> {
     const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
@@ -468,8 +515,24 @@ export class ChainWatcher {
       if (b.hash.toLowerCase() === known.toLowerCase()) { ancestor = n; break; }
     }
 
-    const verified = ancestor !== null;
-    const target = ancestor ?? Math.max(0, cursor.blockNumber - REORG_LOOKBACK);
+    if (ancestor === null) {
+      // Fail closed: no provable ancestor within the supported window.
+      this.recoveryRequired = true;
+      this.store.appendQuarantine({
+        kind: 'REORG_ANOMALY',
+        detail: {
+          cursorBlock: cursor.blockNumber, cursorHash: cursor.blockHash,
+          providerHash: head.hash, ancestorVerified: false,
+          recoveryRequired: true, lookback: REORG_LOOKBACK,
+          note: 'automatic recovery stopped; cursor NOT advanced to an '
+            + 'unverified hash; bounded manual recovery required',
+        },
+        firstSeenUtc: this.nowIso(),
+      });
+      return;
+    }
+
+    const target = ancestor;
     const targetBlock = await this.rpc<{ hash: string }>(
       this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber',
       ['0x' + target.toString(16), false],
@@ -479,8 +542,7 @@ export class ChainWatcher {
       detail: {
         cursorBlock: cursor.blockNumber, cursorHash: cursor.blockHash,
         providerHash: head.hash, ancestor: target,
-        ancestorVerified: verified,
-        ...(verified ? {} : { unverifiedBoundedRewind: true, lookback: REORG_LOOKBACK }),
+        ancestorVerified: true,
       },
       firstSeenUtc: this.nowIso(),
     });
@@ -498,10 +560,14 @@ export class ChainWatcher {
     this.blockCache.clear();
     this.seenRaw.clear();
     this.rawCommitted.clear();
+    // Re-seed tombstone dominance: REORG_REWIND tombstones must dominate any
+    // PENDING dispositions for the exact tombstoned identities.
+    for (const key of this.store.tombstoneIndex()) this.seenRemoved.add(key);
   }
 
   private async recoverFromReorg(): Promise<void> {
     await this.validateCursor();
+    if (this.recoveryRequired) return; // fail-closed: no automatic resume
     await this.replayIncompleteFromStore();
     const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
     if (!cursor) return;
@@ -529,12 +595,9 @@ export class ChainWatcher {
       this.rawCommitted.add(
         `${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}:${r.blockHash.toLowerCase()}`);
     }
-    for (const t of this.store.tombstones()) {
-      if (t.reason === 'REMOVED_FLAG') {
-        this.seenRemoved.add(
-          `${t.chainId}:${t.emitter}:${t.txHash}:${t.logIndex}:${t.blockHash.toLowerCase()}`);
-      }
-    }
+    // Tombstone dominance seeded from ALL tombstone reasons: a removed,
+    // rewound, or hash-conflicted identity must never be replayed.
+    for (const key of this.store.tombstoneIndex()) this.seenRemoved.add(key);
     for (const [key, d] of dispositions) {
       if (d !== 'PENDING') this.seenRaw.add(key);
     }
@@ -560,6 +623,18 @@ export class ChainWatcher {
     for (const r of raws) {
       const key = `${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}:${r.blockHash.toLowerCase()}`;
       const d = dispositions.get(key);
+      // Tombstone dominance at restart: a PENDING row whose exact identity
+      // was later removed/rewound/conflicted is terminalized, never replayed.
+      if (this.seenRemoved.has(key)) {
+        if (d === 'PENDING') {
+          this.store.appendDisposition({
+            chainId: r.chainId, emitter: r.emitter, txHash: r.txHash,
+            logIndex: r.logIndex, blockHash: r.blockHash,
+            disposition: 'REMOVED_INVALID', atUtc: this.nowIso(),
+          });
+        }
+        continue;
+      }
       const pending =
         d === 'PENDING' ||
         (d === undefined &&
@@ -591,6 +666,7 @@ export class ChainWatcher {
    *  Public for tests; production entry is the subscription-ack handler. */
   async backfillFromCursor(): Promise<void> {
     await this.validateCursor();
+    if (this.recoveryRequired) return; // fail-closed: no automatic resume
     await this.replayIncompleteFromStore();
     const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
     const latestHex = await this.rpc<string>(this.cfg.polygonHttpRpcUrl, 'eth_blockNumber', []);
@@ -610,6 +686,7 @@ export class ChainWatcher {
     this.verifier = setInterval(() => {
       void this.runExclusive(async () => {
         await this.validateCursor();
+        if (this.recoveryRequired) return; // fail-closed: no automatic resume
         await this.processRetries();
         const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
         if (!cursor) return;
@@ -639,6 +716,18 @@ export class ChainWatcher {
       }
       // Transient failures are PENDING (durable) + queued in memory; both
       // paths recover them. Cursor advancement strands nothing.
+      // Dense rolling checkpoints: spacing < REORG_LOOKBACK guarantees a
+      // genuinely stored hash inside any ancestor-walk window, so a routine
+      // shallow reorg can always be PROVED (never silently unverified).
+      for (let n = start; n < end; n += CHECKPOINT_SPACING) {
+        const cp = await this.rpc<{ hash: string }>(
+          this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber', ['0x' + n.toString(16), false],
+        );
+        this.store.appendBlockHash({
+          chainId: this.cfg.chainId, blockNumber: n, blockHash: cp.hash,
+          firstSeenUtc: this.nowIso(),
+        });
+      }
       const head = await this.rpc<{ hash: string }>(
         this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber', ['0x' + end.toString(16), false],
       );
