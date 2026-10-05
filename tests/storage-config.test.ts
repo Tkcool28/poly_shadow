@@ -69,6 +69,15 @@ describe('fail-closed credential guard', () => {
       expect(() => assertNoCredentials(env)).toThrow(CredentialGuardError);
     }
   });
+  it('presence is enough: set-but-empty banned vars still refuse startup', () => {
+    for (const env of [
+      { PRIVATE_KEY: '' },
+      { CLOB_API_SECRET: '' },
+      { ARB_PRIVATE_KEY: '' },
+    ]) {
+      expect(() => assertNoCredentials(env)).toThrow(CredentialGuardError);
+    }
+  });
   it('loadConfig requires watched wallets and defaults chain 137', () => {
     expect(() => loadConfig({})).toThrow(/SHADOW_WATCHED_WALLETS/);
     const cfg = loadConfig({ SHADOW_WATCHED_WALLETS: '0xD38B71F3E8ED1AF71983E5C309EAC3DFA9B35029' });
