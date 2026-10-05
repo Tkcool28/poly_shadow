@@ -37,12 +37,12 @@ discovery — not to make its output artificially identical to Poly2.
 
 ## Scope honesty
 
-**Phase 2 is a chain-observer foundation, not the finished multi-source
-system.** The current entrypoint runs only the Polygon V2 watcher. The
-intended final architecture — fast REST trade discovery, validated WebSocket
-trade observation, independent source racing with first-seen timestamps — is
-Phase 3. This PR must not be presented as a finished head-to-head
-alternative to Poly2.
+**Phase 2 (chain-observer foundation) is complete and merged** (PR #2, merge
+commit `aa223757e9b477f23adc72f19e6bdf0e696f6f06`). **Phase 3 adds the
+multi-source layer** — REST /trades and /activity observers plus source
+racing — on top of that foundation. The full head-to-head comparison against
+Poly2 remains Phase 4 (offline, exported records). Neither phase should be
+presented as proof of superior discovery before Phase 4 evidence exists.
 
 ## Correctness/safety findings (implemented and test-covered)
 
