@@ -30,15 +30,25 @@ and rebuild freely.
 - **Live source health** — CHAIN raw events, REST polls/errors, CDN age
   P50, quarantine count, `recoveryRequired` flag, latest observation
   (rendered "artifact-only" when no data dir is supplied).
-- **Wallets** — per-wallet matched/only counts and median raw/usable deltas.
-- **Trade comparison** — every comparison record with match-class pill,
-  raw/usable deltas (Δ = Poly2 − Shadow; positive = Shadow earlier),
-  decision-relevance class; filters for wallet, match class, winner,
-  decision class.
-- **Coverage** — per-system coverage of the union (ambiguous excluded).
+- **Wallets** — per-wallet matched/only counts, median raw/usable deltas,
+  and latest observed activity (either system).
+- **Trade comparison** — every comparison record, auditable per trade:
+  time, wallet, market/token, side, size, Shadow source(s), Shadow raw and
+  usable times, Poly2 raw and usable times, raw/usable deltas
+  (Δ = Poly2 − Shadow; positive = Shadow earlier), match-class pill,
+  decision-relevance class, actionable marker. Filters: wallet, match
+  class, winner, Shadow source, maker/taker role, BUY/SELL,
+  actionable/not, decision class. Horizontally scrollable on phone.
+- **Coverage** — per-system coverage of the union
+  (`(matched + own-only) / (matched + both-only)`, ambiguous excluded, per
+  contract §7) plus export rows excluded from primary metrics
+  (non-cohort / out-of-window, per contract §8).
 - **Latency** — raw and usable P50/P90/P95 over matched events.
+- **Population** — Shadow source usage, maker/taker (chain roles),
+  BUY/SELL, standard vs negRisk emitter, market breakdown where metadata
+  exists.
 - **Policy impact** — stale-rejections, how many Shadow saw inside the 300s
-  budget, decision-relevance breakdown.
+  budget, rejection-reason and decision-relevance breakdowns.
 
 ## Reading rules
 

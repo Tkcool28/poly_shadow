@@ -52,6 +52,11 @@ removal plan.
   300 s freshness budget modeled.
 - Gate: 14 handoff items; items requiring a real Poly2 export + frozen 24 h
   window are pending until that export exists.
+- Review correction pass (six blockers): symmetric cohort + window
+  enforcement on Poly2 rows (fail-closed, exclusions reported), frozen
+  coverage-of-union formula, emitter/market population metrics, full
+  trade-level dashboard fields + filters, test-count/doc reconciliation
+  (suite is 84 + 18 = **102 tests**).
 
 ## Later possibilities (NOT approved)
 

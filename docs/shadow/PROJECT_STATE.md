@@ -96,7 +96,7 @@
   proved ancestor.
 - The Phase 4 comparison machinery (cohorts, matching classes, raw/usable
   timing, decision relevance, dashboard) is implemented and fixture-tested
-  (77/77 tests, tsc clean, static safety gate OK).
+  (102/102 tests, tsc clean, static safety gate OK).
 
 **Not proven:**
 - Whether Shadow discovers real wallet activity faster or more completely
@@ -136,11 +136,13 @@ Grouping is a hypothesis, never a storage primary key.
 
 ## Test state
 
-At Phase 3 merge (main `f22f3acf…`): full suite green, `tsc --noEmit` clean,
-static safety gate OK. Phase 4 adds `tests/phase4-compare.test.ts`
-(13 tests: matching classes, raw-vs-usable deltas, cohort isolation,
-decision relevance, window filtering). Phase 2 tests unchanged except the
-documented `ShadowConfig`/`ChainWatcher` interface extensions.
+At Phase 3 merge (main `f22f3acf…`): **84 tests** green, `tsc --noEmit`
+clean, static safety gate OK. Phase 4 adds `tests/phase4-compare.test.ts`
+(18 tests: matching classes, raw-vs-usable deltas, symmetric cohort/window
+enforcement, coverage-of-union formula, decision relevance, emitter/market
+population) → **102 tests** total on the Phase 4 branch. Phase 2 tests
+unchanged except the documented `ShadowConfig`/`ChainWatcher` interface
+extensions.
 
 ## Known limitations (Phase 3 honesty)
 
@@ -152,8 +154,9 @@ documented `ShadowConfig`/`ChainWatcher` interface extensions.
 - Reconciliation group keys are heuristic candidates, not proof of identity.
 - WebSocket trade source: investigated, **rejected** — see WS_FEASIBILITY.md.
 - This sandbox cannot reach `*.polymarket.com` (egress-filtered): REST
-  sources are fixture-tested here; the live multi-source run must be
-  (re)executed in an environment with normal egress (one command in README).
+  sources are fixture-tested here. The live multi-source acceptance run was
+  executed on a normal-egress VPS during Phase 3 (bounded window, zero
+  quarantine/transient failures) and passed — see MILESTONES.md Phase 3.
 
 ## Watched-wallet testing assumptions
 

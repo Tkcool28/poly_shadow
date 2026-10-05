@@ -2,17 +2,23 @@
  * Phase 4 comparison engine — deterministic, offline, read-only.
  *
  * Implements docs/shadow/PHASE4_COMPARISON_CONTRACT.md exactly:
- * - cohort separation (CONTROLLED_OVERLAP primary; SHADOW_EXPLORATORY never
- *   in primary denominators);
+ * - cohort separation enforced SYMMETRICALLY (CONTROLLED_OVERLAP primary on
+ *   both Shadow observations and Poly2 export rows; SHADOW_EXPLORATORY and
+ *   any non-cohort row never enters a primary denominator);
+ * - frozen window enforced SYMMETRICALLY (export window must equal the
+ *   frozen cohorts window — fail-closed — and out-of-window Poly2 rows are
+ *   excluded from primary metrics and reported separately);
  * - event-level matching (Poly2 row ↔ Shadow economic group);
  * - raw discovery = earliest per-source arrival (never the racer FIRST row);
  * - usable discovery per the contract definition;
+ * - coverage-of-union per the contract's frozen formula;
  * - policy impact + decision-relevance classification.
  *
  * Neither system's native identity is ever mutated. Ambiguity stays visible.
  */
 
 import type { SourceObservationRow } from '../shadow/racing.js';
+import { EXCHANGE_V2_STANDARD, EXCHANGE_V2_NEG_RISK } from '../shadow/v2constants.js';
 
 // ─── Poly2 export contract (§3) ───
 
@@ -49,6 +55,9 @@ export function validatePoly2Export(data: unknown): Poly2Export {
   if (!d || typeof d !== 'object' || !Array.isArray(d.rows)) {
     throw new Error('poly2 export: missing rows array');
   }
+  if (!d.window || Number.isNaN(Date.parse(d.window.startUtc)) || Number.isNaN(Date.parse(d.window.endUtc))) {
+    throw new Error('poly2 export: window.startUtc/endUtc missing/invalid');
+  }
   d.rows.forEach((r, i) => {
     if (typeof r.wallet !== 'string' || !r.wallet.startsWith('0x')) {
       throw new Error(`poly2 export row ${i}: wallet missing/invalid`);
@@ -58,6 +67,24 @@ export function validatePoly2Export(data: unknown): Poly2Export {
     }
   });
   return d;
+}
+
+/**
+ * Fail-closed window check (contract §8): the sealed Poly2 export MUST cover
+ * exactly the frozen comparison window. A mismatch is a contract error, not
+ * a warning — comparing over different windows is not the same experiment.
+ */
+export function assertExportWindowMatches(
+  exportData: Poly2Export,
+  window: { startUtc: string; endUtc: string },
+): void {
+  if (Date.parse(exportData.window.startUtc) !== Date.parse(window.startUtc)
+    || Date.parse(exportData.window.endUtc) !== Date.parse(window.endUtc)) {
+    throw new Error(
+      `poly2 export window ${exportData.window.startUtc}→${exportData.window.endUtc} `
+      + `does not equal frozen comparison window ${window.startUtc}→${window.endUtc}`,
+    );
+  }
 }
 
 // ─── Shadow event groups ───
@@ -77,15 +104,28 @@ export interface ShadowGroup {
   sourceTs: number | null;
   roles: Set<string>;
   sources: Set<string>;
+  /** Emitter classes observed among CHAIN members: standard / negRisk / unknown. */
+  emitters: Set<string>;
 }
+
+export type CohortFn = (w: string) => 'CONTROLLED_OVERLAP' | 'SHADOW_EXPLORATORY' | null;
 
 function usable(o: SourceObservationRow): boolean {
   return !!(o.wallet && o.side && o.asset && o.size && o.price && o.hydration === 'FULL');
 }
 
+/** Emitter class of a CHAIN observation (identity = chainId:emitter:tx:logIndex:blockHash). */
+function emitterClass(o: SourceObservationRow): 'standard' | 'negRisk' | 'unknown' | null {
+  if (o.source !== 'CHAIN') return null;
+  const emitter = o.identity.split(':')[1]?.toLowerCase();
+  if (emitter === EXCHANGE_V2_STANDARD.toLowerCase()) return 'standard';
+  if (emitter === EXCHANGE_V2_NEG_RISK.toLowerCase()) return 'negRisk';
+  return 'unknown';
+}
+
 export function buildShadowGroups(
   obs: SourceObservationRow[],
-  walletCohort: (w: string) => 'CONTROLLED_OVERLAP' | 'SHADOW_EXPLORATORY' | null,
+  walletCohort: CohortFn,
   window: { startUtc: string; endUtc: string },
 ): Map<string, ShadowGroup> {
   const groups = new Map<string, ShadowGroup>();
@@ -101,13 +141,15 @@ export function buildShadowGroups(
         rawUtc: o.sourceFirstSeenUtc, usableUtc: null,
         tx: key.startsWith('econ:') ? key.split(':')[1] ?? null : null,
         asset: o.asset, size6: o.size, side: o.side,
-        sourceTs: o.sourceTs, roles: new Set(), sources: new Set(),
+        sourceTs: o.sourceTs, roles: new Set(), sources: new Set(), emitters: new Set(),
       };
       groups.set(key, g);
     }
     g.members.push(o);
     g.roles.add(o.role);
     g.sources.add(o.source);
+    const em = emitterClass(o);
+    if (em) g.emitters.add(em);
     if (o.sourceFirstSeenUtc < g.rawUtc) g.rawUtc = o.sourceFirstSeenUtc;
     if (usable(o) && (g.usableUtc === null || o.completedUtc < g.usableUtc)) {
       g.usableUtc = o.completedUtc;
@@ -128,7 +170,7 @@ const sideOk = (a: string | null, b: string | null): boolean => !a || !b || a ==
 const sideConflict = (a: string | null, b: string | null): boolean => !!a && !!b && a !== b;
 
 export interface MatchRecord {
-  poly2Index: number | null;   // null for SHADOW_ONLY
+  poly2Index: number | null;   // index into the INCLUDED rows array; null for SHADOW_ONLY
   groupKey: string | null;     // null for POLY2_ONLY
   match: MatchClass;
   note: string | null;
@@ -222,13 +264,32 @@ export interface ComparisonResult {
   cohort: 'CONTROLLED_OVERLAP';
   records: Array<MatchRecord & {
     wallet: string | null;
+    /** Display time: Shadow raw arrival when known, else Poly2 ingest. */
+    timeUtc: string | null;
+    market: string | null;
+    asset: string | null;
+    side: 'BUY' | 'SELL' | null;
+    size: string | null;
+    shadowSources: string[];
+    shadowRoles: string[];
+    shadowRawUtc: string | null;
+    shadowUsableUtc: string | null;
+    poly2RawUtc: string | null;
+    poly2UsableUtc: string | null;
     rawDeltaSec: number | null;
     usableDeltaSec: number | null;
     decision: DecisionClass | null;
+    actionable: boolean;
   }>;
   coverage: {
     matched: number; shadowOnly: number; poly2Only: number; ambiguous: number;
-    shadowCoveragePct: number | null; poly2CoveragePct: number | null;
+    /**
+     * Coverage of the non-ambiguous event union U = matched + shadowOnly +
+     * poly2Only (contract §7, frozen): Shadow = (matched + shadowOnly) / U,
+     * Poly2 = (matched + poly2Only) / U. AMBIGUOUS stays visible but is
+     * excluded from U because it cannot be attributed to either system.
+     */
+    shadowUnionCoveragePct: number | null; poly2UnionCoveragePct: number | null;
   };
   raw: ReturnType<typeof latencyStats>;
   usable: ReturnType<typeof latencyStats>;
@@ -242,6 +303,16 @@ export interface ComparisonResult {
     shadowSources: Record<string, number>;
     chainRoles: Record<string, number>;
     buySell: Record<string, number>;
+    /** standard vs negRisk emitter split across groups with CHAIN evidence. */
+    emitters: Record<string, number>;
+    /** market breakdown where metadata exists (REST hydration or export). */
+    markets: Record<string, number>;
+  };
+  /** Rows sealed out of primary metrics (fail-closed, reported separately). */
+  excluded: {
+    nonCohortPoly2Rows: number;
+    outOfWindowPoly2Rows: number;
+    byWallet: Record<string, number>;
   };
 }
 
@@ -251,8 +322,30 @@ export function compare(
   exportData: Poly2Export,
   groups: Map<string, ShadowGroup>,
   window: { startUtc: string; endUtc: string },
+  walletCohort: CohortFn,
+  marketByGroupKey?: Map<string, string>,
 ): ComparisonResult {
-  const records = matchEvents(exportData.rows, groups);
+  assertExportWindowMatches(exportData, window);
+
+  // Symmetric cohort + window enforcement on the Poly2 side (contract §2/§8).
+  const included: Poly2ExportRow[] = [];
+  const excluded = { nonCohortPoly2Rows: 0, outOfWindowPoly2Rows: 0, byWallet: {} as Record<string, number> };
+  for (const r of exportData.rows) {
+    const w = r.wallet.toLowerCase();
+    if (walletCohort(r.wallet) !== 'CONTROLLED_OVERLAP') {
+      excluded.nonCohortPoly2Rows++;
+      excluded.byWallet[w] = (excluded.byWallet[w] ?? 0) + 1;
+      continue;
+    }
+    if (r.ingestedUtc < window.startUtc || r.ingestedUtc > window.endUtc) {
+      excluded.outOfWindowPoly2Rows++;
+      excluded.byWallet[w] = (excluded.byWallet[w] ?? 0) + 1;
+      continue;
+    }
+    included.push(r);
+  }
+
+  const records = matchEvents(included, groups);
   const enriched: ComparisonResult['records'] = [];
   const rawDeltas: number[] = [];
   const usableDeltas: number[] = [];
@@ -265,7 +358,7 @@ export function compare(
   const isMatched = (m: MatchClass) => m === 'MATCHED_HIGH_CONFIDENCE' || m === 'MATCHED_PROBABLE';
 
   for (const rec of records) {
-    const row = rec.poly2Index !== null ? exportData.rows[rec.poly2Index]! : null;
+    const row = rec.poly2Index !== null ? included[rec.poly2Index]! : null;
     const g = rec.groupKey && !rec.groupKey.includes('|') ? groups.get(rec.groupKey) ?? null : null;
     let rawDelta: number | null = null;
     let usableDelta: number | null = null;
@@ -299,10 +392,23 @@ export function compare(
       policy.rejectionReasons[row.rejectionReason] = (policy.rejectionReasons[row.rejectionReason] ?? 0) + 1;
     }
 
+    const poly2Usable = row ? (row.normalizedUtc ?? row.decisionUtc) : null;
     enriched.push({
       ...rec,
       wallet: row?.wallet ?? g?.wallet ?? null,
+      timeUtc: g?.rawUtc ?? row?.ingestedUtc ?? null,
+      market: (g && marketByGroupKey?.get(g.groupKey)) ?? row?.conditionId ?? null,
+      asset: g?.asset ?? row?.asset ?? null,
+      side: g?.side ?? row?.side ?? null,
+      size: g?.size6 ?? (row?.size != null ? String(row.size) : null),
+      shadowSources: g ? [...g.sources].sort() : [],
+      shadowRoles: g ? [...g.roles].sort() : [],
+      shadowRawUtc: g?.rawUtc ?? null,
+      shadowUsableUtc: g?.usableUtc ?? null,
+      poly2RawUtc: row?.ingestedUtc ?? null,
+      poly2UsableUtc: poly2Usable ?? null,
       rawDeltaSec: rawDelta, usableDeltaSec: usableDelta, decision: dec,
+      actionable: dec === 'EARLIER_AND_USABLE',
     });
   }
 
@@ -310,24 +416,32 @@ export function compare(
   const shadowOnly = records.filter((r) => r.match === 'SHADOW_ONLY').length;
   const poly2Only = records.filter((r) => r.match === 'POLY2_ONLY').length;
   const ambiguous = records.filter((r) => r.match === 'AMBIGUOUS').length;
+  const union = matched + shadowOnly + poly2Only; // AMBIGUOUS visible, never in U
 
-  const population = { shadowSources: {} as Record<string, number>, chainRoles: {} as Record<string, number>, buySell: {} as Record<string, number> };
+  const population = {
+    shadowSources: {} as Record<string, number>, chainRoles: {} as Record<string, number>,
+    buySell: {} as Record<string, number>, emitters: {} as Record<string, number>,
+    markets: {} as Record<string, number>,
+  };
   for (const g of groups.values()) {
     for (const s of g.sources) population.shadowSources[s] = (population.shadowSources[s] ?? 0) + 1;
     for (const r of g.roles) population.chainRoles[r] = (population.chainRoles[r] ?? 0) + 1;
+    for (const e of g.emitters) population.emitters[e] = (population.emitters[e] ?? 0) + 1;
     const bs = g.side ?? 'unknown';
     population.buySell[bs] = (population.buySell[bs] ?? 0) + 1;
+    const m = marketByGroupKey?.get(g.groupKey);
+    if (m) population.markets[m] = (population.markets[m] ?? 0) + 1;
   }
 
   return {
     window, cohort: 'CONTROLLED_OVERLAP', records: enriched,
     coverage: {
       matched, shadowOnly, poly2Only, ambiguous,
-      shadowCoveragePct: matched + shadowOnly > 0 ? matched / (matched + shadowOnly) : null,
-      poly2CoveragePct: matched + poly2Only > 0 ? matched / (matched + poly2Only) : null,
+      shadowUnionCoveragePct: union > 0 ? (matched + shadowOnly) / union : null,
+      poly2UnionCoveragePct: union > 0 ? (matched + poly2Only) / union : null,
     },
     raw: latencyStats(rawDeltas),
     usable: latencyStats(usableDeltas),
-    policy, decisionRelevance: decision, population,
+    policy, decisionRelevance: decision, population, excluded,
   };
 }

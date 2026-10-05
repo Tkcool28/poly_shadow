@@ -10,6 +10,7 @@ import {
 } from '../src/compare/phase4.js';
 import type { Poly2Export, Poly2ExportRow } from '../src/compare/phase4.js';
 import type { SourceObservationRow } from '../src/shadow/racing.js';
+import { EXCHANGE_V2_STANDARD, EXCHANGE_V2_NEG_RISK } from '../src/shadow/v2constants.js';
 
 const W1 = '0x' + 'aa'.repeat(20); // controlled
 const W2 = '0x' + 'bb'.repeat(20); // exploratory — must be excluded
@@ -58,7 +59,7 @@ describe('phase 4 comparison', () => {
     const g = buildShadowGroups([obs({})], cohortOf, WINDOW);
     const recs = matchEvents([row({})], g);
     expect(recs[0]!.match).toBe('MATCHED_HIGH_CONFIDENCE');
-    const res = compare(exportOf([row({})]), g, WINDOW);
+    const res = compare(exportOf([row({})]), g, WINDOW, cohortOf);
     expect(res.records[0]!.rawDeltaSec).toBe(10);          // Shadow 10s earlier
     expect(res.records[0]!.usableDeltaSec).toBe(14);       // usable: 15s vs 1s
     expect(res.records[0]!.decision).toBe('EARLIER_AND_USABLE');
@@ -72,7 +73,7 @@ describe('phase 4 comparison', () => {
       obs({ source: 'CHAIN', sourceFirstSeenUtc: '2026-01-01T10:00:00.000Z', identity: 'c', role: 'TAKER_AGGREGATE' }),
       obs({ sourceFirstSeenUtc: '2026-01-01T09:59:50.000Z', identity: 'r' }),
     ], cohortOf, WINDOW);
-    const res = compare(exportOf([row({})]), g, WINDOW);
+    const res = compare(exportOf([row({})]), g, WINDOW, cohortOf);
     expect(res.records[0]!.rawDeltaSec).toBe(20); // 10:00:10 − 09:59:50
   });
 
@@ -96,17 +97,76 @@ describe('phase 4 comparison', () => {
     expect(recs[0]!.note).toContain('side conflict');
   });
 
-  it('SHADOW_ONLY and POLY2_ONLY stay visible; coverage math', () => {
+  it('SHADOW_ONLY and POLY2_ONLY stay visible; coverage-of-union math (§7 frozen formula)', () => {
     const g = buildShadowGroups([
       obs({}), // matches row 1
       obs({ identity: 'solo', groupKey: 'econ:' + TX3 + ':' + ASSET + ':50.000000', size: '50.000000' }), // shadow-only
     ], cohortOf, WINDOW);
     const rows = [row({}), row({ txHash: '0x' + '99'.repeat(32), size: 777, ingestedUtc: '2026-01-01T11:00:00.000Z' })];
-    const res = compare(exportOf(rows), g, WINDOW);
+    const res = compare(exportOf(rows), g, WINDOW, cohortOf);
     expect(res.coverage.matched).toBe(1);
     expect(res.coverage.shadowOnly).toBe(1);
     expect(res.coverage.poly2Only).toBe(1);
-    expect(res.coverage.shadowCoveragePct).toBeCloseTo(0.5);
+    // U = 1+1+1 = 3; Shadow observed 2/3, Poly2 observed 2/3.
+    expect(res.coverage.shadowUnionCoveragePct).toBeCloseTo(2 / 3);
+    expect(res.coverage.poly2UnionCoveragePct).toBeCloseTo(2 / 3);
+  });
+
+  it('coverage of union, asymmetric: 1 matched / 9 Shadow-only / 0 Poly2-only', () => {
+    const members = [obs({})];
+    for (let i = 0; i < 9; i++) {
+      members.push(obs({ identity: 'solo' + i, groupKey: `econ:0xsolo${i}:${ASSET}:${50 + i}.000000`, size: `${50 + i}.000000` }));
+    }
+    const g = buildShadowGroups(members, cohortOf, WINDOW);
+    const res = compare(exportOf([row({})]), g, WINDOW, cohortOf);
+    expect(res.coverage).toMatchObject({ matched: 1, shadowOnly: 9, poly2Only: 0 });
+    expect(res.coverage.shadowUnionCoveragePct).toBeCloseTo(1.0);   // (1+9)/10
+    expect(res.coverage.poly2UnionCoveragePct).toBeCloseTo(0.1);     // (1+0)/10
+  });
+
+  it('symmetric cohort enforcement: exploratory/non-cohort Poly2 rows never enter primary metrics', () => {
+    const g = buildShadowGroups([obs({})], cohortOf, WINDOW);
+    const rows = [
+      row({}),
+      row({ wallet: W2, txHash: '0x' + '98'.repeat(32), size: 555, ingestedUtc: '2026-01-01T12:00:00.000Z' }), // exploratory
+      row({ wallet: '0x' + 'cc'.repeat(20), txHash: '0x' + '97'.repeat(32), size: 444, ingestedUtc: '2026-01-01T12:30:00.000Z' }), // unknown wallet
+    ];
+    const res = compare(exportOf(rows), g, WINDOW, cohortOf);
+    expect(res.coverage.matched).toBe(1);
+    expect(res.coverage.poly2Only).toBe(0); // NOT inflated by non-cohort rows
+    expect(res.excluded.nonCohortPoly2Rows).toBe(2);
+    expect(res.excluded.byWallet[W2]).toBe(1);
+  });
+
+  it('symmetric window enforcement: out-of-window Poly2 rows excluded and reported', () => {
+    const g = buildShadowGroups([obs({})], cohortOf, WINDOW);
+    const rows = [
+      row({}),
+      row({ txHash: '0x' + '96'.repeat(32), size: 333, ingestedUtc: '2026-01-03T00:00:00.000Z' }), // after window
+    ];
+    const res = compare(exportOf(rows), g, WINDOW, cohortOf);
+    expect(res.coverage.poly2Only).toBe(0);
+    expect(res.excluded.outOfWindowPoly2Rows).toBe(1);
+  });
+
+  it('fail-closed: export window must equal the frozen comparison window', () => {
+    const g = buildShadowGroups([obs({})], cohortOf, WINDOW);
+    const bad = { window: { startUtc: WINDOW.startUtc, endUtc: '2026-01-03T00:00:00.000Z' }, rows: [row({})] };
+    expect(() => compare(validatePoly2Export(bad), g, WINDOW, cohortOf)).toThrow(/does not equal/);
+    expect(() => validatePoly2Export({ rows: [] })).toThrow(/window/); // window mandatory
+  });
+
+  it('population: standard vs negRisk emitter split from CHAIN evidence', () => {
+    const g = buildShadowGroups([
+      obs({ source: 'CHAIN', identity: `137:${EXCHANGE_V2_STANDARD}:${TX1}:7:0xblock`, role: 'TAKER_AGGREGATE' }),
+      obs({ source: 'CHAIN', identity: `137:${EXCHANGE_V2_NEG_RISK}:${TX2}:3:0xblock`, role: 'MAKER_LEG',
+            groupKey: 'econ:' + TX2 + ':' + ASSET + ':100.000000' }),
+    ], cohortOf, WINDOW);
+    const res = compare(exportOf([row({})]), g, WINDOW, cohortOf);
+    expect(res.population.emitters).toEqual({ standard: 1, negRisk: 1 });
+    expect(res.records[0]!.shadowRawUtc).toBe('2026-01-01T10:00:00.000Z');
+    expect(res.records[0]!.poly2RawUtc).toBe('2026-01-01T10:00:10.000Z');
+    expect(res.records[0]!.actionable).toBe(true);
   });
 
   it('cohort separation: exploratory wallets never enter the primary comparison', () => {
@@ -119,7 +179,7 @@ describe('phase 4 comparison', () => {
   it('usable timing: PARTIAL hydration group is not usable → EARLIER_BUT_NOT_HYDRATED', () => {
     const g = buildShadowGroups([obs({ hydration: 'PARTIAL' })], cohortOf, WINDOW);
     expect([...g.values()][0]!.usableUtc).toBeNull();
-    const res = compare(exportOf([row({})]), g, WINDOW);
+    const res = compare(exportOf([row({})]), g, WINDOW, cohortOf);
     expect(res.records[0]!.decision).toBe('EARLIER_BUT_NOT_HYDRATED');
     expect(res.usable.n).toBe(0);
   });
@@ -130,14 +190,14 @@ describe('phase 4 comparison', () => {
       sourceTs: Math.floor(Date.parse('2026-01-01T10:00:00.000Z') / 1000) - 400,
     });
     const g = buildShadowGroups([obs({ sourceTs: stale.sourceTs })], cohortOf, WINDOW);
-    const res = compare(exportOf([stale]), g, WINDOW);
+    const res = compare(exportOf([stale]), g, WINDOW, cohortOf);
     // Shadow arrived ~400s after source ts → NOT within budget here:
     expect(res.policy.staleRejected).toBe(1);
     expect(res.records[0]!.decision).toBe('EARLIER_BUT_POLICY_INELIGIBLE');
     // Now Shadow arrives 60s after sourceTs → within budget:
     const g2 = buildShadowGroups([obs({ sourceTs: stale.sourceTs,
       sourceFirstSeenUtc: new Date((stale.sourceTs! + 60) * 1000).toISOString() })], cohortOf, WINDOW);
-    const res2 = compare(exportOf([stale]), g2, WINDOW);
+    const res2 = compare(exportOf([stale]), g2, WINDOW, cohortOf);
     expect(res2.policy.staleRejectedShadowSawWithin300s).toBe(1);
   });
 
@@ -146,7 +206,7 @@ describe('phase 4 comparison', () => {
       sourceFirstSeenUtc: '2026-01-01T10:00:00.000Z',
       completedUtc: '2026-01-01T10:00:30.000Z', // usable AFTER poly2's 15s
     })], cohortOf, WINDOW);
-    const res = compare(exportOf([row({})]), g, WINDOW);
+    const res = compare(exportOf([row({})]), g, WINDOW, cohortOf);
     expect(res.records[0]!.decision).toBe('EARLIER_BUT_TOO_LATE');
   });
 
@@ -154,7 +214,7 @@ describe('phase 4 comparison', () => {
     const g = buildShadowGroups([obs({
       source: 'CHAIN', role: 'MAKER_LEG', identity: 'm',
     })], cohortOf, WINDOW);
-    const res = compare(exportOf([row({})]), g, WINDOW);
+    const res = compare(exportOf([row({})]), g, WINDOW, cohortOf);
     expect(res.records[0]!.decision).toBe('EARLIER_MAKER_ONLY');
   });
 
@@ -165,7 +225,7 @@ describe('phase 4 comparison', () => {
 
   it('one group claimed by two Poly2 rows → AMBIGUOUS', () => {
     const g = buildShadowGroups([obs({})], cohortOf, WINDOW);
-    const res = compare(exportOf([row({}), row({ ingestedUtc: '2026-01-01T10:05:00.000Z' })]), g, WINDOW);
+    const res = compare(exportOf([row({}), row({ ingestedUtc: '2026-01-01T10:05:00.000Z' })]), g, WINDOW, cohortOf);
     expect(res.records.every((r) => r.match === 'AMBIGUOUS')).toBe(true);
   });
 });

@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { compare, validatePoly2Export } from './phase4.js';
 import { buildShadowGroups } from './phase4.js';
 import type { SourceObservationRow } from '../shadow/racing.js';
+import { tradeGroupKey } from '../shadow/racing.js';
 
 const [, , dataDir, exportPath, cohortsPath, outDir] = process.argv;
 if (!dataDir || !exportPath || !cohortsPath || !outDir) {
@@ -40,12 +41,33 @@ const obs: SourceObservationRow[] = existsSync(obsFile)
   : [];
 
 const exportData = validatePoly2Export(JSON.parse(readFileSync(exportPath, 'utf8')));
+
+// Market metadata (title / conditionId) survives only in the raw REST
+// payloads — rebuild a groupKey → market lookup from rest_raw when present.
+const marketByGroupKey = new Map<string, string>();
+const rawFile = join(dataDir, 'rest_raw.ndjson');
+if (existsSync(rawFile)) {
+  for (const line of readFileSync(rawFile, 'utf8').split('\n')) {
+    if (!line.trim()) continue;
+    const r = JSON.parse(line) as { payload?: Record<string, unknown> };
+    const p = r.payload ?? {};
+    const tx = String(p['transactionHash'] ?? '').toLowerCase();
+    const asset = p['asset'] != null && p['asset'] !== '' ? String(p['asset']) : null;
+    const size6 = typeof p['size'] === 'number' ? (p['size'] as number).toFixed(6) : null;
+    const market = (p['title'] ?? p['conditionId']) as string | undefined;
+    if (tx && asset && size6 && market && !marketByGroupKey.has(tradeGroupKey(tx, asset, size6))) {
+      marketByGroupKey.set(tradeGroupKey(tx, asset, size6), market);
+    }
+  }
+}
+
 const groups = buildShadowGroups(obs, cohortOf, cohorts.window);
-const result = compare(exportData, groups, cohorts.window);
+const result = compare(exportData, groups, cohorts.window, cohortOf, marketByGroupKey);
 
 mkdirSync(outDir, { recursive: true });
 writeFileSync(join(outDir, 'comparison.json'), JSON.stringify(result, null, 2));
 console.log(`[phase4] groups=${groups.size} poly2Rows=${exportData.rows.length}`);
+console.log(`[phase4] excluded:`, result.excluded);
 console.log(`[phase4] coverage:`, result.coverage);
 console.log(`[phase4] raw:`, result.raw);
 console.log(`[phase4] usable:`, result.usable);

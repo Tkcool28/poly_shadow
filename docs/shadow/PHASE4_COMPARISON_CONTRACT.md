@@ -20,7 +20,10 @@ measured, never "corrected".
   never in primary denominators.
 
 Cohort membership is declared in the run config (`cohorts.json`), frozen
-before the window starts, and embedded in every comparison artifact.
+before the window starts, and embedded in every comparison artifact. The
+filter is enforced **symmetrically**: Shadow observations AND Poly2 export
+rows outside CONTROLLED_OVERLAP are both sealed out of primary metrics
+(see §8).
 
 ## 3. Poly2 export contract (read-only, export→compare)
 
@@ -99,9 +102,15 @@ Match at the EVENT level: one Poly2 row ↔ one Shadow economic group
 
 ## 7. Metrics (handoff §10/§11)
 
-COVERAGE: matched / shadow-only / poly2-only / ambiguous counts; coverage%
-= matched / (matched + only) per system (ambiguous excluded from
-denominator, reported).
+COVERAGE: matched / shadow-only / poly2-only / ambiguous counts.
+**Coverage of union (frozen definition):** for the non-ambiguous event
+union `U = matched + shadowOnly + poly2Only`,
+- Shadow coverage of union = `(matched + shadowOnly) / U`
+- Poly2 coverage of union = `(matched + poly2Only) / U`
+
+AMBIGUOUS records stay visible but are excluded from `U` because they
+cannot be attributed to either system. No other coverage formula is
+reported under the name "coverage".
 
 RAW and USABLE: winner counts (shadowEarlier / poly2Earlier / tie),
 median/P50/P90/P95 of signed deltas over matched events.
@@ -132,6 +141,18 @@ exists.
 swaps; all raw evidence preserved; anything shorter than the declared
 window is labeled a **smoke run** and cannot support conclusions. First
 target: 24 h if operationally practical.
+
+**Fail-closed enforcement (symmetric, implemented in `compare()`):**
+- the sealed Poly2 export's `window` MUST exactly equal the frozen
+  comparison window — a mismatch is a contract error (comparison aborts);
+- Poly2 rows whose `ingestedUtc` falls outside the frozen window are
+  excluded from primary metrics and reported separately
+  (`excluded.outOfWindowPoly2Rows`);
+- Poly2 rows whose wallet is not in CONTROLLED_OVERLAP are excluded from
+  primary metrics and reported separately (`excluded.nonCohortPoly2Rows`,
+  per-wallet breakdown). Shadow observations are filtered the same way in
+  `buildShadowGroups()`. Neither side can contaminate the primary
+  denominators.
 
 ## 9. Anti-contamination rules
 

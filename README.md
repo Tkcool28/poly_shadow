@@ -60,7 +60,7 @@ WS trade source: investigated and rejected —
 
 ```bash
 npm ci --ignore-scripts
-npm test          # 63 tests: fixtures, watcher, exit-audit matrix, source racing
+npm test          # full suite (102 tests on the Phase 4 branch): fixtures, watcher, exit-audit matrix, source racing, comparison
 npm run build     # tsc --noEmit
 npm run safety    # static no-trading safety gate
 
