@@ -422,4 +422,37 @@ describe('exit-audit acceptance matrix', () => {
     expect(store.observations()[1]!.evidence.blockHash).toBe(BLOCK_B);
     expect(store.logStatus(id)).toBe('REINCLUDED');
   });
+
+  it('15. provider head lag: invalid-range eth_getLogs clamps to fresh head, scan completes', async () => {
+    const store = tempStore();
+    // Node serving eth_getLogs is BEHIND the head advertised earlier:
+    // toBlock beyond 150 -> range error; head re-fetch reports 150.
+    const blocks: Blocks = new Map();
+    for (let n = 100; n <= 150; n++) blocks.set(n, { hash: '0x' + n.toString(16).padStart(64, 'e'), timestamp: 1_791_143_000 + n });
+    const gapLog = fillLog(140, blocks.get(140)!.hash);
+    const rpc = async <T>(url: string, method: string, params: unknown[]): Promise<T> => {
+      if (method === 'eth_getLogs') {
+        const p = params[0] as { toBlock: string };
+        if (parseInt(p.toBlock, 16) > 150) throw new Error('invalid block range params');
+        return [gapLog] as T;
+      }
+      if (method === 'eth_getBlockByNumber') {
+        const n = parseInt(params[0] as string, 16);
+        const b = blocks.get(n);
+        if (!b) throw new Error(`no block ${n}`);
+        return { hash: b.hash, timestamp: '0x' + b.timestamp.toString(16) } as T;
+      }
+      if (method === 'eth_blockNumber') return '0x96' as T; // 150
+      throw new Error(`unexpected ${method}`);
+    };
+    const w = new ChainWatcher(cfg(store.dir), store, clock(),
+      rpc as typeof import('../src/shadow/egress.js').rpcCall);
+    // Caller believed the head was 190; the lagging node rejects the range.
+    await w.scanRange(100, 190);
+    // Scan completed to the CLAMPED head; the log at 140 was captured.
+    expect(store.observations()).toHaveLength(1);
+    expect(store.readCursor('https://rpc.test')!.blockNumber).toBe(150);
+    // No failure quarantine: head lag is handled, not an anomaly.
+    expect(store.quarantine().filter((q) => q.kind === 'TRANSIENT_FAILURE')).toHaveLength(0);
+  });
 });
