@@ -44,7 +44,16 @@ export interface TombstoneRow {
 export type LogStatus = 'CONFIRMED' | 'REMOVED' | 'REINCLUDED';
 
 export interface ObservationRow {
-  canonicalKey: string;
+  /**
+   * PRIMARY KEY — native blockchain event identity:
+   *   chainId:emitter:txHash:logIndex
+   * Shadow's storage and dedup identity is the chain event itself, not any
+   * downstream system's formula. Poly2 canonical equivalence lives ONLY in
+   * src/compare/poly2-adapter.ts and is computed offline at comparison time.
+   */
+  eventId: string;
+  /** Separately classified populations; MAKER_LEG is a first-class stored
+   *  population (an investigation target), not a diagnostic to discard. */
   role: 'TAKER_AGGREGATE' | 'MAKER_LEG';
   wallet: string;
   side: 'BUY' | 'SELL';

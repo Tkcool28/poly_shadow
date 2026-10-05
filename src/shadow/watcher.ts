@@ -13,7 +13,6 @@
 import WebSocket from 'ws';
 import { decodeV2Log, classifyFill, normalizeGross, crossCheckAggregate } from './decoder.js';
 import type { DecodedOrderFilled, DecodedOrdersMatched, RawLog } from './decoder.js';
-import { canonicalTradeId } from './canonical.js';
 import { V2_SUBSCRIBE_TOPICS, V2_EXCHANGES, TOPIC_ORDER_FILLED_V2 } from './v2constants.js';
 import { rpcCall } from './egress.js';
 import type { ShadowConfig } from './config.js';
@@ -150,7 +149,10 @@ export class ChainWatcher {
 
     const cls = classifyFill(decoded, this.cfg.watchedWallets);
     if (!cls) return;
-    if (cls.role === 'TAKER_LEG_REDUNDANT') return; // covered by the aggregate; raw row kept
+    // TAKER_LEG_REDUNDANT legs are covered by the same-tx aggregate; the raw
+    // evidence row above is kept. MAKER_LEG is stored as a first-class,
+    // separately classified population (an investigation target).
+    if (cls.role === 'TAKER_LEG_REDUNDANT') return;
 
     const block = await this.blockRef(blockNumber, log.blockHash);
     const norm = normalizeGross(decoded);
@@ -170,17 +172,12 @@ export class ChainWatcher {
       }
     }
 
-    const canonicalKey = canonicalTradeId({
-      transactionHash: log.transactionHash,
-      proxyWallet: cls.wallet,
-      asset: decoded.tokenId,
-      shares: norm.shares,
-      price10: norm.price10,
-      blockTimestamp: block.timestamp,
-    });
+    // Native chain event identity is the primary key. Poly2 equivalence is
+    // computed later, offline, by src/compare/poly2-adapter.ts — never here.
+    const eventId = `${this.cfg.chainId}:${decoded.emitter}:${log.transactionHash}:${logIndex}`;
 
     this.store.appendObservation({
-      canonicalKey,
+      eventId,
       role: cls.role,
       wallet: cls.wallet,
       side: decoded.side,
