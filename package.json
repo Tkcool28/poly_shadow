@@ -9,7 +9,9 @@
     "test": "vitest run",
     "start": "tsx src/shadow/main.ts",
     "safety": "node scripts/static-safety.mjs",
-    "metrics": "node scripts/multisource-metrics.mjs"
+    "metrics": "node scripts/multisource-metrics.mjs",
+    "compare": "tsx src/compare/cli.ts",
+    "dashboard": "tsx src/compare/dashboard.ts"
   },
   "license": "MIT",
   "dependencies": {
