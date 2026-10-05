@@ -4,7 +4,7 @@
 
 Poly-Shadow watches approved Polymarket wallets through public, read-only
 sources (Polygon V2 exchange events, Data API REST) and records what it sees,
-when it saw it, and the exact canonical identity of each observed trade —
+when it saw it, and the native chain identity of each observed event —
 so Poly2's discovery completeness and freshness can be measured against an
 independent observer.
 
@@ -27,6 +27,7 @@ Audit trail and phase plans live in `docs/shadow/`:
 - `UPSTREAM_PIN.md` — fork provenance and pin
 - `PHASE1_ASSESSMENT.md` — security/architecture audit (PR #1)
 - `PHASE2_REMOVAL_PLAN.md` — execution-capability excision plan and gate
+- `INDEPENDENCE.md` — architectural independence rules (Phase 2 review)
 
 ## Layout
 
@@ -36,12 +37,16 @@ src/shadow/
   decoder.ts      V2 OrderFilled/OrdersMatched decode, role classification,
                   gross normalization (BigInt only, no floats)
   decimal.ts      Exact 6-dp shares / 10-dp half-up gross price rendering
-  canonical.ts    Poly2 canonical identity formula (unchanged)
-  storage.ts      Append-only NDJSON evidence store with reorg tombstones
+  storage.ts      Append-only NDJSON evidence store, reorg tombstones,
+                  native event identity (chainId:emitter:txHash:logIndex)
   watcher.ts      Completeness-first WSS + eth_getLogs backfill watcher
   config.ts       Fail-closed config (refuses to start with any key material)
   egress.ts       Application-level egress allowlist (RPC + public data APIs only)
   main.ts         Entrypoint
+src/compare/
+  poly2-adapter.ts  Phase 4 ONLY: maps Shadow observations to candidate Poly2
+                    canonical keys; unmatched records stay visible. Never
+                    imported by the collector.
 tests/
   fixtures/v2_fills.json  Real production receipts (5 trades, 3 wallets,
                           both exchanges, BUY+SELL, rounding + fee cases,
