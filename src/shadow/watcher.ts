@@ -16,11 +16,16 @@
  *   different block after a reorg is new evidence, not a duplicate.
  * - seenRaw is only marked AFTER raw evidence + observation commit. A
  *   transient failure (RPC error, block-hash conflict) leaves the event
- *   retryable; failures are recorded in quarantine (visible, never silent)
- *   and replayed from a retry queue.
+ *   retryable; failures are recorded in quarantine (visible, never silent),
+ *   replayed from a retry queue, and — if the process dies first —
+ *   recovered at startup by replayIncompleteFromStore().
+ * - Concurrent WSS + backfill deliveries of the same identity are
+ *   serialized through an in-flight map: the commit path runs exactly once.
  * - Startup and periodic cursor validation: stored cursor/block hashes are
  *   checked against the provider; on mismatch we walk back to the common
  *   ancestor, tombstone everything above it, rewind the cursor, and rescan.
+ * - Observations record raw ARRIVAL time (discovery latency) separately
+ *   from completion time; arrival survives retries and restart replay.
  */
 
 import WebSocket from 'ws';
@@ -58,12 +63,16 @@ export class ChainWatcher {
   private matchedByHash = new Map<string, DecodedOrdersMatched>();
   /** chainId:emitter:txHash:logIndex:blockHash — set only after full commit */
   private seenRaw = new Set<string>();
-  /** chainId:emitter:txHash:logIndex — removal notices already tombstoned */
+  /** chainId:emitter:txHash:logIndex:blockHash — removal notices already tombstoned */
   private seenRemoved = new Set<string>();
+  /** blockHash-aware native identity -> in-flight processing promise.
+   *  Concurrent WSS + backfill deliveries of the same log await the same
+   *  work instead of double-committing. */
+  private inflight = new Map<string, Promise<void>>();
   /** raw evidence rows already committed (retry must not duplicate them) */
   private rawCommitted = new Set<string>();
-  /** logs awaiting replay after a transient failure */
-  private retryQueue: Array<RawLog & { blockHash: string }> = [];
+  /** logs awaiting replay after a transient failure (arrival time preserved) */
+  private retryQueue: Array<{ log: RawLog & { blockHash: string }; arrivedUtc: string }> = [];
   private reorgRecoveryInFlight = false;
 
   constructor(
@@ -150,18 +159,23 @@ export class ChainWatcher {
   /**
    * Handle one raw log from WSS or backfill.
    * Ordering contract: removals first, dedup (with blockHash) second,
-   * seenRaw marked only after full commit.
+   * in-flight serialization third, seenRaw marked only after full commit.
    */
-  async handleLog(log: RawLog & { blockHash: string }): Promise<void> {
-    const blockNumber = Number(log.blockNumber);
+  async handleLog(
+    log: RawLog & { blockHash: string },
+    preservedArrivalUtc?: string,
+  ): Promise<void> {
     const logIndex = Number(log.logIndex);
     const emitter = log.address.toLowerCase();
     const removedKey = `${this.cfg.chainId}:${emitter}:${log.transactionHash}:${logIndex}`;
 
     // 1) Removal notices bypass dedup entirely: they are always evidence.
+    //    Tombstone identity is block-aware: a distinct removal of the same
+    //    (tx, logIndex) under a different blockHash is its own evidence.
     if (log.removed === true) {
-      if (!this.seenRemoved.has(removedKey)) {
-        this.seenRemoved.add(removedKey);
+      const removalKey = `${removedKey}:${log.blockHash.toLowerCase()}`;
+      if (!this.seenRemoved.has(removalKey)) {
+        this.seenRemoved.add(removalKey);
         this.store.appendTombstone({
           chainId: this.cfg.chainId, emitter,
           txHash: log.transactionHash, logIndex, blockHash: log.blockHash,
@@ -175,6 +189,29 @@ export class ChainWatcher {
     const dedupKey = `${removedKey}:${log.blockHash.toLowerCase()}`;
     if (this.seenRaw.has(dedupKey)) return;
 
+    // 2b) Serialize concurrent deliveries of the same identity (WSS racing
+    // backfill): the second caller awaits the in-flight work; the commit
+    // path runs exactly once per identity.
+    const existing = this.inflight.get(dedupKey);
+    if (existing) return existing;
+    const work = this.processLog(log, dedupKey, preservedArrivalUtc)
+      .finally(() => { this.inflight.delete(dedupKey); });
+    this.inflight.set(dedupKey, work);
+    return work;
+  }
+
+  /** Commit path for one non-removed log. Only invoked via handleLog. */
+  private async processLog(
+    log: RawLog & { blockHash: string },
+    dedupKey: string,
+    preservedArrivalUtc?: string,
+  ): Promise<void> {
+    const blockNumber = Number(log.blockNumber);
+    const logIndex = Number(log.logIndex);
+    const emitter = log.address.toLowerCase();
+    // Discovery time of the RAW evidence — preserved across retries and
+    // replays so latency measurement is never misrepresented by rework.
+    const arrivedUtc = preservedArrivalUtc ?? this.nowIso();
     try {
       // 3) Raw evidence first (guarded so retries don't duplicate the row).
       if (!this.rawCommitted.has(dedupKey)) {
@@ -188,7 +225,7 @@ export class ChainWatcher {
           topic0: log.topics[0]?.toLowerCase() ?? '',
           topics: log.topics,
           data: log.data,
-          firstSeenUtc: this.nowIso(),
+          firstSeenUtc: arrivedUtc,
         });
         this.rawCommitted.add(dedupKey);
       }
@@ -253,6 +290,7 @@ export class ChainWatcher {
         feeUnits: norm.feeUnits,
         blockTimestamp: block.timestamp,
         source: 'CHAIN',
+        sourceFirstSeenUtc: arrivedUtc,
         firstSeenUtc: this.nowIso(),
         evidence: {
           chainId: this.cfg.chainId, emitter: decoded.emitter,
@@ -275,7 +313,7 @@ export class ChainWatcher {
       }
       // Transient: record visibly, queue for replay, leave retryable.
       this.recordFailure(`handleLog:${log.transactionHash}:${logIndex}`, err);
-      this.retryQueue.push(log);
+      this.retryQueue.push({ log, arrivedUtc });
     }
   }
 
@@ -284,8 +322,9 @@ export class ChainWatcher {
     if (this.retryQueue.length === 0) return;
     const pending = this.retryQueue;
     this.retryQueue = [];
-    for (const log of pending) {
-      await this.handleLog(log); // on repeated failure it re-queues itself
+    for (const item of pending) {
+      // on repeated failure it re-queues itself (arrival still preserved)
+      await this.handleLog(item.log, item.arrivedUtc);
     }
   }
 
@@ -355,6 +394,7 @@ export class ChainWatcher {
     this.seenRaw.clear();
     this.rawCommitted.clear();
     this.blockCache.clear();
+    this.inflight.clear();
   }
 
   private async recoverFromReorg(): Promise<void> {
@@ -370,9 +410,57 @@ export class ChainWatcher {
     }
   }
 
+  /**
+   * Durable startup replay: any committed raw log that has NO completed
+   * observation (a transient failure crashed/was stopped before the retry
+   * queue drained) is reprocessed from the persisted evidence. Terminal
+   * cases (malformed/AMBIGUOUS_FILL-quarantined, REMOVED) are skipped, as
+   * are identities currently in flight. Raw rows are never re-appended —
+   * rawCommitted is seeded from the store — and the original arrival time
+   * is preserved so discovery latency survives the replay.
+   */
+  async replayIncompleteFromStore(): Promise<number> {
+    const observed = new Set(
+      this.store.observations().map((o) =>
+        `${o.evidence.chainId}:${o.evidence.emitter}:${o.evidence.txHash}:` +
+        `${o.evidence.logIndex}:${o.evidence.blockHash.toLowerCase()}`),
+    );
+    const terminal = new Set(
+      this.store.quarantine()
+        .filter((q) => q.kind === 'AMBIGUOUS_FILL')
+        .map((q) => `${q.detail['txHash']}:${q.detail['logIndex']}`),
+    );
+    let replayed = 0;
+    for (const r of this.store.rawLogs()) {
+      const key = `${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}:${r.blockHash.toLowerCase()}`;
+      this.rawCommitted.add(key); // never duplicate the raw row
+      if (observed.has(key)) continue;
+      if (terminal.has(`${r.txHash}:${r.logIndex}`)) continue; // terminal malformed
+      const status = this.store.logStatus(r);
+      if (status === 'REMOVED') continue; // dead evidence, nothing to observe
+      if (this.seenRaw.has(key)) continue;
+      if (this.inflight.has(key)) continue; // currently committing — never await ourselves
+      replayed++;
+      await this.handleLog(
+        {
+          address: r.emitter,
+          topics: r.topics,
+          data: r.data,
+          transactionHash: r.txHash,
+          logIndex: r.logIndex,
+          blockNumber: r.blockNumber,
+          blockHash: r.blockHash,
+        },
+        r.firstSeenUtc, // original arrival — discovery latency survives replay
+      );
+    }
+    return replayed;
+  }
+
   /** Resume from durable cursor; then periodic verification backfill. */
   private async backfillFromCursor(): Promise<void> {
     await this.validateCursor();
+    await this.replayIncompleteFromStore();
     const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
     const latestHex = await this.rpc<string>(this.cfg.polygonHttpRpcUrl, 'eth_blockNumber', []);
     const latest = parseInt(latestHex, 16);
@@ -412,6 +500,10 @@ export class ChainWatcher {
       for (const log of logs) {
         await this.handleLog(log);
       }
+      // Transient failures are in the retry queue AND recoverable from the
+      // persisted raw rows at startup (replayIncompleteFromStore); terminal
+      // malformed events are quarantined. Cursor advancement is therefore
+      // safe — it never strands an unfinished observation.
       const head = await this.rpc<{ hash: string }>(
         this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber', ['0x' + end.toString(16), false],
       );

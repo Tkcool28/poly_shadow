@@ -63,6 +63,9 @@ export interface ObservationRow {
   feeUnits: string;
   blockTimestamp: number;
   source: 'CHAIN' | 'REST_TRADES' | 'REST_ACTIVITY';
+  /** When the raw evidence ARRIVED at this observer (discovery latency). */
+  sourceFirstSeenUtc: string;
+  /** When this observation row was completed (may be later, after retries). */
   firstSeenUtc: string;
   evidence: { chainId: number; emitter: string; txHash: string; logIndex: number; blockHash: string };
 }
