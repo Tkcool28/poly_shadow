@@ -206,7 +206,7 @@ describe('exit-audit acceptance matrix', () => {
     expect(store.observations()).toHaveLength(1);
   });
 
-  it('5. missing ancestor: fail-closed unverified bounded rewind, quarantined', async () => {
+  it('5. missing ancestor: fail-closed recovery-required, cursor NOT advanced, no resume', async () => {
     const store = tempStore();
     const blocks: Blocks = new Map([[1000, { hash: BLOCK_B, timestamp: 1_791_143_962 }]]);
     // No stored checkpoint hashes at all -> no proof of any ancestor.
@@ -216,11 +216,21 @@ describe('exit-audit acceptance matrix', () => {
     const w = new ChainWatcher(cfg(store.dir), store, clock(), mockRpc(blocks).rpc);
     await w.validateCursor();
 
+    // Truly fail-closed: cursor is NOT advanced to an unverified provider
+    // hash, nothing is tombstoned, and automatic recovery does not resume.
     const cursor = store.readCursor('https://rpc.test')!;
-    expect(cursor.blockNumber).toBe(1000 - 128); // bounded, not "proved"
+    expect(cursor.blockNumber).toBe(1000);
+    expect(cursor.blockHash).toBe(BLOCK_A);
+    expect(w.recoveryRequired).toBe(true);
     const q = store.quarantine().filter((x) => x.kind === 'REORG_ANOMALY');
-    expect(q.some((x) => x.detail['unverifiedBoundedRewind'] === true)).toBe(true);
+    expect(q.some((x) => x.detail['recoveryRequired'] === true)).toBe(true);
     expect(q.some((x) => x.detail['ancestorVerified'] === false)).toBe(true);
+    expect(store.tombstones()).toHaveLength(0);
+
+    // Automatic scan/backfill must not resume from the unverified point.
+    await w.backfillFromCursor();
+    expect(store.readCursor('https://rpc.test')!.blockNumber).toBe(1000);
+    expect(store.rawLogs()).toHaveLength(0);
   });
 
   it('6. reorg during delayed concurrent deliveries: no deadlock, no dup', async () => {
@@ -279,5 +289,134 @@ describe('exit-audit acceptance matrix', () => {
     await w2.handleLog(matchedLog(100, BLOCK_A, 999n));
     await w2.handleLog(fillLog(100, BLOCK_A));
     expect(store2.quarantine().filter((x) => x.kind === 'ORDERSMATCHED_MISMATCH').length).toBe(1);
+  });
+
+  it('9. PENDING -> REMOVED_FLAG -> processRetries: zero observation', async () => {
+    const store = tempStore();
+    const blocks: Blocks = new Map([[100, { hash: BLOCK_A, timestamp: 1_791_143_962 }]]);
+    const { rpc, state } = mockRpc(blocks);
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+
+    state.failNext = true;
+    await w.handleLog(fillLog(100, BLOCK_A));            // PENDING + queued
+    await w.handleLog({ ...fillLog(100, BLOCK_A), removed: true }); // tombstone
+    await w.processRetries();                            // must NOT observe
+    expect(store.observations()).toHaveLength(0);
+    const idx = store.dispositionIndex();
+    expect([...idx.values()]).toContain('REMOVED_INVALID');
+    expect([...idx.values()]).not.toContain('OBSERVED');
+  });
+
+  it('10. PENDING -> REMOVED_FLAG -> new process -> replay: zero observation', async () => {
+    const store = tempStore();
+    const blocks: Blocks = new Map([[100, { hash: BLOCK_A, timestamp: 1_791_143_962 }]]);
+    const { rpc, state } = mockRpc(blocks);
+    const w1 = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+
+    state.failNext = true;
+    await w1.handleLog(fillLog(100, BLOCK_A));           // durable PENDING
+    await w1.handleLog({ ...fillLog(100, BLOCK_A), removed: true });
+    // Process dies; a new watcher must not replay the removed identity.
+    const w2 = new ChainWatcher(cfg(store.dir), store, clock(), mockRpc(blocks).rpc);
+    expect(await w2.replayIncompleteFromStore()).toBe(0);
+    expect(store.observations()).toHaveLength(0);
+    expect([...store.dispositionIndex().values()]).toContain('REMOVED_INVALID');
+  });
+
+  it('11. PENDING old blockHash -> REORG_REWIND -> new-blockHash re-inclusion observes exactly once', async () => {
+    const store = tempStore();
+    const blocks: Blocks = new Map([
+      [99, { hash: '0x' + '99'.repeat(32), timestamp: 1_791_143_910 }],
+      [100, { hash: BLOCK_A, timestamp: 1_791_143_962 }],
+    ]);
+    const { rpc, state } = mockRpc(blocks);
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+
+    state.failNext = true;
+    await w.handleLog(fillLog(100, BLOCK_A));            // PENDING on old fork
+    store.appendBlockHash({ chainId: 137, blockNumber: 99, blockHash: '0x' + '99'.repeat(32), firstSeenUtc: 'x' });
+    store.advanceCursor({ provider: 'https://rpc.test', blockNumber: 100, blockHash: BLOCK_A, updatedAtUtc: 'x' });
+    blocks.set(100, { hash: BLOCK_B, timestamp: 1_791_143_970 }); // fork
+    await w.validateCursor();                            // proved rewind to 99
+
+    // Old identity is tombstoned: replay terminalizes it, never observes.
+    const w2 = new ChainWatcher(cfg(store.dir), store, clock(), mockRpc(blocks).rpc);
+    expect(await w2.replayIncompleteFromStore()).toBe(0);
+    expect(store.observations()).toHaveLength(0);
+
+    // Re-inclusion under the NEW blockHash is new evidence — observed once.
+    await w2.handleLog(fillLog(100, BLOCK_B));
+    await w2.handleLog(fillLog(100, BLOCK_B));           // dup delivery
+    expect(store.observations()).toHaveLength(1);
+    expect(store.observations()[0]!.evidence.blockHash).toBe(BLOCK_B);
+  });
+
+  it('12. default chunk + shallow reorg: dense checkpoints PROVE a stored ancestor', async () => {
+    const store = tempStore();
+    const blocks: Blocks = new Map();
+    for (let n = 1; n <= 200; n++) blocks.set(n, { hash: '0x' + n.toString(16).padStart(64, 'c'), timestamp: 1_791_143_000 + n });
+    const { rpc } = mockRpc(blocks);
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+
+    await w.scanRange(1, 200); // single 200-block chunk, dense checkpoints
+    const cursor = store.readCursor('https://rpc.test')!;
+    expect(cursor.blockNumber).toBe(200);
+
+    // Shallow reorg 6 blocks behind the cursor: a stored checkpoint inside
+    // the 128-block walk must match (spacing 16 << lookback 128).
+    blocks.set(200, { hash: BLOCK_B, timestamp: 1_791_144_000 });
+    await w.validateCursor();
+    expect(w.recoveryRequired).toBe(false);
+    const rewound = store.readCursor('https://rpc.test')!;
+    expect(rewound.blockNumber).toBeLessThan(200);
+    expect(rewound.blockNumber).toBeGreaterThanOrEqual(200 - 128);
+    // The rewound target is a genuinely stored, provider-verified checkpoint.
+    expect(blocks.get(rewound.blockNumber)!.hash).toBe(rewound.blockHash);
+    const q = store.quarantine().filter((x) => x.kind === 'REORG_ANOMALY');
+    expect(q.some((x) => x.detail['ancestorVerified'] === true)).toBe(true);
+    expect(q.some((x) => x.detail['recoveryRequired'] === true)).toBe(false);
+  });
+
+  it('13. no ancestor within window: cursor not advanced and automatic scan does not resume', async () => {
+    const store = tempStore();
+    const blocks: Blocks = new Map();
+    // Divergence older than the lookback: only blocks far below agree, and
+    // no checkpoints were stored at all.
+    for (let n = 900; n <= 1000; n++) blocks.set(n, { hash: '0x' + n.toString(16).padStart(64, 'd'), timestamp: 1 });
+    store.advanceCursor({ provider: 'https://rpc.test', blockNumber: 1000, blockHash: BLOCK_A, updatedAtUtc: 'x' });
+    blocks.set(1000, { hash: BLOCK_B, timestamp: 2 });
+
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), mockRpc(blocks).rpc);
+    await w.backfillFromCursor(); // full automatic path
+    expect(w.recoveryRequired).toBe(true);
+    expect(store.readCursor('https://rpc.test')!.blockNumber).toBe(1000); // unmoved
+    expect(store.rawLogs()).toHaveLength(0);                              // no scan
+    expect(store.observations()).toHaveLength(0);
+  });
+
+  it('14. after proved rewind: old fork rows tombstoned, replacement observed once', async () => {
+    const store = tempStore();
+    const blocks: Blocks = new Map([
+      [99, { hash: '0x' + '99'.repeat(32), timestamp: 1_791_143_910 }],
+      [100, { hash: BLOCK_A, timestamp: 1_791_143_962 }],
+    ]);
+    const { rpc } = mockRpc(blocks);
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+
+    await w.handleLog(fillLog(100, BLOCK_A));            // observed on old fork
+    expect(store.observations()).toHaveLength(1);
+    store.appendBlockHash({ chainId: 137, blockNumber: 99, blockHash: '0x' + '99'.repeat(32), firstSeenUtc: 'x' });
+    store.advanceCursor({ provider: 'https://rpc.test', blockNumber: 100, blockHash: BLOCK_A, updatedAtUtc: 'x' });
+    blocks.set(100, { hash: BLOCK_B, timestamp: 1_791_143_970 }); // fork
+    await w.validateCursor();                            // proved rewind to 99
+
+    const id = { chainId: 137, emitter: EXCHANGE_V2_STANDARD, txHash: TX, logIndex: 7 };
+    expect(store.logStatus(id)).toBe('REMOVED');         // old fork tombstoned
+    // Replacement under the new blockHash: observed exactly once.
+    await w.handleLog(fillLog(100, BLOCK_B));
+    await w.handleLog(fillLog(100, BLOCK_B));
+    expect(store.observations()).toHaveLength(2);
+    expect(store.observations()[1]!.evidence.blockHash).toBe(BLOCK_B);
+    expect(store.logStatus(id)).toBe('REINCLUDED');
   });
 });
