@@ -35,14 +35,38 @@ and it must not drift into one.
 The objective is to determine whether **this system** provides superior
 discovery — not to make its output artificially identical to Poly2.
 
-## Correctness/safety findings (still binding)
+## Scope honesty
 
-- Removed-log handling, transient failure/retry, restart and reorg recovery
-  — implemented via append-only raw evidence, tombstones + derived status,
-  cursor rewind to common ancestor.
-- Append-only evidence preserved; first-seen rows are never edited or deleted.
-- Credential guard is fail-closed; egress allowlist is application-level and
-  must be paired with deployment-time network controls.
+**Phase 2 is a chain-observer foundation, not the finished multi-source
+system.** The current entrypoint runs only the Polygon V2 watcher. The
+intended final architecture — fast REST trade discovery, validated WebSocket
+trade observation, independent source racing with first-seen timestamps — is
+Phase 3. This PR must not be presented as a finished head-to-head
+alternative to Poly2.
+
+## Correctness/safety findings (implemented and test-covered)
+
+- **Removed-log handling**: removal notices bypass dedup entirely and are
+  always tombstoned; re-inclusion in a different block is new evidence
+  (dedup keys include blockHash). Covered by watcher tests.
+- **Transient failure/retry**: `seenRaw` is marked only after full commit;
+  failures are recorded in quarantine (`TRANSIENT_FAILURE`) and replayed
+  from a retry queue. Covered by watcher tests.
+- **Restart and reorg recovery**: startup + periodic cursor-hash validation,
+  common-ancestor walk over append-only block-hash evidence,
+  `tombstoneAboveBlock`, cursor rewind, rescan. A block-hash conflict never
+  emits an observation with a conflicting timestamp. Covered by watcher tests.
+- **Append-only evidence preserved**; first-seen rows are never edited or
+  deleted.
+- **Credential guard** is fail-closed on PRESENCE (a set-but-empty banned
+  variable still refuses startup). **Egress** covers both HTTP RPC and the
+  WSS endpoint; the WSS host must match the configured HTTP RPC host or the
+  public allowlist. Both remain application-level controls that must be
+  paired with deployment-time network restrictions.
+- **Storage durability limits (Phase 2)**: evidence lives in append-only
+  NDJSON files on a single host. There is no replication, fsync policy, or
+  backup; host loss loses evidence. Acceptable for an independent research
+  shadow at this phase; not a production durability claim.
 - The application remains **incapable of trading** — no signing, no keys, no
   order paths exist in this repository.
 

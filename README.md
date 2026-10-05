@@ -39,9 +39,11 @@ src/shadow/
   decimal.ts      Exact 6-dp shares / 10-dp half-up gross price rendering
   storage.ts      Append-only NDJSON evidence store, reorg tombstones,
                   native event identity (chainId:emitter:txHash:logIndex)
-  watcher.ts      Completeness-first WSS + eth_getLogs backfill watcher
-  config.ts       Fail-closed config (refuses to start with any key material)
-  egress.ts       Application-level egress allowlist (RPC + public data APIs only)
+  watcher.ts      Completeness-first WSS + eth_getLogs backfill watcher,
+                  removed-log tombstones, retry queue, reorg rewind
+  config.ts       Fail-closed config (presence-based credential guard)
+  egress.ts       Application-level egress allowlist (HTTP RPC + WSS +
+                  public data APIs only)
   main.ts         Entrypoint
 src/compare/
   poly2-adapter.ts  Phase 4 ONLY: maps Shadow observations to candidate Poly2
@@ -51,6 +53,7 @@ tests/
   fixtures/v2_fills.json  Real production receipts (5 trades, 3 wallets,
                           both exchanges, BUY+SELL, rounding + fee cases,
                           the 37-fill multi-fill transaction)
+  watcher.test.ts         Failure/restart/reorg flows through the real watcher
 ```
 
 ## Run
@@ -63,6 +66,14 @@ npm run build   # tsc --noEmit
 SHADOW_WATCHED_WALLETS=0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029 \
   npm start     # observation only; writes to ./shadow-data/
 ```
+
+## Scope
+
+Phase 2 (current) is the **chain-observer foundation**: the Polygon V2 event
+watcher above. Fast REST discovery, validated WebSocket trade observation,
+and independent source racing are Phase 3; comparison against Poly2 via
+`src/compare/` is Phase 4. This is not yet a finished head-to-head
+alternative to Poly2.
 
 ## Hard boundaries
 
