@@ -2,7 +2,6 @@ import { describe, it, expect } from 'vitest';
 import {
   ratioScaled10, formatScaled10, grossPrice10, shares6, trimDecimal,
 } from '../src/shadow/decimal.js';
-import { canonicalTradeId } from '../src/shadow/canonical.js';
 
 describe('exact decimal normalization (BigInt)', () => {
   it('exact ratios stay exact', () => {
@@ -42,27 +41,10 @@ describe('exact decimal normalization (BigInt)', () => {
     expect(() => shares6(-1n)).toThrow();
   });
 
-  it('trimDecimal renders canonical-facing strings', () => {
+  it('trimDecimal renders comparison-facing strings', () => {
     expect(trimDecimal('680.780000')).toBe('680.78');
     expect(trimDecimal('11.000000')).toBe('11');
     expect(trimDecimal('0.5092544849')).toBe('0.5092544849');
     expect(trimDecimal('0.5600000000')).toBe('0.56');
-  });
-});
-
-describe('canonical identity (formula unchanged from Poly2)', () => {
-  it('builds data-api keys with block timestamp', () => {
-    const key = canonicalTradeId({
-      transactionHash: '0x446845c37e85c37b91419c6d201250d6df7df471de2dd680d2cd09f4ca08805b',
-      proxyWallet: '0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029',
-      asset: '12345',
-      shares: '680.780000',
-      price10: '0.5600000000',
-      blockTimestamp: 1791143962,
-    });
-    expect(key).toBe(
-      'data-api:0x446845c37e85c37b91419c6d201250d6df7df471de2dd680d2cd09f4ca08805b:' +
-      '0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029:12345:680.78:0.56:1791143962',
-    );
   });
 });

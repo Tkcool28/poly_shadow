@@ -45,7 +45,7 @@ export function shares6(amountUnits: bigint): string {
 /**
  * Trim trailing zeros in the fraction of a fixed decimal string.
  * "680.780000" -> "680.78", "11.000000" -> "11", "0.5092544849" unchanged.
- * Used only for canonical-key rendering; storage keeps full precision.
+ * Used only by the Phase-4 comparison adapter; storage keeps full precision.
  */
 export function trimDecimal(s: string): string {
   if (!s.includes('.')) return s;

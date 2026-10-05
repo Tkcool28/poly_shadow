@@ -3,7 +3,9 @@
  *
  * Role model (Hermes feasibility §3, verified against production receipts):
  *   1. Passive maker-order fill:  maker = makerOrder.maker, taker = takerOrder.maker.
- *      If the watched wallet is `maker` here -> MAKER_LEG (diagnostic only).
+ *      If the watched wallet is `maker` here -> MAKER_LEG: a first-class,
+ *      separately classified population. Investigating whether Poly2 misses
+ *      useful maker-side wallet activity is a core purpose of Shadow.
  *   2. Active taker aggregate:    maker = takerOrder.maker, taker = EXCHANGE address.
  *      All 14/14 reconstructed production trades use this form -> TAKER_AGGREGATE.
  *   3. Wallet appearing as `taker` with another maker -> individual leg of the
@@ -39,7 +41,7 @@ export interface RawLog {
 
 export type FillRole =
   | 'TAKER_AGGREGATE'      // watched wallet = maker, taker = exchange
-  | 'MAKER_LEG'            // watched wallet = maker, taker = other wallet
+  | 'MAKER_LEG'            // watched wallet = maker, taker = other wallet (first-class population)
   | 'TAKER_LEG_REDUNDANT'; // watched wallet = taker, maker = other wallet
 
 export interface DecodedOrderFilled {
