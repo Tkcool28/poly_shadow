@@ -9,32 +9,36 @@
  * watched-wallet filtering happens post-decode. Topic2 funded-owner filtering
  * is NOT used until fixture-proven complete.
  *
- * Evidence-safety rules (independent re-review findings):
- * - Removed logs are handled BEFORE any dedup gate — a removal notice is
- *   always recorded as a tombstone, never swallowed by seenRaw.
- * - Dedup keys include blockHash: the same (tx, logIndex) re-included in a
- *   different block after a reorg is new evidence, not a duplicate.
- * - seenRaw is only marked AFTER raw evidence + observation commit. A
- *   transient failure (RPC error, block-hash conflict) leaves the event
- *   retryable; failures are recorded in quarantine (visible, never silent),
- *   replayed from a retry queue, and — if the process dies first —
- *   recovered at startup by replayIncompleteFromStore().
- * - Concurrent WSS + backfill deliveries of the same identity are
- *   serialized through an in-flight map: the commit path runs exactly once.
- * - Startup and periodic cursor validation: stored cursor/block hashes are
- *   checked against the provider; on mismatch we walk back to the common
- *   ancestor, tombstone everything above it, rewind the cursor, and rescan.
+ * Evidence-safety contract (consolidated exit audit):
+ * - Removal notices bypass dedup and are always tombstoned (blockHash-aware).
+ * - Every raw identity gets a DURABLE disposition (append-only):
+ *   OBSERVED | COMPLETED_NO_OBSERVATION | TERMINAL_QUARANTINE | PENDING.
+ *   Startup rebuilds in-memory dedup from that index and replays only
+ *   PENDING identities — restart delivery is idempotent, valid terminal
+ *   rows are never replayed, and no observation is ever stranded.
+ * - seenRaw is marked only after full commit; concurrent deliveries of the
+ *   same blockHash-aware identity are serialized through an in-flight map.
+ * - Reorg recovery is fork-aware: a common ancestor must be PROVED against
+ *   stored checkpoint hashes, or recovery fails closed (quarantine +
+ *   explicit bounded rewind, labeled unverified). Conflicting raw
+ *   identities are invalidated (HASH_CONFLICT tombstone + TERMINAL) so
+ *   replay cannot revive them.
+ * - Recovery/scan/validation are single-flight (serialized); a generation
+ *   counter invalidates handlers that were mid-flight across a rewind.
+ * - First start: live coverage begins only after the subscription is
+ *   acknowledged; backfill overlaps a bounded window so handshake-gap
+ *   events are captured (native dedup removes double-delivery).
  * - Observations record raw ARRIVAL time (discovery latency) separately
  *   from completion time; arrival survives retries and restart replay.
  */
 
 import WebSocket from 'ws';
 import { decodeV2Log, classifyFill, normalizeGross, crossCheckAggregate } from './decoder.js';
-import type { DecodedOrdersMatched, RawLog } from './decoder.js';
-import { V2_SUBSCRIBE_TOPICS, V2_EXCHANGES, TOPIC_ORDER_FILLED_V2 } from './v2constants.js';
+import type { DecodedOrderFilled, DecodedOrdersMatched, RawLog } from './decoder.js';
+import { V2_SUBSCRIBE_TOPICS, V2_EXCHANGES } from './v2constants.js';
 import { assertAllowedUrl, rpcCall } from './egress.js';
 import type { ShadowConfig } from './config.js';
-import type { ShadowStore } from './storage.js';
+import type { Disposition, ShadowStore } from './storage.js';
 
 interface BlockRef { number: number; hash: string; timestamp: number }
 
@@ -50,6 +54,22 @@ export class ReorgSignal extends Error {
 
 /** How far back common-ancestor search may walk (blocks). */
 const REORG_LOOKBACK = 128;
+/** First-start backfill overlap: covers the subscribe-handshake window. */
+const FIRST_START_OVERLAP_BLOCKS = 64;
+/** Bounds for in-memory diagnostic maps (Phase 2 bounded-run foundation). */
+const MATCHED_CACHE_MAX = 1024;
+const BLOCK_CACHE_MAX = 512;
+
+/** FIFO-bounded Map: oldest entries evicted past `max`. */
+class BoundedMap<K, V> extends Map<K, V> {
+  constructor(private max: number) { super(); }
+  override set(key: K, value: V): this {
+    if (this.has(key)) this.delete(key);
+    super.set(key, value);
+    while (this.size > this.max) this.delete(this.keys().next().value as K);
+    return this;
+  }
+}
 
 export class ChainWatcher {
   private ws: WebSocket | null = null;
@@ -58,22 +78,26 @@ export class ChainWatcher {
   private lastMessageAt = 0;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private verifier: ReturnType<typeof setInterval> | null = null;
-  private blockCache = new Map<number, BlockRef>();
-  /** OrdersMatched cross-check buffer: orderHash -> decoded */
-  private matchedByHash = new Map<string, DecodedOrdersMatched>();
-  /** chainId:emitter:txHash:logIndex:blockHash — set only after full commit */
+  private subscriptionAcked = false;
+  private blockCache = new BoundedMap<number, BlockRef>(BLOCK_CACHE_MAX);
+  /** OrdersMatched cross-check buffers, keyed by order hash (both arrival
+   *  orders reconciled; bounded FIFO). */
+  private matchedByHash = new BoundedMap<string, DecodedOrdersMatched>(MATCHED_CACHE_MAX);
+  private aggregateByHash = new BoundedMap<string, DecodedOrderFilled & { logIndex: number; txHash: string }>(MATCHED_CACHE_MAX);
+  /** Identities fully committed this run (seeded from durable dispositions). */
   private seenRaw = new Set<string>();
-  /** chainId:emitter:txHash:logIndex:blockHash — removal notices already tombstoned */
+  /** blockHash-aware removal notices already tombstoned (seeded from store). */
   private seenRemoved = new Set<string>();
-  /** blockHash-aware native identity -> in-flight processing promise.
-   *  Concurrent WSS + backfill deliveries of the same log await the same
-   *  work instead of double-committing. */
-  private inflight = new Map<string, Promise<void>>();
-  /** raw evidence rows already committed (retry must not duplicate them) */
+  /** raw evidence rows already committed (retry/replay must not duplicate) */
   private rawCommitted = new Set<string>();
-  /** logs awaiting replay after a transient failure (arrival time preserved) */
+  /** blockHash-aware identity -> in-flight commit promise */
+  private inflight = new Map<string, Promise<void>>();
+  /** transient failures awaiting replay (arrival time preserved) */
   private retryQueue: Array<{ log: RawLog & { blockHash: string }; arrivedUtc: string }> = [];
-  private reorgRecoveryInFlight = false;
+  /** Bumped on every rewind: handlers from an older generation abort commit. */
+  private generation = 0;
+  /** Single-flight chain for validate/scan/replay/recovery transitions. */
+  private exclusive: Promise<void> = Promise.resolve();
 
   constructor(
     private cfg: ShadowConfig,
@@ -94,6 +118,13 @@ export class ChainWatcher {
     this.ws?.close(1000, 'shutdown');
   }
 
+  /** Serialize scan/validate/replay/recovery: one transition at a time. */
+  private runExclusive(fn: () => Promise<void>): Promise<void> {
+    const run = this.exclusive.then(fn, fn);
+    this.exclusive = run.catch(() => {});
+    return run;
+  }
+
   private connect(): void {
     // The WSS connection goes through the SAME egress assertion as HTTP RPC.
     // The WS host must match the configured HTTP RPC host (or the public
@@ -103,6 +134,7 @@ export class ChainWatcher {
     const ws = new WebSocket(this.cfg.polygonWsRpcUrl);
     this.ws = ws;
     this.lastMessageAt = Date.now();
+    this.subscriptionAcked = false;
 
     ws.on('open', () => {
       this.reconnectDelayMs = 1000;
@@ -111,13 +143,22 @@ export class ChainWatcher {
         params: ['logs', { address: [...V2_EXCHANGES], topics: [[...V2_SUBSCRIBE_TOPICS]] }],
       }));
       this.startHeartbeat();
-      void this.backfillFromCursor().catch((err) => this.recordFailure('backfill', err));
+      // Backfill begins only after the subscription is ACKNOWLEDGED — see
+      // the message handler for id===1. Live coverage before that moment is
+      // not assumed; the first-start overlap window closes the gap.
     });
 
     ws.on('message', (data: WebSocket.Data) => {
       this.lastMessageAt = Date.now();
       try {
         const msg = JSON.parse(data.toString());
+        if (msg.id === 1 && msg.result) {
+          // Subscription acknowledged: live coverage is now active.
+          this.subscriptionAcked = true;
+          void this.runExclusive(() => this.backfillFromCursor())
+            .catch((err) => this.recordFailure('backfill', err));
+          return;
+        }
         if (msg.method === 'eth_subscription' && msg.params?.result) {
           void this.handleLog(msg.params.result as RawLog & { blockHash: string })
             .catch((err) => this.recordFailure('subscription-log', err));
@@ -125,6 +166,8 @@ export class ChainWatcher {
       } catch { /* malformed message ignored */ }
     });
 
+    // Liveness: any sign of life counts — subscription messages AND pongs.
+    ws.on('pong', () => { this.lastMessageAt = Date.now(); });
     ws.on('close', () => { this.scheduleReconnect(); });
     ws.on('error', () => { /* close follows */ });
   }
@@ -156,10 +199,26 @@ export class ChainWatcher {
     });
   }
 
+  /** Durable disposition for one blockHash-aware identity. */
+  private recordDisposition(
+    log: RawLog & { blockHash: string },
+    disposition: Disposition,
+  ): void {
+    this.store.appendDisposition({
+      chainId: this.cfg.chainId,
+      emitter: log.address.toLowerCase(),
+      txHash: log.transactionHash,
+      logIndex: Number(log.logIndex),
+      blockHash: log.blockHash,
+      disposition,
+      atUtc: this.nowIso(),
+    });
+  }
+
   /**
    * Handle one raw log from WSS or backfill.
    * Ordering contract: removals first, dedup (with blockHash) second,
-   * in-flight serialization third, seenRaw marked only after full commit.
+   * in-flight serialization third, durable disposition on every outcome.
    */
   async handleLog(
     log: RawLog & { blockHash: string },
@@ -209,9 +268,16 @@ export class ChainWatcher {
     const blockNumber = Number(log.blockNumber);
     const logIndex = Number(log.logIndex);
     const emitter = log.address.toLowerCase();
+    const gen = this.generation;
     // Discovery time of the RAW evidence — preserved across retries and
     // replays so latency measurement is never misrepresented by rework.
     const arrivedUtc = preservedArrivalUtc ?? this.nowIso();
+
+    const finish = (d: Disposition): void => {
+      this.recordDisposition(log, d);
+      this.seenRaw.add(dedupKey);
+    };
+
     try {
       // 3) Raw evidence first (guarded so retries don't duplicate the row).
       if (!this.rawCommitted.has(dedupKey)) {
@@ -239,40 +305,45 @@ export class ChainWatcher {
           detail: { txHash: log.transactionHash, logIndex, error: String(err) },
           firstSeenUtc: this.nowIso(),
         });
-        this.seenRaw.add(dedupKey); // malformed is terminal, not transient
+        finish('TERMINAL_QUARANTINE'); // malformed is terminal, not transient
         return;
       }
-      if (!decoded) { this.seenRaw.add(dedupKey); return; } // foreign event
+      if (!decoded) { finish('COMPLETED_NO_OBSERVATION'); return; } // foreign event
 
       if (decoded.kind === 'OrdersMatched') {
+        // Cross-check only — never a trade record. Reconcile in EITHER
+        // arrival order: if the aggregate arrived first, check now.
         this.matchedByHash.set(decoded.takerOrderHash.toLowerCase(), decoded);
-        this.seenRaw.add(dedupKey);
-        return; // cross-check only — never a trade record
+        const agg = this.aggregateByHash.get(decoded.takerOrderHash.toLowerCase());
+        if (agg) this.crossCheck(agg, decoded);
+        finish('COMPLETED_NO_OBSERVATION');
+        return;
       }
 
       const cls = classifyFill(decoded, this.cfg.watchedWallets);
       if (!cls || cls.role === 'TAKER_LEG_REDUNDANT') {
         // Unwatched, or a leg covered by the same-tx aggregate. Raw row kept.
-        this.seenRaw.add(dedupKey);
+        finish('COMPLETED_NO_OBSERVATION');
         return;
       }
 
       // May throw ReorgSignal (hash conflict) or a transient RPC error.
       const block = await this.blockRef(blockNumber, log.blockHash);
+
+      // A rewind happened while we were awaiting the RPC: this handler is
+      // stale. Leave the identity PENDING; post-rewind replay reprocesses.
+      if (gen !== this.generation) {
+        this.recordDisposition(log, 'PENDING');
+        return;
+      }
+
       const norm = normalizeGross(decoded);
 
       if (cls.role === 'TAKER_AGGREGATE') {
+        const ctx = { ...decoded, logIndex, txHash: log.transactionHash };
+        this.aggregateByHash.set(decoded.orderHash.toLowerCase(), ctx);
         const om = this.matchedByHash.get(decoded.orderHash.toLowerCase());
-        if (om) {
-          const errs = crossCheckAggregate(decoded, om);
-          if (errs.length > 0) {
-            this.store.appendQuarantine({
-              kind: 'ORDERSMATCHED_MISMATCH',
-              detail: { txHash: log.transactionHash, logIndex, errs },
-              firstSeenUtc: this.nowIso(),
-            });
-          }
-        }
+        if (om) this.crossCheck(ctx, om);
       }
 
       // Native chain event identity is the primary key. Poly2 equivalence is
@@ -299,21 +370,47 @@ export class ChainWatcher {
       });
 
       // 4) Only now is the event fully committed.
-      this.seenRaw.add(dedupKey);
+      finish('OBSERVED');
     } catch (err) {
       if (err instanceof ReorgSignal) {
-        // Do NOT emit with a conflicting timestamp. Record + recover.
+        // Do NOT emit with a conflicting timestamp. Invalidate this raw
+        // identity terminally so replay can never revive it, quarantine the
+        // anomaly, and schedule serialized recovery.
+        this.store.appendTombstone({
+          chainId: this.cfg.chainId, emitter,
+          txHash: log.transactionHash, logIndex, blockHash: log.blockHash,
+          removedAtUtc: this.nowIso(), reason: 'HASH_CONFLICT',
+        });
         this.store.appendQuarantine({
           kind: 'REORG_ANOMALY',
           detail: { blockNumber, logBlockHash: log.blockHash, error: String(err) },
           firstSeenUtc: this.nowIso(),
         });
-        await this.recoverFromReorg();
-        return; // not marked seen — replay after recovery
+        finish('TERMINAL_QUARANTINE');
+        void this.runExclusive(() => this.recoverFromReorg())
+          .catch((e) => this.recordFailure('reorg-recovery', e));
+        return;
       }
-      // Transient: record visibly, queue for replay, leave retryable.
+      // Transient: record visibly, mark PENDING durably, queue in-memory
+      // replay. If the process dies first, startup replay recovers it.
       this.recordFailure(`handleLog:${log.transactionHash}:${logIndex}`, err);
+      this.recordDisposition(log, 'PENDING');
       this.retryQueue.push({ log, arrivedUtc });
+    }
+  }
+
+  /** OrdersMatched vs aggregate cross-check (arrival-order independent). */
+  private crossCheck(
+    agg: DecodedOrderFilled & { logIndex: number; txHash: string },
+    om: DecodedOrdersMatched,
+  ): void {
+    const errs = crossCheckAggregate(agg, om);
+    if (errs.length > 0) {
+      this.store.appendQuarantine({
+        kind: 'ORDERSMATCHED_MISMATCH',
+        detail: { txHash: agg.txHash, logIndex: agg.logIndex, errs },
+        firstSeenUtc: this.nowIso(),
+      });
     }
   }
 
@@ -345,9 +442,10 @@ export class ChainWatcher {
 
   /**
    * Validate the stored cursor against the provider. On mismatch, walk back
-   * to the common ancestor (using our append-only block-hash evidence),
-   * tombstone everything above it, and rewind the cursor. Nothing is edited
-   * or deleted; orphaned first-seen evidence is preserved.
+   * over stored checkpoint hashes to a PROVED common ancestor. If no stored
+   * checkpoint matches within REORG_LOOKBACK, fail closed: quarantine an
+   * explicitly UNVERIFIED bounded rewind — never label an unproved block as
+   * the common ancestor.
    */
   async validateCursor(): Promise<void> {
     const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
@@ -358,9 +456,8 @@ export class ChainWatcher {
     );
     if (head.hash.toLowerCase() === cursor.blockHash.toLowerCase()) return;
 
-    // Mismatch: walk back to common ancestor using stored block hashes.
     const stored = this.store.latestBlockHashes();
-    let ancestor = Math.max(0, cursor.blockNumber - REORG_LOOKBACK);
+    let ancestor: number | null = null;
     for (let n = cursor.blockNumber - 1; n >= cursor.blockNumber - REORG_LOOKBACK && n > 0; n--) {
       const known = stored.get(n);
       if (!known) continue;
@@ -371,55 +468,83 @@ export class ChainWatcher {
       if (b.hash.toLowerCase() === known.toLowerCase()) { ancestor = n; break; }
     }
 
-    const ancestorBlock = await this.rpc<{ hash: string }>(
+    const verified = ancestor !== null;
+    const target = ancestor ?? Math.max(0, cursor.blockNumber - REORG_LOOKBACK);
+    const targetBlock = await this.rpc<{ hash: string }>(
       this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber',
-      ['0x' + ancestor.toString(16), false],
+      ['0x' + target.toString(16), false],
     );
     this.store.appendQuarantine({
       kind: 'REORG_ANOMALY',
       detail: {
         cursorBlock: cursor.blockNumber, cursorHash: cursor.blockHash,
-        providerHash: head.hash, ancestor,
+        providerHash: head.hash, ancestor: target,
+        ancestorVerified: verified,
+        ...(verified ? {} : { unverifiedBoundedRewind: true, lookback: REORG_LOOKBACK }),
       },
       firstSeenUtc: this.nowIso(),
     });
-    this.store.tombstoneAboveBlock(this.cfg.chainId, ancestor, this.nowIso());
+    this.store.tombstoneAboveBlock(this.cfg.chainId, target, this.nowIso());
     this.store.advanceCursor({
       provider: this.cfg.polygonHttpRpcUrl,
-      blockNumber: ancestor,
-      blockHash: ancestorBlock.hash,
+      blockNumber: target,
+      blockHash: targetBlock.hash,
       updatedAtUtc: this.nowIso(),
     });
-    // Post-rewind state must be re-observed from the rescan.
+    // Rewind: invalidate in-flight handlers via generation bump; drop caches.
+    // in-flight promises are NOT cleared — their generation check aborts
+    // their commit, and awaiting callers still get a settled promise.
+    this.generation++;
+    this.blockCache.clear();
     this.seenRaw.clear();
     this.rawCommitted.clear();
-    this.blockCache.clear();
-    this.inflight.clear();
   }
 
   private async recoverFromReorg(): Promise<void> {
-    if (this.reorgRecoveryInFlight) return;
-    this.reorgRecoveryInFlight = true;
-    try {
-      await this.validateCursor();
-      await this.backfillFromCursor();
-    } catch (err) {
-      this.recordFailure('reorg-recovery', err);
-    } finally {
-      this.reorgRecoveryInFlight = false;
-    }
+    await this.validateCursor();
+    await this.replayIncompleteFromStore();
+    const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
+    if (!cursor) return;
+    const latestHex = await this.rpc<string>(this.cfg.polygonHttpRpcUrl, 'eth_blockNumber', []);
+    await this.scanRange(cursor.blockNumber + 1, parseInt(latestHex, 16));
   }
 
   /**
-   * Durable startup replay: any committed raw log that has NO completed
-   * observation (a transient failure crashed/was stopped before the retry
-   * queue drained) is reprocessed from the persisted evidence. Terminal
-   * cases (malformed/AMBIGUOUS_FILL-quarantined, REMOVED) are skipped, as
-   * are identities currently in flight. Raw rows are never re-appended —
-   * rawCommitted is seeded from the store — and the original arrival time
-   * is preserved so discovery latency survives the replay.
+   * Durable startup/restart recovery:
+   *  1. Seed in-memory dedup from the append-only disposition index —
+   *     already-delivered identities can never double-commit after restart.
+   *  2. Seed rawCommitted from raw rows and seenRemoved from tombstones.
+   *  3. Replay ONLY identities whose latest disposition is PENDING, plus
+   *     legacy rows with no disposition and no observation (pre-disposition
+   *     evidence). Only the LATEST raw row per identity is eligible, so an
+   *     old tombstoned fork row can never be revived.
+   * Original arrival time is preserved so discovery latency survives replay.
    */
   async replayIncompleteFromStore(): Promise<number> {
+    const raws = this.store.rawLogs();
+    const dispositions = this.store.dispositionIndex();
+
+    // Seed dedup state from durable evidence (idempotent restart delivery).
+    for (const r of raws) {
+      this.rawCommitted.add(
+        `${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}:${r.blockHash.toLowerCase()}`);
+    }
+    for (const t of this.store.tombstones()) {
+      if (t.reason === 'REMOVED_FLAG') {
+        this.seenRemoved.add(
+          `${t.chainId}:${t.emitter}:${t.txHash}:${t.logIndex}:${t.blockHash.toLowerCase()}`);
+      }
+    }
+    for (const [key, d] of dispositions) {
+      if (d !== 'PENDING') this.seenRaw.add(key);
+    }
+
+    // Latest raw row per blockHash-blind identity (file order = arrival order).
+    const latestByIdentity = new Map<string, (typeof raws)[number]>();
+    for (const r of raws) {
+      latestByIdentity.set(`${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}`, r);
+    }
+
     const observed = new Set(
       this.store.observations().map((o) =>
         `${o.evidence.chainId}:${o.evidence.emitter}:${o.evidence.txHash}:` +
@@ -430,14 +555,19 @@ export class ChainWatcher {
         .filter((q) => q.kind === 'AMBIGUOUS_FILL')
         .map((q) => `${q.detail['txHash']}:${q.detail['logIndex']}`),
     );
+
     let replayed = 0;
-    for (const r of this.store.rawLogs()) {
+    for (const r of raws) {
       const key = `${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}:${r.blockHash.toLowerCase()}`;
-      this.rawCommitted.add(key); // never duplicate the raw row
-      if (observed.has(key)) continue;
-      if (terminal.has(`${r.txHash}:${r.logIndex}`)) continue; // terminal malformed
-      const status = this.store.logStatus(r);
-      if (status === 'REMOVED') continue; // dead evidence, nothing to observe
+      const d = dispositions.get(key);
+      const pending =
+        d === 'PENDING' ||
+        (d === undefined &&
+          latestByIdentity.get(`${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}`) === r &&
+          !observed.has(key) &&
+          !terminal.has(`${r.txHash}:${r.logIndex}`) &&
+          this.store.logStatus(r) !== 'REMOVED');
+      if (!pending) continue;
       if (this.seenRaw.has(key)) continue;
       if (this.inflight.has(key)) continue; // currently committing — never await ourselves
       replayed++;
@@ -457,14 +587,20 @@ export class ChainWatcher {
     return replayed;
   }
 
-  /** Resume from durable cursor; then periodic verification backfill. */
-  private async backfillFromCursor(): Promise<void> {
+  /** Resume from durable cursor; then periodic verification backfill.
+   *  Public for tests; production entry is the subscription-ack handler. */
+  async backfillFromCursor(): Promise<void> {
     await this.validateCursor();
     await this.replayIncompleteFromStore();
     const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
     const latestHex = await this.rpc<string>(this.cfg.polygonHttpRpcUrl, 'eth_blockNumber', []);
     const latest = parseInt(latestHex, 16);
-    const from = cursor ? cursor.blockNumber + 1 : latest;
+    // First start (no cursor): overlap a bounded window so events from the
+    // subscribe-handshake gap are captured; native dedup absorbs any
+    // double-delivery from the now-acknowledged live subscription.
+    const from = cursor
+      ? cursor.blockNumber + 1
+      : Math.max(0, latest - FIRST_START_OVERLAP_BLOCKS);
     await this.scanRange(from, latest);
     this.startVerifier();
   }
@@ -472,19 +608,20 @@ export class ChainWatcher {
   private startVerifier(): void {
     if (this.verifier) clearInterval(this.verifier);
     this.verifier = setInterval(() => {
-      void (async () => {
+      void this.runExclusive(async () => {
         await this.validateCursor();
         await this.processRetries();
         const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
         if (!cursor) return;
         const latestHex = await this.rpc<string>(this.cfg.polygonHttpRpcUrl, 'eth_blockNumber', []);
         await this.scanRange(cursor.blockNumber + 1, parseInt(latestHex, 16));
-      })().catch((err) => this.recordFailure('verifier', err));
+      }).catch((err) => this.recordFailure('verifier', err));
     }, this.cfg.verifyIntervalMs);
   }
 
   /** Scan [from, to] with eth_getLogs; cursor advances only after commit. */
   async scanRange(from: number, to: number): Promise<void> {
+    if (from > to) return;
     const chunk = this.cfg.backfillChunkBlocks;
     for (let start = from; start <= to; start += chunk) {
       const end = Math.min(start + chunk - 1, to);
@@ -500,10 +637,8 @@ export class ChainWatcher {
       for (const log of logs) {
         await this.handleLog(log);
       }
-      // Transient failures are in the retry queue AND recoverable from the
-      // persisted raw rows at startup (replayIncompleteFromStore); terminal
-      // malformed events are quarantined. Cursor advancement is therefore
-      // safe — it never strands an unfinished observation.
+      // Transient failures are PENDING (durable) + queued in memory; both
+      // paths recover them. Cursor advancement strands nothing.
       const head = await this.rpc<{ hash: string }>(
         this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber', ['0x' + end.toString(16), false],
       );

@@ -38,7 +38,7 @@ export interface TombstoneRow {
   logIndex: number;
   blockHash: string;
   removedAtUtc: string;
-  reason: 'REMOVED_FLAG' | 'REORG_REWIND';
+  reason: 'REMOVED_FLAG' | 'REORG_REWIND' | 'HASH_CONFLICT';
 }
 
 export type LogStatus = 'CONFIRMED' | 'REMOVED' | 'REINCLUDED';
@@ -88,6 +88,28 @@ export interface BlockHashRow {
   blockNumber: number;
   blockHash: string;
   firstSeenUtc: string;
+}
+
+/**
+ * Durable per-evidence disposition — the restart/recovery contract.
+ * Keyed by the full blockHash-aware native identity. Append-only; the
+ * latest row per identity wins (derived index, never a mutation).
+ */
+export type Disposition =
+  | 'OBSERVED'                 // observation committed
+  | 'COMPLETED_NO_OBSERVATION' // valid terminal, no observation by design
+                               // (OrdersMatched, unwatched, redundant leg, foreign)
+  | 'TERMINAL_QUARANTINE'      // malformed/conflicted — never replay
+  | 'PENDING';                 // transient failure — replay at startup
+
+export interface DispositionRow {
+  chainId: number;
+  emitter: string;
+  txHash: string;
+  logIndex: number;
+  blockHash: string;
+  disposition: Disposition;
+  atUtc: string;
 }
 
 export interface CursorRow {
@@ -151,6 +173,10 @@ export class ShadowStore {
     this.append('block_hashes.ndjson', row);
   }
 
+  appendDisposition(row: DispositionRow): void {
+    this.append('dispositions.ndjson', row);
+  }
+
   // ─── cursor (small mutable state; cursor file is rewritten, evidence is not) ───
 
   readCursor(provider: string): CursorRow | null {
@@ -189,6 +215,20 @@ export class ShadowStore {
   latestBlockHashes(): Map<number, string> {
     const m = new Map<number, string>();
     for (const r of this.blockHashes()) m.set(r.blockNumber, r.blockHash);
+    return m;
+  }
+
+  dispositions(): DispositionRow[] {
+    return this.readAll<DispositionRow>('dispositions.ndjson');
+  }
+
+  /** Latest disposition per full blockHash-aware identity (derived index). */
+  dispositionIndex(): Map<string, Disposition> {
+    const m = new Map<string, Disposition>();
+    for (const d of this.dispositions()) {
+      m.set(`${d.chainId}:${d.emitter}:${d.txHash}:${d.logIndex}:${d.blockHash.toLowerCase()}`,
+        d.disposition);
+    }
     return m;
   }
 
