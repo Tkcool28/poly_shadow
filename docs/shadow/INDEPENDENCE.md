@@ -67,6 +67,22 @@ alternative to Poly2.
   NDJSON files on a single host. There is no replication, fsync policy, or
   backup; host loss loses evidence. Acceptable for an independent research
   shadow at this phase; not a production durability claim.
+- **Bounded-state limits (Phase 2)**: diagnostic maps (OrdersMatched /
+  aggregate cross-check buffers, block cache) are FIFO-bounded. Dedup sets
+  (`seenRaw`, `seenRemoved`, `rawCommitted`) scale with evidence volume and
+  are rebuilt from the durable disposition index at startup — a restart is
+  the rotation mechanism. Guidance: restart the observer at least daily
+  during long research runs; production-grade rotation is a separate
+  operational gate before any long unattended canary.
+- **Recovery semantics**: reorg recovery requires a PROVED common ancestor
+  (stored checkpoint hash matching the provider). When no checkpoint matches
+  within the 128-block lookback, the watcher fails closed: it quarantines an
+  explicitly labeled *unverified bounded rewind* rather than claiming an
+  ancestor it cannot prove. Raw identities whose block hash conflicts with
+  the provider are invalidated terminally (`HASH_CONFLICT` tombstone) so
+  replay can never revive them.
+- **Liveness vs freshness**: connection liveness counts any sign of life
+  (subscription messages and pongs); event freshness is a Phase 3 concern.
 - The application remains **incapable of trading** — no signing, no keys, no
   order paths exist in this repository.
 

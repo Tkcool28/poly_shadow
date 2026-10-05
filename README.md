@@ -38,30 +38,33 @@ src/shadow/
                   gross normalization (BigInt only, no floats)
   decimal.ts      Exact 6-dp shares / 10-dp half-up gross price rendering
   storage.ts      Append-only NDJSON evidence store, reorg tombstones,
-                  native event identity (chainId:emitter:txHash:logIndex)
-  watcher.ts      Completeness-first WSS + eth_getLogs backfill watcher,
-                  removed-log tombstones, retry queue, reorg rewind
-  config.ts       Fail-closed config (presence-based credential guard)
-  egress.ts       Application-level egress allowlist (HTTP RPC + WSS +
-                  public data APIs only)
+                  durable dispositions, native event identity
+  watcher.ts      Completeness-first WSS + eth_getLogs backfill watcher;
+                  single-flight recovery, generation-guarded concurrency
+  config.ts       Fail-closed config (refuses to start with any key material)
+  egress.ts       Application-level egress allowlist (RPC + public data APIs only)
   main.ts         Entrypoint
 src/compare/
   poly2-adapter.ts  Phase 4 ONLY: maps Shadow observations to candidate Poly2
                     canonical keys; unmatched records stay visible. Never
                     imported by the collector.
+scripts/
+  static-safety.mjs  CI gate: banned deps, network-client confinement,
+                     signing-API ban — exits non-zero on any violation
 tests/
+  exit-audit.test.ts   Phase 2 exit-audit acceptance matrix (8 cases)
   fixtures/v2_fills.json  Real production receipts (5 trades, 3 wallets,
                           both exchanges, BUY+SELL, rounding + fee cases,
                           the 37-fill multi-fill transaction)
-  watcher.test.ts         Failure/restart/reorg flows through the real watcher
 ```
 
 ## Run
 
 ```bash
 npm ci --ignore-scripts
-npm test        # vitest: fixtures from real Polygon receipts
+npm test        # vitest: fixtures from real Polygon receipts + acceptance matrix
 npm run build   # tsc --noEmit
+npm run safety  # static safety gate
 
 SHADOW_WATCHED_WALLETS=0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029 \
   npm start     # observation only; writes to ./shadow-data/
@@ -77,8 +80,9 @@ alternative to Poly2.
 
 ## Hard boundaries
 
-- No deployment automation exists in this repo; GitHub Actions stay disabled
-  until a reviewed, GitHub-hosted, test-only workflow is introduced.
+- GitHub Actions in this repo are test-only (`.github/workflows/test.yml`):
+  typecheck, fixture tests, the static safety gate, and bounded startup
+  smoke checks. No deployment automation exists.
 - No connection to Poly2's production database, hosts, or credentials.
 - Comparison against Poly2 uses exported, read-only records only (Phase 4).
 - Upstream updates are never merged automatically.
