@@ -66,6 +66,13 @@
   primary, apples-to-apples comparison; **no auto wallet discovery**) and
   SHADOW_EXPLORATORY (reported separately, never mixed in). Cohorts come
   from a frozen `cohorts.json` only.
+- **Which wallets are compared**: the CONTROLLED_OVERLAP list is exactly the
+  wallet set Poly2 follows, frozen in `cohorts.json` at window seal time —
+  it is an experiment input, not derived by Shadow. **Status: not yet
+  frozen** (gate item 1 pending; the default observed wallet today is the
+  Poly2-approved `0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029`, see
+  "Watched-wallet testing assumptions"). SHADOW_EXPLORATORY count is
+  currently **0** — no exploratory wallets are enrolled.
 - **Raw vs usable discovery**: raw = min `sourceFirstSeenUtc` across
   independent source observations (arrival evidence, NOT racer FIRST
   order); usable = earliest time a group has full decision fields
@@ -78,6 +85,26 @@
   / NOT_HYDRATED / MAKER_ONLY / TOO_LATE / NO_MEANINGFUL_ADVANTAGE, with
   Poly2's 300 s freshness budget modeled (contract §7).
 - **Frozen window**: 24 h, both exports sealed before comparison (contract §8).
+
+## What has been proven / not proven (as of Phase 4 draft)
+
+**Proven:**
+- Read-only multi-source observation is implementable with durable,
+  restart-idempotent evidence (Phase 2, live-smoked) and source-independent
+  racing/reconciliation (Phase 3, merged at `f22f3acf…`).
+- RPC head-lag is handled fail-soft; reorg recovery is fail-closed without a
+  proved ancestor.
+- The Phase 4 comparison machinery (cohorts, matching classes, raw/usable
+  timing, decision relevance, dashboard) is implemented and fixture-tested
+  (77/77 tests, tsc clean, static safety gate OK).
+
+**Not proven:**
+- Whether Shadow discovers real wallet activity faster or more completely
+  than Poly2 — requires gate items 1, 11, 12 (frozen cohort + bounded real
+  24 h comparison + full metrics) against a real Poly2 export. No real
+  Poly2-vs-Shadow numbers exist yet; fixture results are smoke evidence only.
+- Automatic wallet discovery quality — research-only feasibility notes in
+  WALLET_DISCOVERY_FEASIBILITY.md; no ranking by future outcomes.
 
 ## Source definitions
 
