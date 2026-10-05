@@ -74,13 +74,19 @@ alternative to Poly2.
   the rotation mechanism. Guidance: restart the observer at least daily
   during long research runs; production-grade rotation is a separate
   operational gate before any long unattended canary.
-- **Recovery semantics**: reorg recovery requires a PROVED common ancestor
-  (stored checkpoint hash matching the provider). When no checkpoint matches
-  within the 128-block lookback, the watcher fails closed: it quarantines an
-  explicitly labeled *unverified bounded rewind* rather than claiming an
-  ancestor it cannot prove. Raw identities whose block hash conflicts with
-  the provider are invalidated terminally (`HASH_CONFLICT` tombstone) so
-  replay can never revive them.
+- **Recovery semantics**: scanning persists dense block-hash checkpoints
+  (spacing 16, guaranteed < the 128-block reorg lookback), so a common
+  ancestor within the supported depth is always PROVABLE against a genuinely
+  stored hash. If no stored checkpoint matches inside the walk window,
+  recovery fails closed: a hard `recoveryRequired` quarantine is recorded,
+  the cursor is NOT advanced to an unverified provider hash, nothing is
+  tombstoned, and automatic scanning does not resume — bounded manual
+  recovery is a later operator action. A removal/reorg tombstone (any
+  reason) dominates a PENDING disposition for that exact blockHash-aware
+  identity forever (`REMOVED_INVALID`): only a new raw row under a NEW
+  blockHash is new evidence, and the in-memory retry queue can never revive
+  a removed identity. Raw identities whose block hash conflicts with the
+  provider are invalidated terminally (`HASH_CONFLICT` tombstone).
 - **Liveness vs freshness**: connection liveness counts any sign of life
   (subscription messages and pongs); event freshness is a Phase 3 concern.
 - The application remains **incapable of trading** — no signing, no keys, no
