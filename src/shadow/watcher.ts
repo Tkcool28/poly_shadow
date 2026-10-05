@@ -53,6 +53,12 @@ export class ReorgSignal extends Error {
   }
 }
 
+/** Provider lag only: six attempts; 100/200/400/800/1600ms (3.1s total). */
+const PROVIDER_LAG_ATTEMPTS = 6;
+const providerLagBackoff = (attempt: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, 100 * 2 ** attempt));
+class ProviderLagError extends Error {}
+
 /** How far back common-ancestor search may walk (blocks). */
 const REORG_LOOKBACK = 128;
 /**
@@ -476,16 +482,23 @@ export class ChainWatcher {
     }
   }
 
+  /** Null is an unavailable block, never proof of a hash conflict. */
+  private async providerBlock(blockNumber: number): Promise<{ hash: string; timestamp: string }> {
+    for (let attempt = 0; attempt < PROVIDER_LAG_ATTEMPTS; attempt++) {
+      const block = await this.rpc<{ hash: string; timestamp: string } | null>(
+        this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber',
+        ['0x' + blockNumber.toString(16), false],
+      );
+      if (block) return block;
+      if (attempt + 1 < PROVIDER_LAG_ATTEMPTS) await providerLagBackoff(attempt);
+    }
+    throw new ProviderLagError(`block ${blockNumber} not yet available from provider after ${PROVIDER_LAG_ATTEMPTS} attempts`);
+  }
+
   private async blockRef(blockNumber: number, blockHash: string): Promise<BlockRef> {
     const cached = this.blockCache.get(blockNumber);
     if (cached && cached.hash.toLowerCase() === blockHash.toLowerCase()) return cached;
-    const b = await this.rpc<{ hash: string; timestamp: string } | null>(
-      this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber',
-      ['0x' + blockNumber.toString(16), false],
-    );
-    // Provider head lag: block unknown to this node yet — transient, retried
-    // by the caller's PENDING path (never a hash conflict).
-    if (!b) throw new Error(`block ${blockNumber} not yet available from provider`);
+    const b = await this.providerBlock(blockNumber);
     if (b.hash.toLowerCase() !== blockHash.toLowerCase()) {
       throw new ReorgSignal(blockNumber); // caller records + recovers
     }
@@ -510,10 +523,7 @@ export class ChainWatcher {
   async validateCursor(): Promise<void> {
     const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
     if (!cursor) return;
-    const head = await this.rpc<{ hash: string }>(
-      this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber',
-      ['0x' + cursor.blockNumber.toString(16), false],
-    );
+    const head = await this.providerBlock(cursor.blockNumber);
     if (head.hash.toLowerCase() === cursor.blockHash.toLowerCase()) return;
 
     const stored = this.store.latestBlockHashes();
@@ -521,10 +531,7 @@ export class ChainWatcher {
     for (let n = cursor.blockNumber - 1; n >= cursor.blockNumber - REORG_LOOKBACK && n > 0; n--) {
       const known = stored.get(n);
       if (!known) continue;
-      const b = await this.rpc<{ hash: string }>(
-        this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber',
-        ['0x' + n.toString(16), false],
-      );
+      const b = await this.providerBlock(n);
       if (b.hash.toLowerCase() === known.toLowerCase()) { ancestor = n; break; }
     }
 
@@ -546,10 +553,7 @@ export class ChainWatcher {
     }
 
     const target = ancestor;
-    const targetBlock = await this.rpc<{ hash: string }>(
-      this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber',
-      ['0x' + target.toString(16), false],
-    );
+    const targetBlock = await this.providerBlock(target);
     this.store.appendQuarantine({
       kind: 'REORG_ANOMALY',
       detail: {
@@ -678,7 +682,14 @@ export class ChainWatcher {
   /** Resume from durable cursor; then periodic verification backfill.
    *  Public for tests; production entry is the subscription-ack handler. */
   async backfillFromCursor(): Promise<void> {
-    await this.validateCursor();
+    try {
+      await this.validateCursor();
+    } catch (err) {
+      if (err instanceof ProviderLagError) this.startVerifier(true);
+      // ACK caller records the exhaustion once. Next tick must redo startup
+      // validation and durable replay, never skip to an unvalidated scan.
+      throw err;
+    }
     if (this.recoveryRequired) return; // fail-closed: no automatic resume
     await this.replayIncompleteFromStore();
     const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
@@ -694,26 +705,42 @@ export class ChainWatcher {
     this.startVerifier();
   }
 
-  private startVerifier(): void {
+  private startVerifier(retryStartup = false): void {
     if (this.verifier) clearInterval(this.verifier);
     this.verifier = setInterval(() => {
       void this.runExclusive(async () => {
+        if (retryStartup) {
+          await this.backfillFromCursor();
+          return;
+        }
         await this.validateCursor();
         if (this.recoveryRequired) return; // fail-closed: no automatic resume
         await this.processRetries();
         const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
-        if (!cursor) return;
         const latestHex = await this.rpc<string>(this.cfg.polygonHttpRpcUrl, 'eth_blockNumber', []);
-        await this.scanRange(cursor.blockNumber + 1, parseInt(latestHex, 16));
+        const latest = parseInt(latestHex, 16);
+        // Initial lag may leave no committed cursor. Retry the same bounded
+        // first-start overlap policy rather than making every tick a no-op.
+        await this.scanRange(cursor ? cursor.blockNumber + 1 : Math.max(0, latest - FIRST_START_OVERLAP_BLOCKS), latest);
       }).catch((err) => this.recordFailure('verifier', err));
     }, this.cfg.verifyIntervalMs);
   }
 
   /** Scan [from, to] with eth_getLogs; cursor advances only after commit. */
   async scanRange(from: number, to: number): Promise<void> {
+    try {
+      await this.scanChunks(from, to);
+    } catch (err) {
+      if (!(err instanceof ProviderLagError)) throw err;
+      // One visible failure per exhausted scan; verifier retries the cursor.
+      this.recordFailure('scanRange', err);
+    }
+  }
+
+  private async scanChunks(from: number, to: number): Promise<void> {
     if (from > to) return;
     const chunk = this.cfg.backfillChunkBlocks;
-    for (let start = from; start <= to; start += chunk) {
+    for (let start = from; start <= to;) {
       let end = Math.min(start + chunk - 1, to);
       const params = (e: number) => [{
         address: [...V2_EXCHANGES],
@@ -721,42 +748,47 @@ export class ChainWatcher {
         fromBlock: '0x' + start.toString(16),
         toBlock: '0x' + e.toString(16),
       }];
-      let logs: Array<RawLog & { blockHash: string }>;
-      try {
-        logs = await this.rpc(this.cfg.polygonHttpRpcUrl, 'eth_getLogs', params(end));
-      } catch (err) {
-        if (!/invalid block range/i.test(String(err))) throw err;
-        // Load-balanced provider head lag: eth_blockNumber was answered by a
-        // node ahead of the one serving eth_getLogs. Re-fetch the head,
-        // clamp, and retry once; if the head is behind our start, stop the
-        // scan — the cursor simply does not advance past committed chunks.
-        const latestHex = await this.rpc<string>(this.cfg.polygonHttpRpcUrl, 'eth_blockNumber', []);
-        const latest = parseInt(latestHex, 16);
-        if (latest < start) break;
-        end = Math.min(end, latest);
-        logs = await this.rpc(this.cfg.polygonHttpRpcUrl, 'eth_getLogs', params(end));
+      let logs: Array<RawLog & { blockHash: string }> = [];
+      for (let attempt = 0; attempt < PROVIDER_LAG_ATTEMPTS; attempt++) {
+        try {
+          logs = await this.rpc(this.cfg.polygonHttpRpcUrl, 'eth_getLogs', params(end));
+          break;
+        } catch (err) {
+          if (!/invalid block range/i.test(String(err))) throw err;
+          // A different backend may answer the head request. Clamp on every
+          // rejected range, never expand the current chunk during retries.
+          const latestHex = await this.rpc<string>(this.cfg.polygonHttpRpcUrl, 'eth_blockNumber', []);
+          const latest = parseInt(latestHex, 16);
+          if (latest < start) return; // no safe work yet; last cursor stays
+          end = Math.min(end, latest);
+          if (attempt + 1 === PROVIDER_LAG_ATTEMPTS) {
+            throw new ProviderLagError(`eth_getLogs exhausted ${PROVIDER_LAG_ATTEMPTS} attempts: ${String(err)}`);
+          }
+          await providerLagBackoff(attempt);
+        }
       }
       for (const log of logs) {
         await this.handleLog(log);
+        const key = `${this.cfg.chainId}:${log.address.toLowerCase()}:` +
+          `${log.transactionHash}:${Number(log.logIndex)}:${log.blockHash.toLowerCase()}`;
+        // handleLog already recorded the failure and durable PENDING state.
+        // Stop here rather than fetching the same missing block again and
+        // emitting a duplicate failure or advancing past unavailable evidence.
+        // Tombstoned/conflicting evidence must not advance the cursor before
+        // queued reorg recovery validates the old cursor and proves ancestry.
+        if (!this.seenRaw.has(key) || this.seenRemoved.has(key)) return;
       }
-      // Transient failures are PENDING (durable) + queued in memory; both
-      // paths recover them. Cursor advancement strands nothing.
       // Dense rolling checkpoints: spacing < REORG_LOOKBACK guarantees a
       // genuinely stored hash inside any ancestor-walk window, so a routine
       // shallow reorg can always be PROVED (never silently unverified).
       for (let n = start; n < end; n += CHECKPOINT_SPACING) {
-        const cp = await this.rpc<{ hash: string }>(
-          this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber', ['0x' + n.toString(16), false],
-        );
+        const cp = await this.providerBlock(n);
         this.store.appendBlockHash({
           chainId: this.cfg.chainId, blockNumber: n, blockHash: cp.hash,
           firstSeenUtc: this.nowIso(),
         });
       }
-      const head = await this.rpc<{ hash: string } | null>(
-        this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber', ['0x' + end.toString(16), false],
-      );
-      if (!head) break; // provider head lag on block fetch: stop; cursor stays
+      const head = await this.providerBlock(end);
       // Append-only block-hash evidence for common-ancestor detection.
       this.store.appendBlockHash({
         chainId: this.cfg.chainId, blockNumber: end, blockHash: head.hash,
@@ -769,6 +801,8 @@ export class ChainWatcher {
         blockHash: head.hash,
         updatedAtUtc: this.nowIso(),
       });
+      // Clamping may shorten a chunk: continue at its actual committed end.
+      start = end + 1;
     }
   }
 }

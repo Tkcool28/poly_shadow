@@ -12,6 +12,17 @@ endpoints; **[planned]** / **[not validated]** = explicitly not yet.
   neg-risk) and both V2 topic0s; watched-wallet filtering post-decode.
 - `eth_getLogs` backfill gated on the subscription ack; 64-block first-start
   overlap; periodic verifier rescan.
+- Provider-lag policy: only `invalid block range` and null block responses
+  receive six total attempts, with 100/200/400/800/1600ms backoffs (3.1s
+  cumulative wait, excluding RPC duration). Range retries re-read the head
+  and only clamp downward; null blocks never establish a hash conflict.
+  Exhaustion remains a visible transient failure; PENDING/raw arrival
+  evidence survives, and unavailable evidence cannot advance the cursor.
+  Startup cursor-validation exhaustion arms the existing verifier cadence
+  to repeat validation and durable startup replay before scanning; real
+  mismatches still require proved ancestry or fail closed. Scanned
+  tombstoned/hash-conflicted identities stop cursor advancement before
+  queued recovery can validate the pre-scan cursor.
 - Durable dispositions (OBSERVED / COMPLETED_NO_OBSERVATION /
   TERMINAL_QUARANTINE / REMOVED_INVALID / PENDING) make restart delivery
   idempotent; tombstones (any reason) dominate PENDING forever.
@@ -57,11 +68,15 @@ low-latency chain discovery.
 - `RacingStore`: append-only `rest_raw`, `poll_telemetry`,
   `source_observations`, `reconciliation` NDJSON.
 - `Reconciler`: per economic-trade candidate group
-  (`econ:{tx}:{asset}:{size6}`), the first source to arrive is `FIRST`;
-  later sources are `CORROBORATOR`. Durable rows seed the in-memory winner
-  set at startup, so the winner survives restarts and is never overwritten
-  by later arrivals (even ones with earlier source timestamps — arrival
-  order at this observer is the recorded fact).
+  (`econ:{tx}:{asset}:{size6}`), the first source to commit reconciliation
+  is `FIRST`; later sources are `CORROBORATOR`. Durable rows seed the
+  in-memory winner set at startup, so the winner survives restarts and is
+  never overwritten by later commits (even ones with earlier source timestamps).
+  **Phase 4 caveat:** `FIRST` reflects reconciliation commit order, not
+  necessarily earliest raw arrival. Chain block hydration/provider-lag
+  retries can delay commit despite an earlier preserved `sourceFirstSeenUtc`.
+  Compare raw/source arrival timestamps separately; racing semantics are
+  unchanged in this provider-lag fix.
 - Sources never validate/canonicalize each other. A chain observation and a
   REST observation of the same trade coexist independently; the racer only
   records that they appear to describe the same economic trade.

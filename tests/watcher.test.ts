@@ -8,7 +8,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ChainWatcher, ReorgSignal } from '../src/shadow/watcher.js';
 import { ShadowStore } from '../src/shadow/storage.js';
 import type { ShadowConfig } from '../src/shadow/config.js';
@@ -123,7 +123,380 @@ function tempStore(): ShadowStore {
   dirs.push(d);
   return new ShadowStore(d);
 }
-afterEach(() => { while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true }); });
+afterEach(() => {
+  vi.useRealTimers();
+  while (dirs.length) rmSync(dirs.pop()!, { recursive: true, force: true });
+});
+
+/** Load-balanced provider: advertised head can lead the log/block backend. */
+function lagRpc() {
+  const state = {
+    head: 105, safeHead: 102, invalids: 0, nulls: 0,
+    nullAt: 100, withLog: false, mismatch: false,
+    ranges: [] as number[][], blockCalls: [] as number[], headCalls: 0,
+  };
+  const rpc = async <T>(_url: string, method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_blockNumber') {
+      state.headCalls++;
+      return ('0x' + state.safeHead.toString(16)) as T;
+    }
+    if (method === 'eth_getLogs') {
+      const p = params[0] as { fromBlock: string; toBlock: string };
+      const start = parseInt(p.fromBlock, 16), end = parseInt(p.toBlock, 16);
+      state.ranges.push([start, end]);
+      if (state.invalids-- > 0 || end > state.safeHead) throw new Error('invalid block range');
+      return (state.withLog ? [fillLog(100, BLOCK_A)] : []) as T;
+    }
+    if (method === 'eth_getBlockByNumber') {
+      const n = parseInt(params[0] as string, 16);
+      state.blockCalls.push(n);
+      if (n === state.nullAt && state.nulls-- > 0) return null as T;
+      return { hash: state.mismatch ? BLOCK_B : BLOCK_A, timestamp: '0x64' } as T;
+    }
+    throw new Error(`unexpected method ${method}`);
+  };
+  return { state, rpc: rpc as typeof import('../src/shadow/egress.js').rpcCall };
+}
+
+async function settleRetries(work: Promise<unknown>) {
+  // Attach rejection handling before advancing timers (no unhandled rejection).
+  const result = work.then(() => null, (error: unknown) => error);
+  await vi.runAllTimersAsync();
+  expect(await result).toBeNull();
+}
+
+describe('bounded provider-lag retries', () => {
+  it.each(['block', 'range'])('time-based %s availability after 1.2s succeeds within the bounded budget', async (kind) => {
+    vi.useFakeTimers();
+    const store = tempStore();
+    const started = Date.now();
+    const attempts: number[] = [];
+    const { state, rpc } = lagRpc();
+    state.safeHead = 100; state.withLog = true;
+    const timedRpc: typeof rpc = async <T>(url: string, method: string, params: unknown[]): Promise<T> => {
+      if (method === (kind === 'block' ? 'eth_getBlockByNumber' : 'eth_getLogs')) {
+        const elapsed = Date.now() - started;
+        attempts.push(elapsed);
+        if (elapsed <= 1203) {
+          if (kind === 'block') return null as T;
+          throw new Error('invalid block range');
+        }
+      }
+      return rpc<T>(url, method, params);
+    };
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), timedRpc);
+    const work = w.scanRange(100, 100);
+    await vi.advanceTimersByTimeAsync(1204);
+    expect(store.observations()).toHaveLength(0);
+    expect(store.quarantine()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(296);
+    await work;
+    expect(attempts.slice(0, 5)).toEqual([0, 100, 300, 700, 1500]);
+    expect(store.observations()).toHaveLength(1);
+    expect(store.rawLogs()).toHaveLength(1);
+    expect(store.observations()[0]!.sourceFirstSeenUtc).toBe(store.rawLogs()[0]!.firstSeenUtc);
+    expect(store.readCursor('https://rpc.test')?.blockNumber).toBe(100);
+    expect(store.quarantine()).toHaveLength(0);
+  });
+
+  it.each(['block', 'range'])('time-based %s exhaustion is bounded to six attempts and one failure at 3.1s', async (kind) => {
+    vi.useFakeTimers();
+    const store = tempStore();
+    const started = Date.now();
+    const attempts: number[] = [];
+    const { state, rpc } = lagRpc();
+    state.safeHead = 100; state.withLog = true;
+    const unavailableRpc: typeof rpc = async <T>(url: string, method: string, params: unknown[]): Promise<T> => {
+      if (method === (kind === 'block' ? 'eth_getBlockByNumber' : 'eth_getLogs')) {
+        attempts.push(Date.now() - started);
+        if (kind === 'block') return null as T;
+        throw new Error('invalid block range');
+      }
+      return rpc<T>(url, method, params);
+    };
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), unavailableRpc);
+    const work = w.scanRange(100, 100);
+    await vi.advanceTimersByTimeAsync(3099);
+    expect(store.quarantine()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await work;
+    expect(attempts).toEqual([0, 100, 300, 700, 1500, 3100]);
+    expect(store.quarantine().map((q) => q.kind)).toEqual(['TRANSIENT_FAILURE']);
+    expect(store.observations()).toHaveLength(0);
+    expect(store.readCursor('https://rpc.test')).toBeNull();
+    expect(store.tombstones()).toHaveLength(0);
+    if (kind === 'block') expect([...store.dispositionIndex().values()]).toEqual(['PENDING']);
+  });
+
+  it('startup stored cursor null exhaustion keeps verifier active and validates on its next cycle', async () => {
+    vi.useFakeTimers();
+    const store = tempStore();
+    const { state, rpc } = lagRpc();
+    state.nulls = 6; state.safeHead = 101;
+    store.advanceCursor({ provider: 'https://rpc.test', blockNumber: 100, blockHash: BLOCK_A, updatedAtUtc: clock()() });
+    const before = store.readCursor('https://rpc.test');
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+    try {
+      // Production ACK handler records exactly one startup failure.
+      const recorded = w.backfillFromCursor().catch((err) =>
+        (w as unknown as { recordFailure(where: string, err: unknown): void }).recordFailure('backfill', err));
+      await vi.advanceTimersByTimeAsync(3100);
+      await recorded;
+      expect(vi.getTimerCount()).toBe(1);
+      expect(state.blockCalls).toEqual([100, 100, 100, 100, 100, 100]);
+      expect(state.ranges).toHaveLength(0);
+      expect(store.readCursor('https://rpc.test')).toEqual(before);
+      expect(store.quarantine().map((q) => q.kind)).toEqual(['TRANSIENT_FAILURE']);
+      expect(store.tombstones()).toHaveLength(0);
+      expect(w.recoveryRequired).toBe(false);
+      expect(vi.getTimerCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(state.blockCalls[6]).toBe(100); // validate BEFORE scanning
+      expect(state.ranges).toEqual([[101, 101]]);
+      expect(store.readCursor('https://rpc.test')?.blockNumber).toBe(101);
+      expect(store.quarantine()).toHaveLength(1);
+    } finally { w.stop(); }
+  });
+  it('removal during a null retry dominates eventual hydration and restart replay', async () => {
+    vi.useFakeTimers();
+    const store = tempStore();
+    const { state, rpc } = lagRpc();
+    state.nulls = 4;
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+    const work = w.handleLog(fillLog(100, BLOCK_A));
+    await vi.advanceTimersByTimeAsync(300);
+    await w.handleLog(fillLog(100, BLOCK_A, 7, true));
+    await vi.advanceTimersByTimeAsync(1200);
+    await work;
+    await w.processRetries();
+    expect(store.rawLogs()).toHaveLength(1);
+    expect(store.observations()).toHaveLength(0);
+    expect(store.tombstones().map((t) => t.reason)).toEqual(['REMOVED_FLAG']);
+    expect([...store.dispositionIndex().values()]).toEqual(['REMOVED_INVALID']);
+    const restarted = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+    expect(await restarted.replayIncompleteFromStore()).toBe(0);
+    expect(store.quarantine()).toHaveLength(0);
+  });
+
+  it.each([true, false])('real cursor mismatch waits for unavailable ancestor; provable=%s preserves fail-closed recovery', async (provable) => {
+    vi.useFakeTimers();
+    const store = tempStore();
+    const { state, rpc } = lagRpc();
+    state.nullAt = 99; state.nulls = 6;
+    store.appendBlockHash({ chainId: 137, blockNumber: 99, blockHash: BLOCK_A, firstSeenUtc: clock()() });
+    store.advanceCursor({ provider: 'https://rpc.test', blockNumber: 100, blockHash: BLOCK_A, updatedAtUtc: clock()() });
+    const ancestorRpc: typeof rpc = async <T>(url: string, method: string, params: unknown[]): Promise<T> => {
+      if (method === 'eth_getBlockByNumber' && params[0] === '0x64') return { hash: BLOCK_B, timestamp: '0x64' } as T;
+      state.mismatch = !provable;
+      return rpc<T>(url, method, params);
+    };
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), ancestorRpc);
+    const initial = w.validateCursor().catch((err) => err);
+    await vi.advanceTimersByTimeAsync(3100);
+    expect(String(await initial)).toContain('after 6 attempts');
+    expect(store.readCursor('https://rpc.test')?.blockNumber).toBe(100);
+    expect(store.tombstones()).toHaveLength(0);
+    expect(store.quarantine()).toHaveLength(0);
+    expect(w.recoveryRequired).toBe(false); // unavailable is not unprovable
+    await w.validateCursor();
+    expect(w.recoveryRequired).toBe(!provable);
+    expect(store.readCursor('https://rpc.test')?.blockNumber).toBe(provable ? 99 : 100);
+    expect(store.quarantine()).toHaveLength(1);
+    expect(store.quarantine()[0]!.detail['ancestorVerified']).toBe(provable);
+  });
+
+  it('live and scan concurrent same identity during null hydration commit exactly once', async () => {
+    vi.useFakeTimers();
+    const store = tempStore();
+    const { state, rpc } = lagRpc();
+    state.nulls = 4; state.withLog = true; state.safeHead = 100;
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+    const live = w.handleLog(fillLog(100, BLOCK_A));
+    const scan = w.scanRange(100, 100);
+    await vi.advanceTimersByTimeAsync(1500);
+    await Promise.all([live, scan]);
+    await w.processRetries();
+    expect(store.rawLogs()).toHaveLength(1);
+    expect(store.observations()).toHaveLength(1);
+    expect([...store.dispositionIndex().values()]).toEqual(['OBSERVED']);
+    expect(store.observations()[0]!.sourceFirstSeenUtc).toBe(store.rawLogs()[0]!.firstSeenUtc);
+    expect(store.quarantine()).toHaveLength(0);
+    expect(store.readCursor('https://rpc.test')?.blockNumber).toBe(100);
+  });
+
+  it('scan-discovered hash conflict cannot advance the cursor ahead of queued recovery', async () => {
+    const store = tempStore();
+    const { state, rpc } = lagRpc();
+    state.mismatch = true;
+    store.advanceCursor({ provider: 'https://rpc.test', blockNumber: 100, blockHash: BLOCK_A, updatedAtUtc: clock()() });
+    const conflictRpc: typeof rpc = async <T>(url: string, method: string, params: unknown[]): Promise<T> => {
+      if (method === 'eth_getLogs') return [fillLog(101, BLOCK_A)] as T;
+      return rpc<T>(url, method, params);
+    };
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), conflictRpc);
+    const internals = w as unknown as { runExclusive(fn: () => Promise<void>): Promise<void> };
+    await internals.runExclusive(() => w.scanRange(101, 101));
+    await internals.runExclusive(async () => {}); // drain queued recovery
+    expect(store.readCursor('https://rpc.test')?.blockNumber).toBe(100);
+    expect(w.recoveryRequired).toBe(true);
+    expect(store.tombstones().map((t) => t.reason)).toEqual(['HASH_CONFLICT']);
+    expect(store.observations()).toHaveLength(0);
+  });
+
+  it('clamps H to backend H-N and scans the next chunk without a gap', async () => {
+    vi.useFakeTimers();
+    const store = tempStore();
+    const { state, rpc } = lagRpc();
+    const w = new ChainWatcher({ ...cfg(store.dir), backfillChunkBlocks: 4 }, store, clock(), rpc);
+    await settleRetries(w.scanRange(100, state.head));
+    expect(state.ranges).toEqual([[100, 103], [100, 102], [103, 105]]);
+    expect(store.readCursor('https://rpc.test')?.blockNumber).toBe(102);
+    expect(store.quarantine()).toHaveLength(0);
+    state.safeHead = 105;
+    await settleRetries(w.scanRange(103, 105));
+    expect(store.readCursor('https://rpc.test')?.blockNumber).toBe(105);
+  });
+
+  it('retries two invalid ranges before success without duplicate observations', async () => {
+    vi.useFakeTimers();
+    const store = tempStore();
+    const { state, rpc } = lagRpc();
+    state.safeHead = 100; state.invalids = 2; state.withLog = true;
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+    await settleRetries(w.scanRange(100, 100));
+    expect(state.ranges).toHaveLength(3);
+    expect(state.headCalls).toBe(2);
+    expect(store.observations()).toHaveLength(1);
+    expect(store.rawLogs()).toHaveLength(1);
+    expect(store.quarantine()).toHaveLength(0);
+    expect(store.readCursor('https://rpc.test')?.blockNumber).toBe(100);
+  });
+
+  it('null, null, success backs off 100/200ms and preserves arrival exactly once', async () => {
+    vi.useFakeTimers();
+    const store = tempStore();
+    const { state, rpc } = lagRpc();
+    state.nulls = 2;
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+    const work = Promise.all([w.handleLog(fillLog(100, BLOCK_A)), w.handleLog(fillLog(100, BLOCK_A))]);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(state.blockCalls).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(state.blockCalls).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(199);
+    expect(store.observations()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    await work;
+    await w.processRetries();
+    expect(state.blockCalls).toHaveLength(3);
+    expect(store.rawLogs()).toHaveLength(1);
+    expect(store.observations()).toHaveLength(1);
+    expect(store.observations()[0]!.sourceFirstSeenUtc).toBe(store.rawLogs()[0]!.firstSeenUtc);
+    expect(store.quarantine()).toHaveLength(0);
+    expect(store.tombstones()).toHaveLength(0);
+  });
+
+  it('null exhaustion emits one failure, stops the cursor, and restart replays PENDING', async () => {
+    vi.useFakeTimers();
+    const store = tempStore();
+    const { state, rpc } = lagRpc();
+    state.nulls = 6; state.withLog = true; state.safeHead = 100;
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+    await settleRetries(w.scanRange(100, 100));
+    expect(state.blockCalls).toHaveLength(6);
+    expect(store.quarantine()).toHaveLength(1);
+    expect(store.quarantine()[0]!.kind).toBe('TRANSIENT_FAILURE');
+    expect(store.tombstones()).toHaveLength(0);
+    expect(store.readCursor('https://rpc.test')).toBeNull();
+    expect([...store.dispositionIndex().values()]).toEqual(['PENDING']);
+    expect(w.recoveryRequired).toBe(false);
+    const restarted = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+    expect(await restarted.replayIncompleteFromStore()).toBe(1);
+    await restarted.handleLog(fillLog(100, BLOCK_A));
+    expect(store.observations()).toHaveLength(1);
+    expect(store.rawLogs()).toHaveLength(1);
+    expect(store.quarantine()).toHaveLength(1);
+    expect(store.observations()[0]!.sourceFirstSeenUtc).toBe(store.rawLogs()[0]!.firstSeenUtc);
+  });
+
+  it('invalid-range exhaustion emits one failure and preserves the last cursor', async () => {
+    vi.useFakeTimers();
+    const store = tempStore();
+    const { state, rpc } = lagRpc();
+    state.safeHead = 105;
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+    await w.scanRange(99, 99);
+    state.invalids = 6;
+    await settleRetries(w.scanRange(100, 105));
+    expect(state.ranges.slice(1)).toHaveLength(6);
+    expect(store.quarantine()).toHaveLength(1);
+    expect(store.readCursor('https://rpc.test')?.blockNumber).toBe(99);
+  });
+
+  it.each([100, 102])('null checkpoint/end %s exhaustion never advances the cursor', async (nullAt) => {
+    vi.useFakeTimers();
+    const store = tempStore();
+    const { state, rpc } = lagRpc();
+    state.nullAt = nullAt; state.nulls = 6;
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+    await w.scanRange(99, 99);
+    await settleRetries(w.scanRange(100, 102));
+    expect(state.blockCalls.filter((n) => n === nullAt)).toHaveLength(6);
+    expect(store.readCursor('https://rpc.test')?.blockNumber).toBe(99);
+    expect(store.quarantine()).toHaveLength(1);
+  });
+
+  it('cursor validation retries null without entering reorg recovery', async () => {
+    vi.useFakeTimers();
+    const store = tempStore();
+    const { state, rpc } = lagRpc();
+    store.advanceCursor({ provider: 'https://rpc.test', blockNumber: 100, blockHash: BLOCK_A, updatedAtUtc: clock()() });
+    state.nulls = 2;
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+    await settleRetries(w.validateCursor());
+    expect(state.blockCalls).toHaveLength(3);
+    expect(w.recoveryRequired).toBe(false);
+    expect(store.quarantine()).toHaveLength(0);
+    expect(store.readCursor('https://rpc.test')?.blockNumber).toBe(100);
+  });
+
+  it('first-start lag with no cursor is retried by the next verifier tick', async () => {
+    vi.useFakeTimers();
+    const store = tempStore();
+    const { state, rpc } = lagRpc();
+    state.safeHead = 105; state.invalids = 1;
+    // The initial head leads the backend, whose re-read is below chunk start.
+    let heads = 0;
+    const firstStartRpc: typeof rpc = async <T>(url: string, method: string, params: unknown[]): Promise<T> => {
+      if (method === 'eth_blockNumber' && heads++ < 2) {
+        return (heads === 1 ? '0x69' : '0x28') as T; // 105, then 40 (< 41)
+      }
+      return rpc<T>(url, method, params);
+    };
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), firstStartRpc);
+    try {
+      await w.backfillFromCursor();
+      expect(store.readCursor('https://rpc.test')).toBeNull();
+      expect(store.quarantine()).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(store.readCursor('https://rpc.test')?.blockNumber).toBe(105);
+      expect(store.quarantine()).toHaveLength(0);
+    } finally { w.stop(); }
+  });
+
+  it('null then a real hash mismatch still tombstones as a reorg', async () => {
+    vi.useFakeTimers();
+    const store = tempStore();
+    const { state, rpc } = lagRpc();
+    state.nulls = 1; state.mismatch = true;
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+    await settleRetries(w.handleLog(fillLog(100, BLOCK_A)));
+    expect(state.blockCalls).toHaveLength(2);
+    expect(store.observations()).toHaveLength(0);
+    expect(store.tombstones().map((t) => t.reason)).toEqual(['HASH_CONFLICT']);
+    expect(store.quarantine().map((q) => q.kind)).toEqual(['REORG_ANOMALY']);
+  });
+});
 
 describe('watcher evidence safety', () => {
   it('removed notice is never swallowed by dedup; re-inclusion in a new block is new evidence', async () => {
