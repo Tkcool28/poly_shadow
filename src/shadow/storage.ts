@@ -100,6 +100,9 @@ export type Disposition =
   | 'COMPLETED_NO_OBSERVATION' // valid terminal, no observation by design
                                // (OrdersMatched, unwatched, redundant leg, foreign)
   | 'TERMINAL_QUARANTINE'      // malformed/conflicted — never replay
+  | 'REMOVED_INVALID'          // a removal/reorg tombstone dominates this exact
+                               // blockHash-aware identity — never replay; only a
+                               // NEW raw row with a NEW blockHash is new evidence
   | 'PENDING';                 // transient failure — replay at startup
 
 export interface DispositionRow {
@@ -216,6 +219,20 @@ export class ShadowStore {
     const m = new Map<number, string>();
     for (const r of this.blockHashes()) m.set(r.blockNumber, r.blockHash);
     return m;
+  }
+
+  /**
+   * Every tombstoned blockHash-aware identity (ALL reasons — REMOVED_FLAG,
+   * REORG_REWIND, HASH_CONFLICT). A tombstone dominates any PENDING state for
+   * that exact identity forever; only a raw row under a NEW blockHash is new
+   * evidence (and has a different key).
+   */
+  tombstoneIndex(): Set<string> {
+    const s = new Set<string>();
+    for (const t of this.tombstones()) {
+      s.add(`${t.chainId}:${t.emitter}:${t.txHash}:${t.logIndex}:${t.blockHash.toLowerCase()}`);
+    }
+    return s;
   }
 
   dispositions(): DispositionRow[] {
