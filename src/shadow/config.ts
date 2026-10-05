@@ -30,14 +30,20 @@ export class CredentialGuardError extends Error {
   }
 }
 
-/** Throws CredentialGuardError if any banned variable is set (non-empty). */
+/**
+ * Throws CredentialGuardError if any banned variable is PRESENT — including
+ * set-but-empty. Presence is the signal: an empty PRIVATE_KEY still means
+ * someone attempted to inject credential material into this process.
+ */
 export function assertNoCredentials(env: NodeJS.ProcessEnv = process.env): void {
   const offenders: string[] = [];
   for (const name of BANNED_ENV_VARS) {
-    if (env[name]) offenders.push(name);
+    if (name in env && env[name] !== undefined) offenders.push(name);
   }
   for (const key of Object.keys(env)) {
-    if (BANNED_PREFIXES.some((p) => key.startsWith(p)) && env[key]) offenders.push(key);
+    if (BANNED_PREFIXES.some((p) => key.startsWith(p)) && env[key] !== undefined) {
+      offenders.push(key);
+    }
   }
   if (offenders.length > 0) throw new CredentialGuardError(offenders);
 }

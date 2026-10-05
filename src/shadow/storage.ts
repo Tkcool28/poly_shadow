@@ -74,8 +74,16 @@ export interface QuarantineRow {
     | 'UNKNOWN_MARKET_MAPPING'
     | 'AMBIGUOUS_FILL'
     | 'ORDERSMATCHED_MISMATCH'
-    | 'REORG_ANOMALY';
+    | 'REORG_ANOMALY'
+    | 'TRANSIENT_FAILURE';
   detail: Record<string, unknown>;
+  firstSeenUtc: string;
+}
+
+export interface BlockHashRow {
+  chainId: number;
+  blockNumber: number;
+  blockHash: string;
   firstSeenUtc: string;
 }
 
@@ -134,6 +142,12 @@ export class ShadowStore {
     this.append('quarantine.ndjson', row);
   }
 
+  /** Append-only record of block hashes we have scanned past — the evidence
+   *  base for common-ancestor detection during reorg recovery. */
+  appendBlockHash(row: BlockHashRow): void {
+    this.append('block_hashes.ndjson', row);
+  }
+
   // ─── cursor (small mutable state; cursor file is rewritten, evidence is not) ───
 
   readCursor(provider: string): CursorRow | null {
@@ -162,6 +176,17 @@ export class ShadowStore {
 
   quarantine(): QuarantineRow[] {
     return this.readAll<QuarantineRow>('quarantine.ndjson');
+  }
+
+  blockHashes(): BlockHashRow[] {
+    return this.readAll<BlockHashRow>('block_hashes.ndjson');
+  }
+
+  /** Latest stored hash per block number (derived view of block_hashes). */
+  latestBlockHashes(): Map<number, string> {
+    const m = new Map<number, string>();
+    for (const r of this.blockHashes()) m.set(r.blockNumber, r.blockHash);
+    return m;
   }
 
   /**
