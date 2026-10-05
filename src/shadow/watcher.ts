@@ -479,10 +479,13 @@ export class ChainWatcher {
   private async blockRef(blockNumber: number, blockHash: string): Promise<BlockRef> {
     const cached = this.blockCache.get(blockNumber);
     if (cached && cached.hash.toLowerCase() === blockHash.toLowerCase()) return cached;
-    const b = await this.rpc<{ hash: string; timestamp: string }>(
+    const b = await this.rpc<{ hash: string; timestamp: string } | null>(
       this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber',
       ['0x' + blockNumber.toString(16), false],
     );
+    // Provider head lag: block unknown to this node yet — transient, retried
+    // by the caller's PENDING path (never a hash conflict).
+    if (!b) throw new Error(`block ${blockNumber} not yet available from provider`);
     if (b.hash.toLowerCase() !== blockHash.toLowerCase()) {
       throw new ReorgSignal(blockNumber); // caller records + recovers
     }
@@ -711,16 +714,28 @@ export class ChainWatcher {
     if (from > to) return;
     const chunk = this.cfg.backfillChunkBlocks;
     for (let start = from; start <= to; start += chunk) {
-      const end = Math.min(start + chunk - 1, to);
-      const logs = await this.rpc<Array<RawLog & { blockHash: string }>>(
-        this.cfg.polygonHttpRpcUrl, 'eth_getLogs',
-        [{
-          address: [...V2_EXCHANGES],
-          topics: [[...V2_SUBSCRIBE_TOPICS]],
-          fromBlock: '0x' + start.toString(16),
-          toBlock: '0x' + end.toString(16),
-        }],
-      );
+      let end = Math.min(start + chunk - 1, to);
+      const params = (e: number) => [{
+        address: [...V2_EXCHANGES],
+        topics: [[...V2_SUBSCRIBE_TOPICS]],
+        fromBlock: '0x' + start.toString(16),
+        toBlock: '0x' + e.toString(16),
+      }];
+      let logs: Array<RawLog & { blockHash: string }>;
+      try {
+        logs = await this.rpc(this.cfg.polygonHttpRpcUrl, 'eth_getLogs', params(end));
+      } catch (err) {
+        if (!/invalid block range/i.test(String(err))) throw err;
+        // Load-balanced provider head lag: eth_blockNumber was answered by a
+        // node ahead of the one serving eth_getLogs. Re-fetch the head,
+        // clamp, and retry once; if the head is behind our start, stop the
+        // scan — the cursor simply does not advance past committed chunks.
+        const latestHex = await this.rpc<string>(this.cfg.polygonHttpRpcUrl, 'eth_blockNumber', []);
+        const latest = parseInt(latestHex, 16);
+        if (latest < start) break;
+        end = Math.min(end, latest);
+        logs = await this.rpc(this.cfg.polygonHttpRpcUrl, 'eth_getLogs', params(end));
+      }
       for (const log of logs) {
         await this.handleLog(log);
       }
@@ -738,9 +753,10 @@ export class ChainWatcher {
           firstSeenUtc: this.nowIso(),
         });
       }
-      const head = await this.rpc<{ hash: string }>(
+      const head = await this.rpc<{ hash: string } | null>(
         this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber', ['0x' + end.toString(16), false],
       );
+      if (!head) break; // provider head lag on block fetch: stop; cursor stays
       // Append-only block-hash evidence for common-ancestor detection.
       this.store.appendBlockHash({
         chainId: this.cfg.chainId, blockNumber: end, blockHash: head.hash,
