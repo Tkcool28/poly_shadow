@@ -17,7 +17,8 @@ const obs: ObservationRow = {
   feeUnits: '0',
   blockTimestamp: 1791143962,
   source: 'CHAIN',
-  firstSeenUtc: '2026-01-01T00:00:00.000Z',
+  sourceFirstSeenUtc: '2026-01-01T00:00:00.000Z',
+  firstSeenUtc: '2026-01-01T00:00:00.001Z',
   evidence: {
     chainId: 137,
     emitter: '0xe111180000d2663c0091e4f400237545b87b996b',

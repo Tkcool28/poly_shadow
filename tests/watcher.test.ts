@@ -1,8 +1,10 @@
 /**
- * Watcher evidence-safety tests (independent re-review findings 1–3):
- * removed-log handling, transient failure + replay, restart/reorg recovery.
- * These exercise the real ChainWatcher against an in-memory RPC mock and a
- * real ShadowStore in a temp dir — not storage methods in isolation.
+ * Watcher evidence-safety tests (independent re-review findings):
+ * removed-log handling, transient failure + replay, restart/reorg
+ * recovery, restart-after-failure durable replay, and concurrent-delivery
+ * deduplication. These exercise the real ChainWatcher against in-memory
+ * RPC mocks and a real ShadowStore in a temp dir — not storage methods
+ * in isolation.
  */
 
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -91,6 +93,23 @@ function mockRpc(blocks: Blocks) {
   return { rpc: rpc as typeof import('../src/shadow/egress.js').rpcCall, state };
 }
 
+/** Mock RPC with a controllable artificial delay on block fetches. */
+function slowRpc(blocks: Blocks, delayMs: number) {
+  const rpc = async <T>(url: string, method: string, params: unknown[]): Promise<T> => {
+    if (method === 'eth_getBlockByNumber') {
+      await new Promise((r) => setTimeout(r, delayMs));
+      const n = parseInt(params[0] as string, 16);
+      const b = blocks.get(n);
+      if (!b) throw new Error(`no block ${n}`);
+      return { hash: b.hash, timestamp: '0x' + b.timestamp.toString(16) } as T;
+    }
+    if (method === 'eth_blockNumber') return ('0x' + Math.max(...blocks.keys()).toString(16)) as T;
+    if (method === 'eth_getLogs') return [] as T;
+    throw new Error(`unexpected method ${method}`);
+  };
+  return rpc as typeof import('../src/shadow/egress.js').rpcCall;
+}
+
 /** Strictly increasing ISO clock — REINCLUDED detection depends on ordering. */
 function clock() {
   let t = Date.parse('2026-01-01T00:00:00.000Z');
@@ -132,7 +151,7 @@ describe('watcher evidence safety', () => {
     const store = tempStore();
     const blocks: Blocks = new Map([[100, { hash: BLOCK_A, timestamp: 1_791_143_962 }]]);
     const { rpc, state } = mockRpc(blocks);
-    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+    const w = new ChainWatcher(cfg(store.dir), store, () => '2026-01-01T00:00:00.000Z', rpc);
 
     state.failNext = true; // first blockRef call fails
     await w.handleLog(fillLog(100, BLOCK_A));
@@ -155,7 +174,7 @@ describe('watcher evidence safety', () => {
       [100, { hash: BLOCK_A, timestamp: 1_791_143_962 }],
     ]);
     const { rpc } = mockRpc(blocks);
-    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+    const w = new ChainWatcher(cfg(store.dir), store, () => '2026-01-01T00:00:00.000Z', rpc);
 
     // Record evidence: a fill at block 100 plus scanned block hashes.
     await w.handleLog(fillLog(100, BLOCK_A));
@@ -182,7 +201,7 @@ describe('watcher evidence safety', () => {
     const store = tempStore();
     const blocks: Blocks = new Map([[100, { hash: BLOCK_B, timestamp: 1_791_143_970 }]]); // disagrees with log
     const { rpc } = mockRpc(blocks);
-    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+    const w = new ChainWatcher(cfg(store.dir), store, () => '2026-01-01T00:00:00.000Z', rpc);
 
     await w.handleLog(fillLog(100, BLOCK_A)); // log claims BLOCK_A
     expect(store.observations()).toHaveLength(0); // no emission under conflict
@@ -198,5 +217,70 @@ describe('watcher evidence safety', () => {
 
   it('ReorgSignal carries the block number', () => {
     expect(new ReorgSignal(100).blockNumber).toBe(100);
+  });
+
+  it('restart after transient failure: durable replay completes the observation exactly once', async () => {
+    const store = tempStore();
+    const blocks: Blocks = new Map([[100, { hash: BLOCK_A, timestamp: 1_791_143_962 }]]);
+
+    // Run 1: RPC fails; raw evidence is persisted but no observation.
+    const { rpc: rpc1, state } = mockRpc(blocks);
+    const w1 = new ChainWatcher(cfg(store.dir), store, clock(), rpc1);
+    state.failNext = true;
+    await w1.handleLog(fillLog(100, BLOCK_A));
+    expect(store.observations()).toHaveLength(0);
+    expect(store.rawLogs()).toHaveLength(1);
+    // Process dies here — retryQueue was in memory only.
+
+    // Run 2: a NEW watcher over the SAME store replays the incomplete raw row.
+    const w2 = new ChainWatcher(cfg(store.dir), store, clock(), mockRpc(blocks).rpc);
+    const replayed = await w2.replayIncompleteFromStore();
+    expect(replayed).toBe(1);
+    expect(store.observations()).toHaveLength(1);
+    expect(store.rawLogs()).toHaveLength(1); // no duplicate raw evidence
+    expect(store.observations()[0]!.eventId).toBe(`137:${EXCHANGE_V2_STANDARD}:${TX}:7`);
+
+    // Run 3: replay is idempotent once the observation exists.
+    const w3 = new ChainWatcher(cfg(store.dir), store, clock(), mockRpc(blocks).rpc);
+    expect(await w3.replayIncompleteFromStore()).toBe(0);
+    expect(store.observations()).toHaveLength(1);
+  });
+
+  it('concurrent deliveries of the same log commit exactly once', async () => {
+    const store = tempStore();
+    const blocks: Blocks = new Map([[100, { hash: BLOCK_A, timestamp: 1_791_143_962 }]]);
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), slowRpc(blocks, 25));
+
+    const log = fillLog(100, BLOCK_A);
+    await Promise.all([w.handleLog(log), w.handleLog(log), w.handleLog(log)]);
+    expect(store.rawLogs()).toHaveLength(1);
+    expect(store.observations()).toHaveLength(1);
+  });
+
+  it('removal identity is block-aware: distinct removals are distinct tombstones', async () => {
+    const store = tempStore();
+    const blocks: Blocks = new Map([[100, { hash: BLOCK_A, timestamp: 1_791_143_962 }]]);
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), mockRpc(blocks).rpc);
+
+    await w.handleLog(fillLog(100, BLOCK_A, 7, true));
+    await w.handleLog(fillLog(100, BLOCK_A, 7, true)); // duplicate notice, same block
+    await w.handleLog(fillLog(100, BLOCK_B, 7, true)); // distinct removal, new block
+    expect(store.tombstones()).toHaveLength(2);
+  });
+
+  it('observation preserves raw arrival time separately from completion time', async () => {
+    const store = tempStore();
+    const blocks: Blocks = new Map([[100, { hash: BLOCK_A, timestamp: 1_791_143_962 }]]);
+    const { rpc, state } = mockRpc(blocks);
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), rpc);
+
+    state.failNext = true;
+    await w.handleLog(fillLog(100, BLOCK_A)); // arrival recorded in the raw row
+    const arrival = store.rawLogs()[0]!.firstSeenUtc;
+
+    await w.processRetries();
+    const obs = store.observations()[0]!;
+    expect(obs.sourceFirstSeenUtc).toBe(arrival); // discovery latency preserved
+    expect(obs.firstSeenUtc > obs.sourceFirstSeenUtc).toBe(true); // completed later
   });
 });
