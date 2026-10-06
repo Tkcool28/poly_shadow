@@ -129,33 +129,43 @@ export function buildShadowGroups(
   window: { startUtc: string; endUtc: string },
 ): Map<string, ShadowGroup> {
   const groups = new Map<string, ShadowGroup>();
-  for (const o of obs) {
-    if (o.sourceFirstSeenUtc < window.startUtc || o.sourceFirstSeenUtc > window.endUtc) continue;
-    const cohort = walletCohort(o.wallet);
-    if (cohort !== 'CONTROLLED_OVERLAP') continue; // primary comparison only
-    const key = o.groupKey;
-    let g = groups.get(key);
-    if (!g) {
-      g = {
-        groupKey: key, wallet: o.wallet, members: [],
-        rawUtc: o.sourceFirstSeenUtc, usableUtc: null,
-        tx: key.startsWith('econ:') ? key.split(':')[1] ?? null : null,
-        asset: o.asset, size6: o.size, side: o.side,
-        sourceTs: o.sourceTs, roles: new Set(), sources: new Set(), emitters: new Set(),
-      };
-      groups.set(key, g);
-    }
-    g.members.push(o);
-    g.roles.add(o.role);
-    g.sources.add(o.source);
-    const em = emitterClass(o);
-    if (em) g.emitters.add(em);
-    if (o.sourceFirstSeenUtc < g.rawUtc) g.rawUtc = o.sourceFirstSeenUtc;
-    if (usable(o) && (g.usableUtc === null || o.completedUtc < g.usableUtc)) {
-      g.usableUtc = o.completedUtc;
-    }
-  }
+  for (const o of obs) addShadowObservation(groups, o, walletCohort, window, true);
   return groups;
+}
+
+/** Same ordered scientific reduction as buildShadowGroups; streaming callers
+ * omit raw members, which the comparator never reads. */
+export function addShadowObservation(
+  groups: Map<string, ShadowGroup>,
+  o: SourceObservationRow,
+  walletCohort: CohortFn,
+  window: { startUtc: string; endUtc: string },
+  retainMembers = false,
+): void {
+  if (o.sourceFirstSeenUtc < window.startUtc || o.sourceFirstSeenUtc > window.endUtc) return;
+  const cohort = walletCohort(o.wallet);
+  if (cohort !== 'CONTROLLED_OVERLAP') return; // primary comparison only
+  const key = o.groupKey;
+  let g = groups.get(key);
+  if (!g) {
+    g = {
+      groupKey: key, wallet: o.wallet, members: [],
+      rawUtc: o.sourceFirstSeenUtc, usableUtc: null,
+      tx: key.startsWith('econ:') ? key.split(':')[1] ?? null : null,
+      asset: o.asset, size6: o.size, side: o.side,
+      sourceTs: o.sourceTs, roles: new Set(), sources: new Set(), emitters: new Set(),
+    };
+    groups.set(key, g);
+  }
+  if (retainMembers) g.members.push(o);
+  g.roles.add(o.role);
+  g.sources.add(o.source);
+  const em = emitterClass(o);
+  if (em) g.emitters.add(em);
+  if (o.sourceFirstSeenUtc < g.rawUtc) g.rawUtc = o.sourceFirstSeenUtc;
+  if (usable(o) && (g.usableUtc === null || o.completedUtc < g.usableUtc)) {
+    g.usableUtc = o.completedUtc;
+  }
 }
 
 // ─── matching (§6) ───

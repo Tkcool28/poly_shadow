@@ -11,12 +11,10 @@
  * Artifacts in — artifacts out. No Poly2 contact, ever.
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { compare, validatePoly2Export } from './phase4.js';
-import { buildShadowGroups } from './phase4.js';
-import type { SourceObservationRow } from '../shadow/racing.js';
-import { tradeGroupKey } from '../shadow/racing.js';
+import { readMarketMetadata, readShadowGroups } from './evidence.js';
 
 const [, , dataDir, exportPath, cohortsPath, outDir] = process.argv;
 if (!dataDir || !exportPath || !cohortsPath || !outDir) {
@@ -35,33 +33,10 @@ const cohortOf = (w: string) =>
   controlled.has(w.toLowerCase()) ? 'CONTROLLED_OVERLAP' as const
     : exploratory.has(w.toLowerCase()) ? 'SHADOW_EXPLORATORY' as const : null;
 
-const obsFile = join(dataDir, 'source_observations.ndjson');
-const obs: SourceObservationRow[] = existsSync(obsFile)
-  ? readFileSync(obsFile, 'utf8').split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l))
-  : [];
-
 const exportData = validatePoly2Export(JSON.parse(readFileSync(exportPath, 'utf8')));
+const marketByGroupKey = await readMarketMetadata(dataDir);
+const groups = await readShadowGroups(dataDir, cohortOf, cohorts.window);
 
-// Market metadata (title / conditionId) survives only in the raw REST
-// payloads — rebuild a groupKey → market lookup from rest_raw when present.
-const marketByGroupKey = new Map<string, string>();
-const rawFile = join(dataDir, 'rest_raw.ndjson');
-if (existsSync(rawFile)) {
-  for (const line of readFileSync(rawFile, 'utf8').split('\n')) {
-    if (!line.trim()) continue;
-    const r = JSON.parse(line) as { payload?: Record<string, unknown> };
-    const p = r.payload ?? {};
-    const tx = String(p['transactionHash'] ?? '').toLowerCase();
-    const asset = p['asset'] != null && p['asset'] !== '' ? String(p['asset']) : null;
-    const size6 = typeof p['size'] === 'number' ? (p['size'] as number).toFixed(6) : null;
-    const market = (p['title'] ?? p['conditionId']) as string | undefined;
-    if (tx && asset && size6 && market && !marketByGroupKey.has(tradeGroupKey(tx, asset, size6))) {
-      marketByGroupKey.set(tradeGroupKey(tx, asset, size6), market);
-    }
-  }
-}
-
-const groups = buildShadowGroups(obs, cohortOf, cohorts.window);
 const result = compare(exportData, groups, cohorts.window, cohortOf, marketByGroupKey);
 
 mkdirSync(outDir, { recursive: true });

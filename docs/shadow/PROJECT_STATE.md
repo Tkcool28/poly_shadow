@@ -22,6 +22,9 @@
 - **Current milestone**: **Phase 4 — controlled Shadow-vs-Poly2 comparison +
   read-only dashboard** (in progress, branch
   `feat/phase4-poly2-comparison-dashboard`, DRAFT PR — do not merge)
+- **Offline reader safety**: Phase 4 evidence NDJSON is streamed without
+  sampling; exact health metrics and scientific group semantics are preserved.
+  Synthetic stress checks are infrastructure evidence, not a real comparison.
 - **Next milestone**: bounded frozen 24 h comparison run once a real Poly2
   export (per `PHASE4_COMPARISON_CONTRACT.md`) exists
 

@@ -50,6 +50,18 @@ and rebuild freely.
 - **Policy impact** — stale-rejections, how many Shadow saw inside the 300s
   budget, rejection-reason and decision-relevance breakdowns.
 
+## Evidence reader safety
+
+Offline Phase 4 NDJSON inputs are streamed without truncation or sampling.
+Blank lines are ignored; malformed JSON fails with file and physical line.
+Health counters are incremental; CDN age uses an exact upper median histogram
+(including legacy `Number(null) = 0`). Latest observation means last row, not
+maximum timestamp. REST market metadata remains first-wins. The CLI retains
+scientific group aggregates, not raw observation members. Memory still scales
+with distinct groups/markets/ages and comparison/export artifacts; individual
+lines are not capped. Matching, timings, cohorts and the frozen scientific
+protocol are unchanged.
+
 ## Reading rules
 
 - Δ convention: positive = Shadow earlier; ties < 1s.

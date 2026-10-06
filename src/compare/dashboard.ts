@@ -9,7 +9,8 @@
  * network calls; the page renders embedded artifacts only (handoff §13/§14).
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { readHealth } from './evidence.js';
 import { join } from 'node:path';
 import type { ComparisonResult } from './phase4.js';
 
@@ -20,35 +21,7 @@ if (!outDir) {
 }
 const comparison = JSON.parse(readFileSync(join(outDir, 'comparison.json'), 'utf8')) as ComparisonResult;
 
-function readRows(dir: string, name: string): Array<Record<string, unknown>> {
-  const f = join(dir, name);
-  if (!existsSync(f)) return [];
-  return readFileSync(f, 'utf8').split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
-}
-
-// Live source health (best-effort; absent when no data dir is supplied).
-let health: Record<string, unknown> = { available: false };
-if (dataDir) {
-  const tel = readRows(dataDir, 'poll_telemetry.ndjson');
-  const quar = readRows(dataDir, 'quarantine.ndjson');
-  const obs = readRows(dataDir, 'source_observations.ndjson');
-  const chainRaw = readRows(dataDir, 'raw_logs.ndjson');
-  const last = (a: Array<Record<string, unknown>>, k: string) =>
-    a.length ? String(a[a.length - 1]![k] ?? '') : null;
-  const errors = tel.filter((t) => t['error']);
-  const ages = tel.map((t) => Number(t['ageHeader'])).filter((a) => !Number.isNaN(a)).sort((a, b) => a - b);
-  health = {
-    available: true,
-    chainRawEvents: chainRaw.length,
-    latestObservationUtc: last(obs, 'completedUtc'),
-    restPolls: tel.length,
-    restErrors: errors.length,
-    lastRestError: errors.length ? String(errors[errors.length - 1]!['error']).slice(0, 120) : null,
-    cdnAgeP50Sec: ages.length ? ages[Math.floor(ages.length / 2)] : null,
-    quarantineCount: quar.length,
-    recoveryRequired: quar.some((q) => (q['detail'] as Record<string, unknown>)?.['recoveryRequired'] === true),
-  };
-}
+const health = await readHealth(dataDir);
 
 const esc = (s: string | null): string =>
   (s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
