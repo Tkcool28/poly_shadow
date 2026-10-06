@@ -596,14 +596,25 @@ class Lifecycle(unittest.TestCase):
         p = subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(30)', 'node'], cwd=self.repo,
                              env=dict(os.environ, SHADOW_DATA_DIR=str(self.repo / 'elsewhere')))
         self.children.append(p)
-        with self.assertRaises(runner.Blocked) as e:
-            runner.orphans(self.repo, self.target)
+        # Real fixture-owned /proc reads; unrelated host PIDs may be unreadable
+        # to the unprivileged CI user and are not this test's process population.
+        with mock.patch.object(Path, 'iterdir', return_value=iter([Path('/proc') / str(p.pid)])):
+            with self.assertRaises(runner.Blocked) as e:
+                runner.orphans(self.repo, self.target)
         self.assertEqual(e.exception.code, 'ORPHAN_DETECTED')
         self.assertIsNone(p.poll())  # discovery NEVER kills
         p.terminate(); p.wait(timeout=3)
         q = subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(30)', 'poly2-node'], cwd=self.repo)
         self.children.append(q)
-        runner.orphans(self.repo, self.target)
+        with mock.patch.object(Path, 'iterdir', return_value=iter([Path('/proc') / str(q.pid)])):
+            runner.orphans(self.repo, self.target)
+        self.assertIsNone(q.poll())
+        # Keep production's unknown-permission gate fail-closed, not skipped.
+        with mock.patch.object(Path, 'iterdir', return_value=iter([Path('/proc') / str(q.pid)])):
+            with mock.patch.object(Path, 'read_bytes', side_effect=PermissionError('fixture permission boundary')):
+                with self.assertRaises(runner.Blocked) as e:
+                    runner.orphans(self.repo, self.target)
+        self.assertEqual(e.exception.code, 'PREFLIGHT_FAILED')
         self.assertIsNone(q.poll())
 
     def test_pid_reuse_token_no_signal(self):
