@@ -16,6 +16,10 @@
  */
 
 import { appendFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+
+// Partial index excludes lifetime terminal history from each periodic pass.
+const INCOMPLETE = "removed=0 AND (disposition='PENDING' OR (raw=1 AND disposition IS NULL AND observed=0))";
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { streamRows } from './stream.js';
@@ -158,7 +162,8 @@ export class ShadowStore {
   /** Rebuildable disk index, never scientific evidence. One writer per directory.
    * Rebuilt on each process startup: an interrupted append/index update cannot
    * forget raw, pending, observation or tombstone evidence. No finite horizon.
-   * SQLite cache is 2MiB; spill/sort use disk, mmap disabled.
+   * SQLite cache is 2MiB; spill/sort use disk, mmap disabled. Raw payload
+   * metadata is disk-only (one <=1MiB row per identity), not a lifetime JS map.
    */
   // An append can be authoritative even when a later cache statement fails.
   // Keep this object fail-stopped (including after close); reopen to rebuild.
@@ -208,7 +213,8 @@ export class ShadowStore {
   private *rebuildIndex(): Generator<void> {
     rmSync(this.file('recovery-index.sqlite'),{force:true});
     const db = new DatabaseSync(this.file('recovery-index.sqlite'));
-    db.exec('PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; PRAGMA mmap_size=0; DROP TABLE IF EXISTS identities; DROP TABLE IF EXISTS latest; DROP TABLE IF EXISTS terminal; CREATE TABLE identities (key TEXT PRIMARY KEY, raw INTEGER DEFAULT 0, arrival TEXT, disposition TEXT, removed INTEGER DEFAULT 0, observed INTEGER DEFAULT 0); CREATE TABLE latest (key TEXT PRIMARY KEY, seq INTEGER); CREATE TABLE terminal (key TEXT PRIMARY KEY); CREATE TABLE canonical_observations (key TEXT PRIMARY KEY, row TEXT NOT NULL);');
+    db.exec('PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA cache_size=-2048; PRAGMA temp_store=FILE; PRAGMA mmap_size=0; DROP TABLE IF EXISTS identities; DROP TABLE IF EXISTS latest; DROP TABLE IF EXISTS terminal; CREATE TABLE identities (key TEXT PRIMARY KEY, raw INTEGER DEFAULT 0, arrival TEXT, disposition TEXT, removed INTEGER DEFAULT 0, observed INTEGER DEFAULT 0, raw_row TEXT, raw_digest TEXT, raw_seq INTEGER NOT NULL DEFAULT 0, last_raw_seq INTEGER NOT NULL DEFAULT 0); CREATE TABLE latest (key TEXT PRIMARY KEY, seq INTEGER); CREATE TABLE terminal (key TEXT PRIMARY KEY); CREATE TABLE canonical_observations (key TEXT PRIMARY KEY, row TEXT NOT NULL);');
+    db.exec(`CREATE INDEX incomplete_raw ON identities(raw_seq) WHERE ${INCOMPLETE}`);
     this.db = db; this.seq = 0; this.indexRows = 0;
     db.exec('CREATE TABLE raw_status(native TEXT, hash TEXT, maxArrival TEXT, PRIMARY KEY(native,hash)); CREATE TABLE tomb_status(native TEXT PRIMARY KEY, hash TEXT, atUtc TEXT); BEGIN');
     try {
@@ -238,7 +244,10 @@ export class ShadowStore {
     if (name === 'raw_logs.ndjson') {
       this.seq++;
       this.prepare('INSERT INTO raw_status VALUES (?,?,?) ON CONFLICT(native,hash) DO UPDATE SET maxArrival=max(maxArrival,excluded.maxArrival)').run(`${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}`,r.blockHash,r.firstSeenUtc);
-      this.prepare('UPDATE identities SET raw=1, arrival=coalesce(arrival,?) WHERE key=?').run(r.firstSeenUtc,key);
+      const payload=JSON.stringify(r);
+      if(Buffer.byteLength(payload)>1024*1024) throw new EvidenceIndexError('raw payload exceeds replay metadata limit');
+      this.prepare('UPDATE identities SET raw=1, arrival=coalesce(arrival,?), raw_row=coalesce(raw_row,?), raw_digest=coalesce(raw_digest,?), raw_seq=CASE WHEN raw=0 THEN ? ELSE raw_seq END, last_raw_seq=? WHERE key=?')
+        .run(r.firstSeenUtc,payload,createHash('sha256').update(payload).digest('hex'),this.seq,this.seq,key);
       this.prepare('INSERT OR REPLACE INTO latest VALUES (?,?)').run(`${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}`,this.seq);
     } else if (name === 'raw_log_tombstones.ndjson') {
       this.prepare('UPDATE identities SET removed=1 WHERE key=?').run(key);
@@ -253,7 +262,7 @@ export class ShadowStore {
   }
   identityState(key: string): {raw:boolean; arrival?:string; disposition?:Disposition; removed:boolean; observed:boolean} {
     this.index();
-    const r = this.prepare('SELECT * FROM identities WHERE key=?').get(key);
+    const r = this.prepare('SELECT raw,arrival,disposition,removed,observed FROM identities WHERE key=?').get(key);
     return {raw:!!r?.raw, arrival:r?.arrival as string | undefined, disposition:r?.disposition as Disposition | undefined, removed:!!r?.removed, observed:!!r?.observed};
   }
   canonicalObservation(key: string): ObservationRow | undefined {
@@ -265,6 +274,60 @@ export class ShadowStore {
     const db=this.index();
     return this.prepare('SELECT seq FROM latest WHERE key=?').get(`${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}`)?.seq === seq
       && !this.prepare('SELECT key FROM terminal WHERE key=?').get(`${r.txHash}:${r.logIndex}`);
+  }
+  /** Check the entire incomplete subset, including positions outside replay's
+   * range. Two bounded-result probes per pass, never per-row O(pending²) work.
+   * Current high-water (not the frozen pass end) permits legitimate appends
+   * during handler awaits. Terminal history is excluded by the partial index.
+   */
+  private validateIncompletePositions(): void {
+    const invalid=this.prepare(`SELECT 1 FROM identities INDEXED BY incomplete_raw
+      WHERE ${INCOMPLETE} AND (typeof(raw_seq)!='integer' OR raw_seq<=0 OR raw_seq>?
+        OR typeof(last_raw_seq)!='integer' OR last_raw_seq<raw_seq OR last_raw_seq>?)
+      LIMIT 1`).get(this.seq,this.seq);
+    if(invalid) throw new EvidenceIndexError('missing or corrupt pending raw positions');
+  }
+  /** One bounded payload at a time, ordered by original raw append position.
+   * Keyset queries avoid holding a SQLite reader across handler writes/awaits.
+   * Freeze the high-water mark so a pass cannot chase concurrent new evidence.
+   * NDJSON remains authoritative; this disposable metadata is rebuilt at startup.
+   */
+  *incompleteRawLogs(): Generator<RawLogRow> {
+    try {
+      this.index();
+      const end=this.seq;
+      this.validateIncompletePositions();
+      let after=-1;
+      while(true) {
+        this.assertUsable();
+        const row=this.prepare(`SELECT key,raw,arrival,disposition,raw_row,raw_digest,raw_seq,last_raw_seq
+          FROM identities INDEXED BY incomplete_raw WHERE ${INCOMPLETE}
+          AND raw_seq>? AND raw_seq<=? ORDER BY raw_seq LIMIT 1`).get(after,end);
+        if(!row) { this.validateIncompletePositions(); return; }
+        const payload=row.raw_row;
+        if(row.raw!==1 || typeof payload!=='string' || Buffer.byteLength(payload)>1024*1024 ||
+           typeof row.arrival!=='string' || !row.arrival ||
+           !Number.isSafeInteger(row.raw_seq) || Number(row.raw_seq)<=0 ||
+           !Number.isSafeInteger(row.last_raw_seq) || Number(row.last_raw_seq)<Number(row.raw_seq) ||
+           createHash('sha256').update(payload).digest('hex')!==row.raw_digest)
+          throw new EvidenceIndexError('missing or corrupt pending raw metadata');
+        const r=JSON.parse(payload) as RawLogRow;
+        if(!r || this.key(r)!==row.key || r.firstSeenUtc!==row.arrival ||
+           !Number.isSafeInteger(r.chainId) || !Number.isSafeInteger(r.blockNumber) ||
+           !Number.isSafeInteger(r.logIndex) || typeof r.emitter!=='string' ||
+           typeof r.txHash!=='string' || typeof r.blockHash!=='string' ||
+           typeof r.topic0!=='string' || typeof r.data!=='string' ||
+           !Array.isArray(r.topics) || !r.topics.every(t=>typeof t==='string'))
+          throw new EvidenceIndexError('pending raw identity/payload mismatch');
+        after=Number(row.raw_seq);
+        // Legacy exclusion remains conservative; never infer missing clocks/FIRST.
+        if(row.disposition==='PENDING' ||
+           (this.legacyEligible(r,Number(row.last_raw_seq)) && this.logStatus(r)!=='REMOVED')) yield r;
+      }
+    } catch(cause) {
+      this.invalidateIndex();
+      throw new EvidenceIndexError('index invalid during pending replay: '+String(cause).slice(0,256),{cause});
+    }
   }
   close(): void { this.statements.clear(); this.db?.close(); this.db=null; }
   *rows<T>(name: string): Generator<T> {

@@ -274,6 +274,9 @@ export class ChainWatcher {
     log: RawLog & { blockHash: string },
     disposition: Disposition,
   ): void {
+    // PENDING is a durable stage, not a retry-attempt counter.
+    const key=`${this.cfg.chainId}:${log.address.toLowerCase()}:${log.transactionHash}:${Number(log.logIndex)}:${log.blockHash.toLowerCase()}`;
+    if(disposition==='PENDING' && this.store.identityState(key).disposition==='PENDING') return;
     this.store.appendDisposition({
       chainId: this.cfg.chainId,
       emitter: log.address.toLowerCase(),
@@ -652,35 +655,28 @@ export class ChainWatcher {
     await this.scanRange(cursor.blockNumber + 1, parseInt(latestHex, 16));
   }
 
-  /**
-   * Durable startup/restart recovery:
-   *  1. Seed in-memory dedup from the append-only disposition index —
-   *     already-delivered identities can never double-commit after restart.
-   *  2. Seed rawCommitted from raw rows and seenRemoved from tombstones.
-   *  3. Replay ONLY identities whose latest disposition is PENDING, plus
-   *     legacy rows with no disposition and no observation (pre-disposition
-   *     evidence). Only the LATEST raw row per identity is eligible, so an
-   *     old tombstoned fork row can never be revived.
-   * Original arrival time is preserved so discovery latency survives replay.
+  /** Durable recovery, at startup and on normal retry ticks.
+   * Startup may stream authoritative NDJSON to rebuild the disposable index.
+   * Every pass thereafter queries only its indexed current incomplete subset;
+   * tombstones and all terminal dispositions are excluded before payload reads.
+   * Legacy rows retain the existing latest-native/observation/quarantine guards.
+   * Original raw append order and first arrival survive; existing canonical
+   * partial observations are reused without inferring clocks or FIRST order.
    */
   async replayIncompleteFromStore(): Promise<number> {
-    let replayed=0, seq=0;
+    let replayed=0, examined=0;
     this.replayActive=true;
     try {
       await this.store.initializeIndex();
-      for(const r of this.store.rows<import('./storage.js').RawLogRow>('raw_logs.ndjson')) {
-        seq++; this.replayRows++;
+      for(const r of this.store.incompleteRawLogs()) {
+        examined++; this.replayRows++;
         const key=`${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}:${r.blockHash.toLowerCase()}`;
-        const s=this.store.identityState(key);
-        if(s.removed) {
-          if(s.disposition==='PENDING') this.store.appendDisposition({...r,disposition:'REMOVED_INVALID',atUtc:this.nowIso()});
-        } else if((s.disposition==='PENDING' ||
-            (!s.observed && !s.disposition && this.store.legacyEligible(r,seq) && this.store.logStatus(r)!=='REMOVED')) && !this.inflight.has(key)) {
+        if(!this.inflight.has(key)) {
           replayed++;
           await this.handleLog({address:r.emitter, topics:r.topics, data:r.data,
             transactionHash:r.txHash, logIndex:r.logIndex, blockNumber:r.blockNumber, blockHash:r.blockHash},r.firstSeenUtc);
         }
-        if(seq % 256 === 0) {
+        if(examined % 256 === 0) {
           this.lastProgressUtc=this.nowIso();
           await new Promise<void>(resolve=>setImmediate(resolve));
         }

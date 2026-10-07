@@ -16,7 +16,9 @@ const dir=mkdtempSync(join(tmpdir(),'poly-memory-proof-'));
 const cfg={chainId:137, watchedWallets:new Set<string>(),polygonHttpRpcUrl:'https://offline.invalid',dataDir:dir} as any;
 const log=(i:number)=>({address:'synthetic-unknown',transactionHash:'tx'+i,logIndex:0,blockNumber:i,blockHash:'fork-a',topics:[],data:'0x'});
 let store=new ShadowStore(dir);let racing=new RacingStore(dir);
-let watcher=new ChainWatcher(cfg,store,()=> '2026-01-01T00:00:00Z',(async()=>{throw Error('network forbidden');}) as any);
+const offlineRpc=(async()=>{throw Error('network forbidden');}) as any;
+globalThis.fetch=async()=>{throw Error('network forbidden');};
+let watcher=new ChainWatcher(cfg,store,()=> '2026-01-01T00:00:00Z',offlineRpc);
 const samples: ReturnType<ChainWatcher['memoryTelemetry']>[]=[];
 try {
  const reconciler=new Reconciler(racing);
@@ -38,12 +40,45 @@ try {
  await watcher.handleLog({...log(0),blockHash:'fork-b'});
  const beforeRestart=statSync(join(dir,'raw_logs.ndjson')).size;
  store.close();racing.close();store=new ShadowStore(dir);racing=new RacingStore(dir);
- watcher=new ChainWatcher(cfg,store);
+ watcher=new ChainWatcher(cfg,store,()=> '2026-01-01T00:00:00Z',offlineRpc);
  assert.equal(await watcher.replayIncompleteFromStore(),0,'restart terminal/tombstone replay');
  await watcher.handleLog(log(0));
  assert.equal(statSync(join(dir,'raw_logs.ndjson')).size,beforeRestart,'restart duplicate');
  const rr=new Reconciler(racing);
  assert.equal(rr.record('CHAIN','i0','g0','2026-01-02T00:00:00Z'),'FIRST');
  assert.equal(rr.record('REST_TRADES','other','g0','2026-01-02T00:00:00Z'),'CORROBORATOR');
- console.log(JSON.stringify({synthetic:true,networkCalls:0,count,rawBytes,indexBytes:statSync(join(dir,'recovery-index.sqlite')).size,samples,rssGrowth,heapGrowth,reconnect:true,reorg:true,restart:true,firstMembershipPreserved:true}));
+ // Tiny durable unfinished publication population amid lifetime terminal history.
+ const arrival='2026-01-01T00:00:00Z';
+ for(let i=count;i<count+2;i++) {
+  const r={chainId:137,emitter:'synthetic-unknown',txHash:'tx'+i,logIndex:0,blockNumber:i,blockHash:'fork-a',topic0:'',topics:[],data:'0x',firstSeenUtc:arrival};
+  store.appendRawLog(r);store.appendDisposition({...r,disposition:'PENDING',atUtc:arrival});
+  store.appendObservation({eventId:'pending'+i,role:'MAKER_LEG',wallet:'offline',side:'BUY',tokenId:'1',shares:'1',price10:'1',feeUnits:'0',blockTimestamp:1,source:'CHAIN',sourceFirstSeenUtc:arrival,firstSeenUtc:arrival,evidence:r});
+ }
+ let fail=true,publicationAttempts=0;
+ watcher=new ChainWatcher(cfg,store,()=>arrival,offlineRpc,()=>{publicationAttempts++;if(fail)throw Error('offline publication failure');});
+ let rawLedgerIterations=0;
+ const originalRows=store.rows.bind(store);
+ store.rows=function*<T>(name:string):Generator<T>{rawLedgerIterations++;throw Error('periodic ledger iteration forbidden: '+name);};
+ const dispositionBytes=statSync(join(dir,'dispositions.ndjson')).size;
+ global.gc!();const pendingWarm=watcher.memoryTelemetry();
+ const passes=200,pendingSamples:ReturnType<ChainWatcher['memoryTelemetry']>[]=[];
+ const started=performance.now();
+ for(let pass=0;pass<passes;pass++) {
+  const before=watcher.memoryTelemetry().replayRows;
+  await watcher.processRetries();
+  assert.equal(watcher.memoryTelemetry().replayRows-before,2,'work must equal pending population');
+  if((pass+1)%25===0){global.gc!();pendingSamples.push(watcher.memoryTelemetry());}
+ }
+ const periodicDurationMs=performance.now()-started;
+ assert.equal(publicationAttempts,passes*2);assert.equal(rawLedgerIterations,0);
+ assert.equal(statSync(join(dir,'dispositions.ndjson')).size,dispositionBytes,'no repeated PENDING amplification');
+ const periodicRssGrowth=Math.max(...pendingSamples.map(s=>s.rssBytes))-pendingWarm.rssBytes;
+ const periodicHeapGrowth=Math.max(...pendingSamples.map(s=>s.heapUsedBytes))-pendingWarm.heapUsedBytes;
+ assert(periodicRssGrowth<32*1024**2);assert(periodicHeapGrowth<8*1024**2);
+ fail=false;assert.equal(await watcher.replayIncompleteFromStore(),2);
+ assert.equal(await watcher.replayIncompleteFromStore(),0);
+ store.rows=originalRows;store.close();store=new ShadowStore(dir);
+ watcher=new ChainWatcher(cfg,store,()=>arrival,offlineRpc,()=>{throw Error('completed restart publication forbidden');});
+ assert.equal(await watcher.replayIncompleteFromStore(),0,'completed pending restart exactly once');
+ console.log(JSON.stringify({synthetic:true,networkCalls:0,count,rawBytes,indexBytes:statSync(join(dir,'recovery-index.sqlite')).size,samples,rssGrowth,heapGrowth,reconnect:true,reorg:true,restart:true,firstMembershipPreserved:true,pendingPopulation:2,passes,periodicExamined:passes*2,publicationAttempts:passes*2,rawLedgerIterations,periodicDurationMs,periodicRssGrowth,periodicHeapGrowth,pendingSamples,noPendingAmplification:true,pendingCompletionRestart:true}));
 } finally {store.close();racing.close();rmSync(dir,{recursive:true,force:true});}
