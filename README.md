@@ -3,31 +3,30 @@
 **Independent, read-only, multi-source trade-discovery shadow for the Poly2 system.**
 
 Poly-Shadow watches approved Polymarket wallets through several independent
-public sources — Polygon V2 exchange events, Data API `/trades`, and Data
-API `/activity` — preserves what each source saw and when, and reconciles
-candidate economic trades without making one source authoritative.
-
-The question it exists to answer is:
+public sources — Polygon V2 exchange events, the Data API `/trades` and
+`/activity` endpoints — records what each source saw and when, and races the
+sources against each other. The question it exists to answer:
 
 > Can an independently designed multi-source observer detect relevant wallet
 > activity faster and/or more completely than Poly2's current discovery path?
 
-**It cannot trade.** No order submission, transaction signing, private-key
-handling, authenticated CLOB access, capital movement, or redemption exists
-in this repository.
+**It cannot trade.** No order submission, no transaction signing, no
+private-key handling, no authenticated CLOB access, no capital movement, no
+redemption path — anywhere in this repository. Credential material in the
+environment is a startup error, not a configuration option.
 
-**It is not a Poly2 rewrite.** Shadow deliberately avoids Poly2 scoring,
-scheduling, freshness rejection, and execution logic. Comparison is deferred
-to Phase 4 and uses exported, read-only records.
+**It is not a Poly2 rewrite.** It keeps Poly2's discoveries scientifically
+testable: Shadow applies no freshness rejection, no scoring, no scheduling,
+and never discards an observation Poly2 would ignore. Comparison happens
+offline (Phase 4) from exported, read-only Poly2 records.
 
 ## Provenance
 
-Forked from `mantotan/polymarket-copy-trade` @
-`9f3e76ce7a8c9f6003cf356ac223870dec4ef56a` (MIT, © Hermanto Tan; see
-`LICENSE`). Upstream is a live-money copy-trading system on legacy V1
-contracts and is used only as an architectural reference for watcher,
-reconnect/backfill, and source-racing patterns. Its execution surface was
-removed.
+Forked from [`mantotan/polymarket-copy-trade`](https://github.com/mantotan/polymarket-copy-trade)
+@ `9f3e76ce7a8c9f6003cf356ac223870dec4ef56a` (MIT, © Hermanto Tan — `LICENSE`).
+Upstream is a live-money copy-trading system on legacy V1 contracts; used
+here as an **architectural reference only** (watcher lifecycle,
+reconnect/backfill, source racing). All execution code has been removed.
 
 ## Status
 
@@ -35,62 +34,33 @@ removed.
 |---|---|
 | 1 — upstream/security assessment | ✅ merged (PR #1) |
 | 2 — execution excision + reliable V2 chain observer | ✅ merged (PR #2, merge `aa223757…`) |
-| 3 — multi-source discovery + source racing | ✅ implementation + live acceptance complete; awaiting merge (PR #3) |
-| 4 — offline Poly2 comparison | planned |
+| 3 — multi-source discovery + source racing | ✅ merged (PR #3, merge `f22f3acf…`) |
+| 4 — controlled Poly2 comparison + read-only dashboard | 🔨 current (draft PR) |
 
-**Read `docs/shadow/PROJECT_STATE.md` first.** It is the authoritative
-handoff for exact SHAs, safety invariants, live-validation evidence, known
-limitations, and what comes next.
+**Start at [`docs/shadow/PROJECT_STATE.md`](docs/shadow/PROJECT_STATE.md)** —
+the authoritative handoff (exact SHAs, invariants, limitations).
 
-## Architecture
+## Architecture (Phase 3)
+
+Three independent sources feed one append-only evidence store; a racer
+records which source saw each economic-trade candidate first. No source
+validates another; unmatched records stay visible.
 
 ```
-Polygon RPC ─► CHAIN watcher (WSS + backfill, reorg/provider-lag safe) ─┐
-data-api ────► REST_TRADES (/trades?takerOnly=false)                   ├─► source racer ─► NDJSON evidence
-data-api ────► REST_ACTIVITY (/activity)                              ─┘   FIRST/CORROBORATOR
+Polygon RPC ─► CHAIN watcher (WSS + backfill, reorg-safe) ─┐
+data-api ────► REST_TRADES poller  (/trades takerOnly=F)   ├─► source racer ─► NDJSON evidence
+data-api ────► REST_ACTIVITY poller(/activity)            ─┘   (FIRST/CORROBORATOR)
 ```
 
-No source validates or overwrites another. Unmatched records remain visible.
-
-Full architecture:
-`docs/shadow/ARCHITECTURE.md`
-
-WebSocket wallet-trade feasibility:
-`docs/shadow/WS_FEASIBILITY.md`
-
-## Verification
-
-At reviewed Phase 3 runtime head
-`921db8f71ed27071da8b7a835bc3d2fcbc360848`:
-
-- **84 tests / 7 files passed**
-- TypeScript passed
-- static safety gate passed
-- exact-head GitHub CI passed
-
-A frozen **900-second live VPS acceptance run** also passed:
-
-- CHAIN: 59,128 raw / 982 normalized watched-wallet observations
-- REST_TRADES: 400 normalized; 180 successful polls / 0 errors
-- REST_ACTIVITY: 1,056 normalized; 60 successful polls / 0 errors
-- 950 CHAIN↔REST corroborated groups
-- quarantine: 0
-- TRANSIENT_FAILURE: 0
-- `recoveryRequired`: 0
-
-Evidence directory:
-
-`/opt/poly-shadow/runs/phase3-provider-lag-live-20261005T072748Z-attempt1`
-
-This proves the Phase 3 multi-source path can operate live and reconcile the
-same watched-wallet activity across independent sources. It does **not** yet
-prove that Shadow is faster or better than Poly2.
+Full detail: [`docs/shadow/ARCHITECTURE.md`](docs/shadow/ARCHITECTURE.md).
+WS trade source: investigated and rejected —
+[`docs/shadow/WS_FEASIBILITY.md`](docs/shadow/WS_FEASIBILITY.md).
 
 ## Run
 
 ```bash
 npm ci --ignore-scripts
-npm test          # 84 tests
+npm test          # full suite (102 tests on the Phase 4 branch): fixtures, watcher, exit-audit matrix, source racing, comparison
 npm run build     # tsc --noEmit
 npm run safety    # static no-trading safety gate
 
@@ -99,39 +69,40 @@ SHADOW_WATCHED_WALLETS=0x<wallet1>[,0x<wallet2>…] \
 SHADOW_DATA_DIR=./shadow-data \
   timeout 300 npm start
 
-# Frozen-run metrics:
+# Frozen-run metrics afterwards:
 node scripts/multisource-metrics.mjs ./shadow-data
 ```
 
-Default cadences are independently chosen and configurable:
+## Compare (Phase 4, offline)
 
-- `SHADOW_TRADES_POLL_MS=10000`
-- `SHADOW_ACTIVITY_POLL_MS=30000`
+Apples-to-apples on a fixed wallet list only — no auto wallet discovery.
+Both exports are sealed over a frozen window before comparison
+(`docs/shadow/PHASE4_COMPARISON_CONTRACT.md`):
 
-## Important timing caveat
+```bash
+npm run compare -- ./shadow-data poly2-export.json cohorts.json ./compare-out
+npm run dashboard -- ./compare-out ./shadow-data
+```
 
-The racer label `FIRST` currently means **first reconciliation commit**.
-It does not guarantee that source had the earliest preserved raw
-`sourceFirstSeenUtc`. Provider hydration/retry timing can reorder commit
-time relative to observation time.
+Produces `comparison.json` (matching classes, raw/usable latency deltas,
+coverage, decision relevance) and a phone-friendly read-only
+`dashboard.html` (`docs/shadow/DASHBOARD.md`). Wallet-discovery feasibility
+is documented as research-only in
+[`docs/shadow/WALLET_DISCOVERY_FEASIBILITY.md`](docs/shadow/WALLET_DISCOVERY_FEASIBILITY.md).
 
-Phase 4 must therefore compare preserved source-arrival timestamps directly
-before making any source-speed claim.
+Cadences (independently chosen, overridable): `SHADOW_TRADES_POLL_MS`
+(default 10 000), `SHADOW_ACTIVITY_POLL_MS` (default 30 000).
 
-## Explicitly not implemented
+## Explicitly NOT implemented
 
-- trading/signing/keys
-- relayer/redemption
-- bankroll or strategy
-- Poly2 scoring/scheduling/freshness rejection
-- deployment automation
-- live Poly2 database/runtime connection
-- authenticated CLOB client
+Trading, signing, keys, relayer, redemption, bankroll, strategy, scoring,
+Poly2's scheduling/canonical identity/freshness rejection, deployment
+automation, any Poly2 connection, any authenticated CLOB client. The
+WebSocket wallet-trade source is rejected with evidence (WS_FEASIBILITY.md).
 
 ## Hard boundaries
 
-- GitHub Actions are test-only with `contents: read`.
-- No Poly2 database, host, or credential access.
-- Upstream updates are never auto-merged.
-- Any future deployment or Shadow→Poly2 integration requires a separate
-  reviewed milestone.
+- GitHub Actions are test-only (`contents: read`): typecheck, tests, static
+  safety gate, bounded startup smokes.
+- No connection to Poly2's database, hosts, or credentials — ever.
+- Upstream updates are never merged automatically.

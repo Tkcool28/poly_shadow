@@ -1,156 +1,123 @@
-# ARCHITECTURE — Phase 3 multi-source discovery
+# ARCHITECTURE — Phase 3 multi-source discovery + Phase 4 comparison
 
-Status legend: **[implemented]** = code exists; **[tested]** = covered by
-automated tests; **[observed]** = verified against live endpoints;
-**[planned]** = intentionally deferred.
+Status legend: **[implemented]** = code exists and is test-covered;
+**[tested]** = fixture/unit tests; **[observed]** = verified against live
+endpoints; **[planned]** / **[not validated]** = explicitly not yet.
 
 ## Components
 
 ### 1. Polygon V2 chain watcher — `src/shadow/watcher.ts` [implemented, tested, observed]
 
-- WSS `eth_subscribe` over both current V2 exchange emitters (standard +
-  neg-risk) and both V2 event topics.
-- `eth_getLogs` backfill begins only after subscription acknowledgement,
-  with a first-start overlap and periodic verifier.
-- Watched-wallet filtering happens post-decode; source evidence is preserved
-  independently of later reconciliation.
+- WSS `eth_subscribe` logs over BOTH V2 exchange emitters (standard +
+  neg-risk) and both V2 topic0s; watched-wallet filtering post-decode.
+- `eth_getLogs` backfill gated on the subscription ack; 64-block first-start
+  overlap; periodic verifier rescan.
+- Durable dispositions (OBSERVED / COMPLETED_NO_OBSERVATION /
+  TERMINAL_QUARANTINE / REMOVED_INVALID / PENDING) make restart delivery
+  idempotent; tombstones (any reason) dominate PENDING forever.
+- Reorg: dense checkpoints (spacing 16 < lookback 128) prove a common
+  ancestor; no provable ancestor → fail-closed `recoveryRequired` (cursor
+  unmoved, no automatic resume).
+- Phase 3 extension: optional `onObservation` callback (constructor arg 5)
+  feeds committed observations into the racer. Default no-op; Phase 2
+  behavior unchanged.
 
-Provider-lag policy:
+### 2. REST /trades observer — `src/shadow/rest-poller.ts` [implemented, tested, observed — VPS live acceptance run passed in Phase 3]
 
-- only null block responses and invalid log-range responses receive the
-  bounded lag retry treatment;
-- maximum **6 attempts**;
-- backoffs: **100 / 200 / 400 / 800 / 1,600 ms**;
-- invalid ranges refresh the provider head and clamp only downward;
-- null blocks are retryable and never treated as hash conflicts;
-- if the confirmed head is below the next chunk start, scanning stops at the
-  last committed cursor and resumes on a later verifier cycle;
-- exhaustion remains visible as a transient failure;
-- cursor advancement remains evidence/commit safe.
+- Polls `GET {dataApi}/trades?user={wallet}&limit=100&takerOnly=false` per
+  watched wallet on a bounded cadence (default 10s — independently chosen,
+  6 req/min/wallet; NOT Poly2's cadence).
+- `takerOnly=false` is load-bearing: the endpoint defaults to taker-only,
+  which would silently drop the maker population.
+- No freshness rejection: late trades are recorded; lateness is measured
+  (`sourceTs` vs `sourceFirstSeenUtc`), never used to discard.
+- Raw payload + per-request telemetry (request/response times, HTTP status,
+  `age`/`cache-control` headers, newest source timestamp, new/duplicate
+  counts, errors) preserved per poll.
 
-Reorg/evidence guarantees remain those established in Phase 2:
+### 3. REST /activity observer — same module [implemented, tested, observed — VPS live acceptance run passed in Phase 3]
 
-- append-only raw evidence;
-- durable dispositions;
-- tombstones dominate PENDING;
-- dense hash checkpoints;
-- proved common ancestor required for automatic reorg recovery;
-- otherwise fail closed with `recoveryRequired`.
+- Polls `GET {dataApi}/activity?user={wallet}&limit=100` (default 30s —
+  secondary population, lower discovery priority).
+- Treated as a SEPARATE population: the activity `type` (TRADE / MERGE /
+  SPLIT / REDEEM / …) is part of the source-native identity. Non-TRADE
+  activity has no economic-trade group key and stays visible as
+  `ungrouped:{identity}` — never discarded.
 
-Phase 3 adds an optional observation callback that forwards committed CHAIN
-observations to the racer without changing the underlying chain identity or
-Phase 2 safety behavior.
+### 4. WebSocket trade source — [investigated, REJECTED]
 
-### 2. REST `/trades` observer — `src/shadow/rest-poller.ts` [implemented, tested, observed]
+See `docs/shadow/WS_FEASIBILITY.md`. Summary: the public CLOB market channel
+carries order-book events with no wallet identity; the user channel requires
+banned CLOB credentials; RTDS carries price/comment streams. None provides a
+valid watched-wallet trade signal. The Polygon logs WSS already supplies
+low-latency chain discovery.
 
-- Polls
-  `GET {dataApi}/trades?user={wallet}&limit=100&takerOnly=false`.
-- Default cadence: 10 seconds per watched wallet.
-- `takerOnly=false` is required because the endpoint otherwise omits part
-  of the maker-side population.
-- No freshness rejection is applied.
-- Raw payload and per-poll telemetry are preserved:
-  request/response times, HTTP status, CDN `age` / `cache-control`,
-  newest source timestamp, new/duplicate counts, and errors.
+### 5. Source racer / reconciliation — `src/shadow/racing.ts` [implemented, tested]
 
-Live validation from the frozen Phase 3 VPS run:
+- `RacingStore`: append-only `rest_raw`, `poll_telemetry`,
+  `source_observations`, `reconciliation` NDJSON.
+- `Reconciler`: per economic-trade candidate group
+  (`econ:{tx}:{asset}:{size6}`), the first source to arrive is `FIRST`;
+  later sources are `CORROBORATOR`. Durable rows seed the in-memory winner
+  set at startup, so the winner survives restarts and is never overwritten
+  by later arrivals (even ones with earlier source timestamps — arrival
+  order at this observer is the recorded fact).
+- Sources never validate/canonicalize each other. A chain observation and a
+  REST observation of the same trade coexist independently; the racer only
+  records that they appear to describe the same economic trade.
 
-- 180 successful polls / 0 errors;
-- 400 normalized REST_TRADES observations;
-- CDN age p50 99s / p95 279s in that run;
-- response delay p50 26ms / p95 308ms.
+### 6. Metrics — `scripts/multisource-metrics.mjs` [implemented]
 
-### 3. REST `/activity` observer — `src/shadow/rest-poller.ts` [implemented, tested, observed]
+Computes the handoff §10 report from a data directory: per-source raw and
+unique counts, source-only / pairwise / all-source groups, first-source
+winners, maker/taker and BUY/SELL splits, latency vs source timestamps,
+REST response delay + CDN `age` header stats, hydration, errors, quarantine.
 
-- Polls `GET {dataApi}/activity?user={wallet}&limit=100`.
-- Default cadence: 30 seconds.
-- Treated as a distinct source population.
-- Activity type is part of the source-native identity.
-- Non-TRADE activity remains visible and is not forced into trade groups.
+### 7. Phase 4 adapter — `src/compare/poly2-adapter.ts` [implemented stub, offline only]
 
-Live validation from the frozen Phase 3 VPS run:
+Maps Shadow observations to candidate Poly2 canonical keys at comparison
+time. Never imported by any collector. UNMATCHED is a first-class outcome.
 
-- 60 successful polls / 0 errors;
-- 1,056 normalized REST_ACTIVITY observations.
+### 8. Phase 4 comparison engine — `src/compare/phase4.ts` [implemented, fixture-tested]
 
-### 4. WebSocket wallet-trade source — [investigated, rejected]
+- `validatePoly2Export`: fail-closed schema check on the read-only Poly2
+  export (window + wallet + ingest timestamp mandatory per contract §3).
+- `assertExportWindowMatches`: the sealed export window must EXACTLY equal
+  the frozen comparison window, else the comparison aborts (contract §8).
+- `buildShadowGroups`: reads the shadow evidence NDJSON, filters to the
+  CONTROLLED_OVERLAP cohort and frozen window, groups economic-trade
+  candidates; computes per-group **raw discovery** (min
+  `sourceFirstSeenUtc` across independent source observations — never racer
+  FIRST order), **usable discovery** (earliest completion with full
+  decision fields + FULL hydration), and emitter classes from CHAIN member
+  identities (standard vs negRisk).
+- `compare`: enforces cohort AND window **symmetrically** — non-cohort and
+  out-of-window Poly2 rows are sealed out of primary metrics and reported
+  separately (`excluded`); `matchEvents` classifies group-level matches →
+  MATCHED_HIGH_CONFIDENCE (tx+asset+size6+side) / MATCHED_PROBABLE
+  (no txHash, ≤120 s proximity) / SHADOW_ONLY / POLY2_ONLY / AMBIGUOUS
+  (multi-candidate, side-conflict, multi-claim). Metrics: coverage of union
+  (frozen formula, contract §7), raw/usable latency deltas (positive =
+  Shadow earlier; ties < 1 s), policy impact, decision relevance with
+  Poly2's 300 s freshness budget modeled, population breakdowns (sources,
+  maker/taker, BUY/SELL, emitter, markets where metadata exists).
 
-See `docs/shadow/WS_FEASIBILITY.md`.
+### 9. Phase 4 CLI + dashboard — `src/compare/cli.ts`, `src/compare/dashboard.ts` [implemented, smoke-tested on fixtures]
 
-The public CLOB market channel lacks wallet identity; the authenticated user
-channel requires credentials that are intentionally banned; RTDS does not
-provide a suitable watched-wallet trade stream. Polygon logs WSS remains the
-live chain source.
-
-### 5. Source racer / reconciliation — `src/shadow/racing.ts` [implemented, tested, observed]
-
-- Source observations remain independently stored.
-- Candidate economic groups use:
-  `econ:{tx}:{asset}:{size6}`.
-- The first reconciliation commit for a group is labeled `FIRST`;
-  subsequent source memberships are `CORROBORATOR`.
-- Winner state is durable across restarts.
-- Unmatched/source-only observations remain first-class evidence.
-
-Frozen live acceptance produced:
-
-- 950 CHAIN↔REST corroborated groups overall;
-- 858 corroborated groups associated with in-window CHAIN observations;
-- 292 groups seen by all sources;
-- source-only counts: CHAIN 32, REST_TRADES 14, REST_ACTIVITY 12;
-- duplicate observations / malformed candidate memberships: 0.
-
-**Phase 4 timing caveat:** `FIRST` is commit order, not guaranteed earliest
-raw arrival. Preserved `sourceFirstSeenUtc` timestamps must be compared
-directly before any source-speed claim.
-
-### 6. Metrics — `scripts/multisource-metrics.mjs` [implemented, tested/used]
-
-Produces the frozen-run report from one evidence directory:
-
-- raw/normalized counts by source;
-- source-only / matched / all-source groups;
-- FIRST counts;
-- maker/taker and BUY/SELL splits;
-- latency vs source timestamps;
-- REST response/CDN-age statistics;
-- hydration;
-- quarantine/errors.
-
-### 7. Phase 4 adapter — `src/compare/poly2-adapter.ts` [implemented stub, planned use]
-
-Maps Shadow observations to candidate Poly2 canonical keys during offline
-comparison. It is not imported by collectors. UNMATCHED remains a valid
-comparison outcome.
-
-## Phase 3 live acceptance
-
-Reviewed runtime head:
-
-`921db8f71ed27071da8b7a835bc3d2fcbc360848`
-
-Evidence directory:
-
-`/opt/poly-shadow/runs/phase3-provider-lag-live-20261005T072748Z-attempt1`
-
-Fixed run:
-
-- 900 seconds
-- CHAIN: 59,128 raw / 982 normalized
-- REST_TRADES: 400 normalized
-- REST_ACTIVITY: 1,056 normalized
-- quarantine: 0
-- TRANSIENT_FAILURE: 0
-- provider-lag failure: 0
-- `recoveryRequired`: 0
-
-Phase 3 live acceptance passed.
+- `cli.ts`: `shadowDataDir + poly2-export.json + cohorts.json →
+  comparison.json`; rebuilds a groupKey→market lookup from `rest_raw`
+  payloads (title/conditionId) for the market breakdown. Artifacts in,
+  dataset out — no live queries.
+- `dashboard.ts`: `comparison.json → dashboard.html`, a self-contained
+  phone-friendly read-only page (overview, live source health from embedded
+  telemetry, per-wallet table with latest activity, fully auditable trade
+  table with per-trade evidence fields + source/maker-taker/side/
+  actionable filters, coverage incl. exclusions, latency, population,
+  policy impact). Never queries Poly2 or any network.
 
 ## Boundaries
 
-- `fetch(` construction remains confined to `src/shadow/egress.ts`.
-- `new WebSocket` remains confined to `src/shadow/watcher.ts`.
-- configuration fails closed on credential material.
-- Poly2 has zero live dependency/contact.
-- no execution/signing path exists.
-- deployment is not part of Phase 3.
+- Network construction: `fetch(` only in `src/shadow/egress.ts`;
+  `new WebSocket` only in `src/shadow/watcher.ts` (CI-enforced).
+- Config (`config.ts`) fails closed on any credential material.
+- Poly2: zero contact. Upstream: pinned reference only.
