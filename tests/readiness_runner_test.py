@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import py_compile
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -91,7 +92,13 @@ class Readiness(unittest.TestCase):
     def test_preserved_312_and_314_caches_across_interpreters(self):
         source = self.repo / 'scripts/phase4-runner.py'
         candidates = {sys.executable, '/usr/bin/python3'}
-        candidates.update(str(p) for p in Path('/root/.hermes/tools').glob('python-3.14*-linux-x64/bin/python3'))
+        # Explicit CI interpreter paths or PATH; never probe another user's
+        # private home. Both actual versions are installed by the workflow.
+        for version, key in (('3.12', 'POLY_SHADOW_TEST_PYTHON_312'),
+                             ('3.14', 'POLY_SHADOW_TEST_PYTHON_314')):
+            executable = os.environ.get(key) or shutil.which('python' + version)
+            if executable:
+                candidates.add(executable)
         interpreters = {}
         for executable in sorted(candidates):
             if Path(executable).is_file():
