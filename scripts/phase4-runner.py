@@ -5,8 +5,13 @@ import ctypes
 import datetime as dt
 import fcntl
 import hashlib
+import io
 import json
 import math
+import importlib.util
+import marshal
+import struct
+import types
 import os
 from pathlib import Path
 import re
@@ -17,7 +22,7 @@ import time
 import uuid
 
 WINDOW_SECONDS = 86400
-BRANCH = 'feat/phase4-poly2-comparison-dashboard'
+BRANCH = 'main'
 POLY2_SHA = 'bd61efc90a4ff8bfc17b8a31abc4a40dd655f81f'
 WALLETS = ['0x82cf2b31d18fca19830e216b98cffa5dbc6c0998',
            '0x924379a79c64b77ad5816ad362122a5f6228658e',
@@ -300,21 +305,79 @@ def production_snapshot():
             'PREFLIGHT_FAILED', 'Poly2 heartbeat gate failed')
     return result
 
+def classify_untracked(repo):
+    # NUL framing avoids Git C-quoting entirely (tabs/newlines/UTF-8 are paths,
+    # not records). Never parse porcelain's quoted display with splitlines().
+    status = call(['git', 'status', '--porcelain=v1', '-z', '--untracked-files=all'], repo)
+    tracked = set(call(['git', 'ls-files', '-z'], repo).split('\0'))
+    result = {'evidence': [], 'interpreterCache': []}
+    cache = repo / 'scripts/__pycache__'
+    for record in filter(None, status.split('\0')):
+        require(record.startswith('?? '), 'PREFLIGHT_FAILED', 'Unexpected tracked status')
+        name = record[3:]
+        p = no_symlinks(repo / name)
+        require(p.is_file(), 'PREFLIGHT_FAILED', 'Untracked directories/symlinks forbidden')
+        if name.startswith('runs/'):
+            # Historical run evidence remains evidence, never runtime/source.
+            result['evidence'].append(name)
+            continue
+        require(p.parent == cache, 'PREFLIGHT_FAILED', 'Untracked content outside runs/cache')
+        # Tiny, observed CPython release-format allowlist. Foreign payloads
+        # are opaque quarantine, never unmarshalled or used as authority.
+        magics = {'cpython-312': bytes.fromhex('cb0d0d0a'),
+                  'cpython-314': bytes.fromhex('2b0e0d0a')}
+        magics.setdefault(sys.implementation.cache_tag, importlib.util.MAGIC_NUMBER)
+        match = re.fullmatch(r'(.+)\.(cpython-[0-9]+)(?:\.opt-[12])?\.pyc', p.name)
+        if match is None or match.group(2) not in magics:
+            raise Blocked('PREFLIGHT_FAILED', 'Only recognized interpreter cache permitted')
+        source = 'scripts/' + match.group(1) + '.py'
+        require(source in tracked and no_symlinks(repo / source).is_file(),
+                'PREFLIGHT_FAILED', 'Cache must correspond to tracked Python source')
+        # Do not execute cached code or require freshness: a preserved pre-edit
+        # cache is harmless. Verify interpreter format, not source timestamp.
+        require(16 < p.stat().st_size <= 8 * 1024 * 1024, 'PREFLIGHT_FAILED', 'Invalid cache size')
+        data = p.read_bytes()
+        valid = (data[:4] == magics[match.group(2)] and
+                 struct.unpack('<I', data[4:8])[0] in (0, 1, 3))
+        if valid and match.group(2) == sys.implementation.cache_tag:
+            # Native format gets additional structural checks, but no exec.
+            try:
+                stream = io.BytesIO(data[16:])
+                code = marshal.load(stream)
+                valid = (isinstance(code, types.CodeType) and
+                         Path(code.co_filename).name == Path(source).name and not stream.read(1))
+            except (ValueError, EOFError, TypeError):
+                valid = False
+        require(valid, 'PREFLIGHT_FAILED', 'Invalid interpreter bytecode')
+        result['interpreterCache'].append(name)
+    # Include ignored entries too: a mixed/symlinked cache must not be hidden by
+    # ignore rules. The exception is exactly direct pyc files already validated.
+    if cache.exists() or cache.is_symlink():
+        no_symlinks(cache)
+        require(cache.is_dir(), 'PREFLIGHT_FAILED', 'Invalid cache directory')
+        require({str(p.relative_to(repo)) for p in cache.iterdir()} == set(result['interpreterCache']),
+                'PREFLIGHT_FAILED', 'Mixed or hidden cache content forbidden')
+    return result
+
+
 def preflight(repo, expected_sha, target, baseline=None):
     credentials(os.environ)
     require(re.fullmatch('[0-9a-f]{40}', expected_sha) is not None, 'PREFLIGHT_FAILED', 'Explicit full expected Shadow SHA required')
     require(call(['git', 'branch', '--show-current'], repo) == BRANCH and
             call(['git', 'rev-parse', 'HEAD'], repo) == expected_sha, 'PREFLIGHT_FAILED', 'Shadow branch/SHA mismatch')
+    require(call(['git', 'rev-parse', 'origin/main'], repo) == expected_sha and
+            call(['git', 'rev-list', '--left-right', '--count', 'HEAD...origin/main'], repo).split() == ['0', '0'],
+            'PREFLIGHT_FAILED', 'Shadow HEAD/origin main mismatch or divergence')
     tracked = call(['git', 'status', '--porcelain=v1', '--untracked-files=no'], repo)
     require(not tracked, 'PREFLIGHT_FAILED', 'Shadow tracked checkout not clean')
-    status = call(['git', 'status', '--porcelain=v1', '--untracked-files=all'], repo)
-    require(all(line.startswith('?? runs/') for line in status.splitlines()), 'PREFLIGHT_FAILED', 'Only untracked runs/ evidence permitted')
+    classification = classify_untracked(repo)
     orphans(repo, target)
     snapshot = production_snapshot()
     if baseline:
         require(all(snapshot[k] == baseline[k] for k in ('sha', 'config', 'envFileSha256', 'container')),
                 'PREFLIGHT_FAILED', 'Protected Poly2 baseline changed')
-    return {'shadowSha': expected_sha, 'branch': BRANCH, 'poly2': snapshot, 'capturedUtc': utc()}
+    return {'shadowSha': expected_sha, 'branch': BRANCH, 'poly2': snapshot,
+            'untrackedClassification': classification, 'capturedUtc': utc()}
 
 def rename_new(source, target):
     # Atomic directory publication with NOREPLACE (Linux), not exists()+rename().
@@ -611,10 +674,122 @@ def lifecycle(repo, target, m, command, env, heartbeat_seconds=30):
         for sig, handler in old.items():
             signal.signal(sig, handler)
 
+def observer_command(repo, target):
+    target = experiment_path(repo, target)
+    return ['systemd-run', '--user', '--scope', '--quiet',
+            '--unit=poly-shadow-observer-' + target.name,
+            '--property=MemoryMax=4294967296', '--property=MemoryHigh=3221225472',
+            '--property=MemorySwapMax=536870912', 'python3', '-B',
+            str(repo / 'scripts/phase4-observer-entry.py'), '--run-id', target.name]
+
+
+def pointer_value(value):
+    fields = {'schemaVersion', 'runDirectory', 'runId', 'approvedShadowSha',
+              'startUtc', 'endUtc', 'lifecycleState'}
+    require(isinstance(value, dict) and set(value) == fields and type(value['schemaVersion']) is int
+            and value['schemaVersion'] == 1 and value['lifecycleState'] == 'AUTHORIZED',
+            'PREFLIGHT_FAILED', 'Invalid current-run schema/state')
+    require(all(isinstance(value[k], str) for k in fields - {'schemaVersion'}),
+            'PREFLIGHT_FAILED', 'Invalid current-run types')
+    directory = Path(value['runDirectory'])
+    require(directory.is_absolute() and directory.name == value['runId'] and
+            re.fullmatch(r'phase4-[A-Za-z0-9_-]+', value['runId']) is not None and
+            re.fullmatch(r'[0-9a-f]{40}', value['approvedShadowSha']) is not None,
+            'PREFLIGHT_FAILED', 'Invalid current-run identity')
+    start, end = epoch(value['startUtc']), epoch(value['endUtc'])
+    require(math.isfinite(start) and math.isfinite(end) and end - start == WINDOW_SECONDS,
+            'PREFLIGHT_FAILED', 'Invalid current-run window')
+    return start, end
+
+
+def decode_current_pointer(raw):
+    """Bounded strict JSON: malformed prior authority must never be replaced."""
+    require(isinstance(raw, bytes) and len(raw) <= 128 * 1024,
+            'PREFLIGHT_FAILED', 'Current-run pointer oversized or invalid')
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            require(key not in value, 'PREFLIGHT_FAILED', 'Duplicate current-run key')
+            value[key] = item
+        return value
+    def constant(_):
+        raise Blocked('PREFLIGHT_FAILED', 'Nonfinite current-run JSON')
+    try:
+        value = json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+    except (ValueError, UnicodeError):
+        raise Blocked('PREFLIGHT_FAILED', 'Malformed current-run JSON') from None
+    pointer_value(value)
+    return value
+
+
+def current_pointer_path(repo, pointer):
+    require(pointer is not None and Path(pointer).is_absolute(), 'PREFLIGHT_FAILED',
+            'Explicit absolute --current-run-pointer required for run')
+    p = no_symlinks(pointer)
+    require(p != repo and repo not in p.parents and p.parent.is_dir(), 'PREFLIGHT_FAILED',
+            'Current-run pointer must be outside repo/runs in existing directory')
+    require(not p.exists() or p.is_file(), 'PREFLIGHT_FAILED', 'Invalid pointer file')
+    return p
+
+
+def publish_current_run(repo, target, m, pointer):
+    """Call ONLY after fresh seal, revision and protected preflight gates.
+
+    External per-pointer lock serializes stale transitions across repositories;
+    existing active or malformed pointers cannot be overwritten.
+    """
+    target = experiment_path(repo, target)
+    p = current_pointer_path(repo, pointer)
+    value = {'schemaVersion': 1, 'runDirectory': str(target), 'runId': target.name,
+             'approvedShadowSha': m['shadowSha'], 'startUtc': m['window']['startUtc'],
+             'endUtc': m['window']['endUtc'], 'lifecycleState': 'AUTHORIZED'}
+    start, _ = pointer_value(value)
+    require(time.time() < start, 'MISSED_START', 'Start passed before current-run publication')
+    lock = no_symlinks(p.with_name(p.name + '.lock'))
+    fd = os.open(lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    stage = p.with_name('.' + p.name + '.' + uuid.uuid4().hex)
+    old = None
+    replaced = False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        current_pointer_path(repo, p)
+        if p.exists():
+            with p.open('rb') as stream:
+                old = stream.read(128 * 1024 + 1)
+            _, old_end = pointer_value(decode_current_pointer(old))
+            require(old_end <= time.time(), 'DUPLICATE_RUN', 'Current-run pointer still active')
+        write_new(stage, value)
+        require(time.time() < start, 'MISSED_START', 'Start passed during current-run publication')
+        os.replace(stage, p)
+        replaced = True
+        fsync_dir(p.parent)
+        with p.open('rb') as stream:
+            readback = decode_current_pointer(stream.read(128 * 1024 + 1))
+        require(readback == value, 'PREFLIGHT_FAILED', 'Current-run readback mismatch')
+    except BaseException:
+        # Restore exact previous bytes if durability/readback failed. A failed
+        # publication never authorizes lifecycle, regardless of rollback errors.
+        if replaced:
+            if old is None:
+                p.unlink()
+            else:
+                with stage.open('xb') as f:
+                    f.write(old); f.flush(); os.fsync(f.fileno())
+                os.replace(stage, p)
+            fsync_dir(p.parent)
+        raise
+    finally:
+        if stage.exists():
+            stage.unlink()
+        os.close(fd)
+    return value
+
+
 def runtime_env(target):
     # No keys, inherited app/polling settings, npm config or credential files.
-    return {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'LANG': 'C.UTF-8',
-            'HOME': str(target / 'runtime-home'), 'TMPDIR': os.environ.get('TMPDIR', '/root/.hermes/cache/scratch'),
+    return {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
+            'HOME': str(target / 'runtime-home'), 'TMPDIR': str(target / 'runtime-home'),
+            'XDG_RUNTIME_DIR': '/run/user/' + str(os.getuid()),
             'SHADOW_WATCHED_WALLETS': ','.join(WALLETS), 'SHADOW_DATA_DIR': str(target / 'shadow-data')}
 
 def main():
@@ -625,6 +800,7 @@ def main():
     parser.add_argument('--start-utc')
     parser.add_argument('--end-utc')
     parser.add_argument('--approve-seal', action='store_true')
+    parser.add_argument('--current-run-pointer')
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
     target = None
@@ -633,6 +809,8 @@ def main():
     try:
         target = experiment_path(repo, args.experiment)
         credentials(os.environ)
+        if args.operation == 'run':
+            current_pointer_path(repo, args.current_run_pointer)
         # Preflight BEFORE any experiment creation. Lock serializes seal/run only.
         if args.operation == 'preflight':
             print(json.dumps(preflight(repo, args.expected_shadow_sha, target)))
@@ -653,7 +831,8 @@ def main():
         require(time.time() < epoch(m['window']['startUtc']), 'MISSED_START', 'Runner not ready before frozen start')
         env = runtime_env(target)
         (target / 'runtime-home').mkdir()
-        return lifecycle(repo, target, m, ['npm', 'start'], env)
+        publish_current_run(repo, target, m, args.current_run_pointer)
+        return lifecycle(repo, target, m, observer_command(repo, target), env)
     except BaseException as e:
         code = e.code if isinstance(e, Blocked) else 'INTERNAL_ERROR'
         refusal = {'classification': code, 'utc': utc(), 'detail': str(e) if isinstance(e, Blocked) else type(e).__name__,
