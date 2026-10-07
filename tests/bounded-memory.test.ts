@@ -1,0 +1,141 @@
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, expect, it } from 'vitest';
+import { ShadowStore } from '../src/shadow/storage.js';
+import { ChainWatcher } from '../src/shadow/watcher.js';
+import { decodeV2Log } from '../src/shadow/decoder.js';
+import { RacingStore, Reconciler } from '../src/shadow/racing.js';
+import { RestPoller } from '../src/shadow/rest-poller.js';
+import { cgroupMemory } from '../src/shadow/memory.js';
+import { EXCHANGE_V2_STANDARD, TOPIC_ORDER_FILLED_V2 } from '../src/shadow/v2constants.js';
+const dirs: string[] = [];
+afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
+function setup() {
+ const dir = mkdtempSync(join(tmpdir(), 'bounded-')); dirs.push(dir);
+ const store = new ShadowStore(dir);
+ const cfg = { chainId: 137, watchedWallets: new Set(['0x'+'11'.repeat(20)]), polygonHttpRpcUrl: 'https://rpc.test', dataDir: dir } as any;
+ const watcher = new ChainWatcher(cfg, store, () => '2026-01-01T00:00:00Z', (async () => { throw Error('offline'); }) as any);
+ return { dir, store, watcher };
+}
+const raw = (i: number) => ({ chainId: 137, emitter: 'x', blockNumber: i, blockHash: 'a', txHash: 'tx'+i, logIndex: 0, topic0: '', topics: [], data: '0x', firstSeenUtc: '2026-01-01T00:00:00Z' });
+it('uses actual governing ancestor usage when leaf limit is max, never inferred heap pressure',()=>{
+ const {dir}=setup();mkdirSync(join(dir,'a/b'),{recursive:true});
+ writeFileSync(join(dir,'a/b/memory.max'),'max');writeFileSync(join(dir,'a/b/memory.current'),'20');
+ writeFileSync(join(dir,'a/memory.max'),'1000');writeFileSync(join(dir,'a/memory.current'),'900');
+ expect(cgroupMemory(dir,'0::/a/b')).toEqual({cgroupUsageBytes:900,cgroupLimitBytes:1000});
+ expect(cgroupMemory(dir,'0::/../escape')).toEqual({cgroupUsageBytes:null,cgroupLimitBytes:null});
+});
+it('exclusive transitions coalesce repeated ticks at capacity two',async()=>{
+ const {watcher}=setup();let release!:()=>void;const gate=new Promise<void>(r=>release=r);let runs=0;
+ const tasks=[];
+ for(let i=0;i<100;i++) tasks.push((watcher as any).runExclusive(async()=>{runs++;await gate;}));
+ await Promise.resolve();expect(watcher.memoryTelemetry().exclusiveDepth).toBe(2);
+ release();await Promise.all(tasks);expect(runs).toBe(2);
+});
+it('all source restart callers stream and source FIRST membership survives cache horizon',()=>{
+ const {dir}=setup();const store=new RacingStore(dir);
+ for(const method of ['reconciliation','sourceObservations','restRaw','identityIndex']) (store as any)[method]=()=>{throw Error('whole source view forbidden');};
+ const r=new Reconciler(store);
+ for(let i=0;i<1200;i++) expect(r.record('CHAIN','i'+i,'g'+i,'2026-01-01T00:00:00Z')).toBe('FIRST');
+ expect(r.record('REST_TRADES','other','g0','2026-01-02T00:00:00Z')).toBe('CORROBORATOR');
+ const restarted=new Reconciler(store);
+ expect(restarted.record('CHAIN','i0','g0','2026-01-03T00:00:00Z')).toBe('FIRST');
+ new RestPoller({source:'REST_TRADES',endpoint:'trades',baseUrl:'https://test',wallets:new Set(),intervalMs:1000},store,restarted);
+});
+it('racing startup rebuild yields before queries and preserves FIRST membership', async()=>{
+ const {dir}=setup();const first=new RacingStore(dir);const recorder=new Reconciler(first);
+ for(let i=0;i<1200;i++) recorder.record('CHAIN','i'+i,'g'+i,'2026-01-01T00:00:00Z');
+ first.close();const fresh=new RacingStore(dir);
+ const rebuilding=fresh.initializeIndex();
+ expect(fresh.indexTelemetry().racingIndexRebuildActive).toBe(true);
+ expect(fresh.indexTelemetry().racingIndexRows).toBe(256);
+ expect(()=>fresh.hasGroup('g0')).toThrow(/rebuilding/);
+ await rebuilding;
+ expect(new Reconciler(fresh).record('CHAIN','i0','g0','2026-01-02T00:00:00Z')).toBe('FIRST');
+ fresh.close();
+});
+it('recovery uses no array evidence views and restart redelivery is duplicate-safe', async () => {
+ const {store, watcher, dir} = setup();
+ for(let i=0;i<1500;i++) store.appendRawLog(raw(i));
+ for(const name of ['rawLogs','observations','quarantine','dispositionIndex','tombstoneIndex']) (store as any)[name] = () => {throw Error('whole history view forbidden');};
+ expect(await watcher.replayIncompleteFromStore()).toBe(1500);
+ expect(watcher.memoryTelemetry().indexRows).toBeGreaterThanOrEqual(1500);
+ expect(await watcher.replayIncompleteFromStore()).toBe(0);
+ const restarted = new ChainWatcher((watcher as any).cfg, new ShadowStore(dir));
+ expect(await restarted.replayIncompleteFromStore()).toBe(0);
+});
+it('index rebuild yields observable bounded progress and concurrent delivery waits for complete membership', async () => {
+ const {store,watcher}=setup();
+ for(let i=0;i<1500;i++) store.appendRawLog(raw(i));
+ const rebuild=store.initializeIndex();
+ const during=watcher.memoryTelemetry();
+ expect(during.indexRebuildActive).toBe(true);
+ expect(during.indexRows).toBeGreaterThan(0);
+ expect(during.indexRows).toBeLessThan(1500);
+ expect(during.indexLastProgressUtc).not.toBeNull();
+ let heartbeat=false;
+ const tick=new Promise<void>(resolve=>setImmediate(()=>{heartbeat=true;resolve();}));
+ const delivery=watcher.handleLog({address:'x',transactionHash:'tx0',logIndex:0,blockNumber:0,blockHash:'a',topics:[],data:'0x'});
+ await tick; expect(heartbeat).toBe(true);
+ await Promise.all([rebuild,delivery]);
+ expect(watcher.memoryTelemetry().indexRebuildActive).toBe(false);
+ expect(store.rawLogs()).toHaveLength(1500);
+ expect(await watcher.replayIncompleteFromStore()).toBe(1499);
+ store.close();
+});
+it('durable identity is exact beyond bounded cache horizon, tombstones dominate pending', async () => {
+ const {store,watcher,dir}=setup();
+ for(let i=0;i<2200;i++) await watcher.handleLog({address:'x',transactionHash:'tx'+i,logIndex:0,blockNumber:i,blockHash:'a',topics:[],data:'0x'});
+ expect((watcher as any).seenRaw?.size ?? 0).toBeLessThanOrEqual(1024);
+ const old={address:'x',transactionHash:'tx0',logIndex:0,blockNumber:0,blockHash:'a',topics:[],data:'0x'};
+ await watcher.handleLog(old);
+ await watcher.handleLog({...old,removed:true});
+ await watcher.handleLog(old);
+ await watcher.handleLog({...old,blockHash:'b'});
+ expect(store.rawLogs().length).toBe(2201);
+ const fresh = new ShadowStore(dir);
+ expect(fresh.identityState('137:x:tx0:0:a').removed).toBe(true);
+ fresh.close(); store.close();
+});
+it('rejects oversized physical lines explicitly instead of growing an unbounded string', () => {
+ const {store,dir}=setup(); writeFileSync(join(dir,'raw_logs.ndjson'), ' '.repeat(1024*1024+1));
+ expect(()=>[...store.rows('raw_logs.ndjson')]).toThrow(/line.*limit/i);
+});
+it('safe early filter keeps malformed, unknown and removal cases; only valid irrelevant fills are omitted', async()=>{
+ const {store,watcher}=setup();
+ const topic=(x:string)=>'0x'+'0'.repeat(24)+x.repeat(40);
+ const log={address:EXCHANGE_V2_STANDARD,transactionHash:'0x'+'aa'.repeat(32),logIndex:0,blockNumber:1,blockHash:'0x'+'bb'.repeat(32),topics:[TOPIC_ORDER_FILLED_V2,'0x'+'00'.repeat(32),topic('2'),topic('3')],data:'0x'+[0,1,2,3,0,0,0].map(n=>n.toString(16).padStart(64,'0')).join('')};
+ expect(decodeV2Log(log)?.kind).toBe('OrderFilled');
+ await watcher.handleLog(log); expect(store.rawLogs()).toHaveLength(0);
+ await watcher.handleLog({...log,data:'0x',transactionHash:'bad'}); expect(store.rawLogs()).toHaveLength(1);
+ await watcher.handleLog({...log,transactionHash:'unknown',topics:['unknown']}); expect(store.rawLogs()).toHaveLength(2);
+ await watcher.handleLog({...log,removed:true}); expect(store.tombstones()).toHaveLength(1);
+});
+it('telemetry exposes bounded queues and actual cgroup values, never substitutes heap for cgroup usage',()=>{
+ const {watcher}=setup(); const t=watcher.memoryTelemetry();
+ expect(t.rssBytes).toBeGreaterThan(0); expect(t.heapUsedBytes).toBeGreaterThan(0);
+ expect(t).toHaveProperty('cgroupUsageBytes'); expect(t).toHaveProperty('cgroupLimitBytes');
+ expect(t).toHaveProperty('replayRows'); expect(t).toHaveProperty('lastProgressUtc');
+ expect(t.inflight).toBe(0);
+});
+it('concurrent delivery spills durably beyond 256 and replays exactly once with original arrival',async()=>{
+ const {store,watcher,dir}=setup();
+ let release!:()=>void; const gate=new Promise<void>(r=>release=r);
+ (watcher as any).rpc=async()=>{await gate;return {hash:'a',timestamp:'0x1'};};
+ const topic=(s:string)=>'0x'+s.slice(2).padStart(64,'0');
+ const fill={address:EXCHANGE_V2_STANDARD,transactionHash:'tx',logIndex:0,blockNumber:1,blockHash:'a',topics:[TOPIC_ORDER_FILLED_V2,'0x'+'00'.repeat(32),topic('0x'+'11'.repeat(20)),topic(EXCHANGE_V2_STANDARD)],data:'0x'+[0,1,2,3,0,0,0].map(n=>n.toString(16).padStart(64,'0')).join('')};
+ const work=[];
+ for(let i=0;i<300;i++) work.push(watcher.handleLog({...fill,transactionHash:'tx'+i},'2025-12-31T23:59:00Z'));
+ expect(watcher.memoryTelemetry().inflight).toBe(256);
+ expect(store.rawLogs()).toHaveLength(300);
+ release();await Promise.all(work);
+ expect(store.observations()).toHaveLength(256);
+ expect(await watcher.replayIncompleteFromStore()).toBe(44);
+ expect(await watcher.replayIncompleteFromStore()).toBe(0);
+ expect(store.observations()).toHaveLength(300);
+ expect(new Set(store.observations().map(o=>o.sourceFirstSeenUtc))).toEqual(new Set(['2025-12-31T23:59:00Z']));
+ store.close(); const fresh=new ShadowStore(dir);
+ const restart=new ChainWatcher((watcher as any).cfg,fresh);
+ expect(await restart.replayIncompleteFromStore()).toBe(0);fresh.close();
+});

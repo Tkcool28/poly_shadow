@@ -142,12 +142,12 @@ describe('exit-audit acceptance matrix', () => {
     await w1.handleLog(matchedLog(100, BLOCK_A));                 // OrdersMatched
     await w1.handleLog(fillLog(100, BLOCK_A, { maker: OTHER }));  // unwatched
     expect(store.observations()).toHaveLength(0);
-    expect(store.rawLogs()).toHaveLength(2);
+    expect(store.rawLogs()).toHaveLength(1); // valid unwatched fill is now filtered before retention
 
     const w2 = new ChainWatcher(cfg(store.dir), store, clock(), mockRpc(blocks).rpc);
     expect(await w2.replayIncompleteFromStore()).toBe(0); // no replay storm
     expect(store.observations()).toHaveLength(0);
-    expect(store.rawLogs()).toHaveLength(2);
+    expect(store.rawLogs()).toHaveLength(1); // valid unwatched fill is now filtered before retention
   });
 
   it('2. pending watched fill is replayed once after restart', async () => {

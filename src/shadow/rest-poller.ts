@@ -17,7 +17,7 @@ import { restGet } from './egress.js';
 import type {
   ActivityPayload, RacingStore, Reconciler, RestRawRow,
 } from './racing.js';
-import { activityIdentity, tradeGroupKey, tradesIdentity } from './racing.js';
+import { activityIdentity, normalizeRestRaw, tradesIdentity } from './racing.js';
 import type { TradesPayload } from './racing.js';
 
 type FetchFn = typeof restGet;
@@ -33,7 +33,7 @@ export interface RestPollerOpts {
 
 export class RestPoller {
   private timer: ReturnType<typeof setInterval> | null = null;
-  private seen = new Set<string>();
+
   private polling = false;
 
   constructor(
@@ -45,7 +45,7 @@ export class RestPoller {
   ) {
     // Restart idempotence: previously committed identities are never
     // re-recorded after a process restart.
-    this.seen = store.identityIndex(opts.source);
+    // Exact disk-backed identity lookup; no startup arrays or lifetime sets.
   }
 
   start(): void {
@@ -60,7 +60,7 @@ export class RestPoller {
   }
 
   /** Number of source-native identities already committed (tests). */
-  get seenCount(): number { return this.seen.size; }
+  get seenCount(): number { return this.store.identityCount(this.opts.source); }
 
   private url(wallet: string): string {
     const base = `${this.opts.baseUrl}/${this.opts.endpoint}?user=${wallet}`
@@ -85,6 +85,8 @@ export class RestPoller {
   /** One bounded poll cycle for one wallet. Errors are telemetry, never
    *  swallowed; a failed poll records zero new identities and moves on. */
   async pollWallet(wallet: string): Promise<void> {
+    this.store.assertUsable(); // Fail before another network/read/telemetry cycle.
+    await this.store.initializeIndex(); // Recover stale REST before requesting new evidence.
     const requestStartUtc = this.nowIso();
     let status: number | null = null;
     let age: string | null = null;
@@ -119,8 +121,7 @@ export class RestPoller {
         : activityIdentity(item as ActivityPayload);
       const sourceTs = typeof item['timestamp'] === 'number' ? item['timestamp'] : null;
       if (sourceTs !== null && (newestTs === null || sourceTs > newestTs)) newestTs = sourceTs;
-      if (this.seen.has(identity)) { dupCount++; continue; }
-      this.seen.add(identity);
+      if (this.store.hasRestPublication(this.opts.source,identity)) { dupCount++; continue; }
       newCount++;
       this.commit(wallet, identity, item, sourceTs, {
         requestStartUtc, responseUtc: responseUtc ?? this.nowIso(),
@@ -152,33 +153,12 @@ export class RestPoller {
       payload: item, requestStartUtc: http.requestStartUtc,
       responseUtc: http.responseUtc, httpStatus: http.httpStatus,
       ageHeader: http.ageHeader, cacheControl: http.cacheControl,
-      sourceTs, firstSeenUtc,
+      sourceTs, firstSeenUtc, completedUtc:this.nowIso(),
     };
-    this.store.appendRestRaw(raw);
-
-    const tx = String(item['transactionHash'] ?? '').toLowerCase();
-    const asset = item['asset'] != null && item['asset'] !== '' ? String(item['asset']) : null;
-    const size6 = typeof item['size'] === 'number' ? (item['size'] as number).toFixed(6) : null;
-    const side = item['side'] === 'BUY' || item['side'] === 'SELL' ? item['side'] : null;
-    // Hydration: market metadata (title/slug/conditionId) present or not.
-    // A PARTIAL row is still a complete observation — raw evidence is kept.
-    const hydration = item['title'] && item['conditionId'] ? 'FULL' : 'PARTIAL';
-    // Group key only when the economic-trade fields exist; non-TRADE
-    // activity (MERGE/SPLIT/REDEEM) has no asset and stays UNMATCHED-visible.
-    const groupKey = tx && asset && size6
-      ? tradeGroupKey(tx, asset, size6)
-      : `ungrouped:${identity}`;
-
-    this.store.appendSourceObservation({
-      source: this.opts.source, identity, wallet, side, asset,
-      size: size6,
-      price: typeof item['price'] === 'number' ? (item['price'] as number).toFixed(4) : null,
-      sourceTs, blockTimestamp: null,
-      sourceFirstSeenUtc: firstSeenUtc, completedUtc: this.nowIso(),
-      // /trades does not label maker vs taker per row — UNKNOWN is honest.
-      role: 'UNKNOWN',
-      groupKey, hydration,
-    });
-    this.reconciler.record(this.opts.source, identity, groupKey, firstSeenUtc);
+    const savedRaw=this.store.restRawIdentity(this.opts.source,identity);
+    if(!savedRaw) this.store.appendRestRaw(raw);
+    const observation=this.store.sourceIdentity(this.opts.source,identity) ?? normalizeRestRaw(savedRaw ?? raw);
+    if(!this.store.hasIdentity(this.opts.source,identity)) this.store.appendSourceObservation(observation);
+    this.reconciler.record(this.opts.source,identity,observation.groupKey,observation.sourceFirstSeenUtc);
   }
 }
