@@ -34,12 +34,14 @@
  */
 
 import WebSocket from 'ws';
+import { EvidenceIndexError } from './storage.js';
 import { decodeV2Log, classifyFill, normalizeGross, crossCheckAggregate } from './decoder.js';
 import type { DecodedOrderFilled, DecodedOrdersMatched, RawLog } from './decoder.js';
 import { V2_SUBSCRIBE_TOPICS, V2_EXCHANGES } from './v2constants.js';
 import { assertAllowedUrl, rpcCall } from './egress.js';
 import type { ShadowConfig } from './config.js';
 import type { Disposition, ShadowStore } from './storage.js';
+import { cgroupMemory } from './memory.js';
 
 interface BlockRef { number: number; hash: string; timestamp: number }
 
@@ -98,12 +100,14 @@ export class ChainWatcher {
    *  orders reconciled; bounded FIFO). */
   private matchedByHash = new BoundedMap<string, DecodedOrdersMatched>(MATCHED_CACHE_MAX);
   private aggregateByHash = new BoundedMap<string, DecodedOrderFilled & { logIndex: number; txHash: string }>(MATCHED_CACHE_MAX);
-  /** Identities fully committed this run (seeded from durable dispositions). */
-  private seenRaw = new Set<string>();
-  /** blockHash-aware removal notices already tombstoned (seeded from store). */
-  private seenRemoved = new Set<string>();
-  /** raw evidence rows already committed (retry/replay must not duplicate) */
-  private rawCommitted = new Set<string>();
+  /** Exact durable identity membership: no lifetime JS sets or finite horizon. */
+  private committed(key:string):boolean {
+    const s=this.store.identityState(key);
+    // A canonical row alone is not completion: publication may still be pending.
+    return s.disposition ? s.disposition !== 'PENDING' : s.observed;
+  }
+  private removed(key:string):boolean {return this.store.identityState(key).removed;}
+  private rawCommitted(key:string):boolean {return this.store.identityState(key).raw;}
   /** blockHash-aware identity -> in-flight commit promise */
   private inflight = new Map<string, Promise<void>>();
   /** transient failures awaiting replay (arrival time preserved) */
@@ -112,6 +116,7 @@ export class ChainWatcher {
   private generation = 0;
   /** Single-flight chain for validate/scan/replay/recovery transitions. */
   private exclusive: Promise<void> = Promise.resolve();
+  private exclusiveDepth=0;
   /**
    * Hard recovery-required state: set when no PROVED common ancestor exists
    * within the supported window. Automatic recovery STOPS — the cursor is
@@ -119,6 +124,37 @@ export class ChainWatcher {
    * resume. A bounded manual/explicit recovery is a later operator action.
    */
   recoveryRequired = false;
+  private replayActive=false;
+  private replayRows=0;
+  private lastProgressUtc: string | null=null;
+  private filteredLogs=0;
+  memoryTelemetry() {
+    const m=process.memoryUsage();
+    return {pid:process.pid, atUtc:this.nowIso(), rssBytes:m.rss, heapUsedBytes:m.heapUsed,
+      heapTotalBytes:m.heapTotal, externalBytes:m.external, ...cgroupMemory(), ...this.store.indexTelemetry(),
+      inflight:this.inflight.size, retryQueue:this.retryQueue.length, exclusiveDepth:this.exclusiveDepth, replayActive:this.replayActive,
+      replayRows:this.replayRows, lastProgressUtc:this.lastProgressUtc,
+      filteredLogs:this.filteredLogs, recoveryRequired:this.recoveryRequired,
+      blockCache:this.blockCache.size, matchedCache:this.matchedByHash.size, aggregateCache:this.aggregateByHash.size};
+  }
+  /** Full valid ABI only. Unknown/malformed events and removals are evidence.
+   * OrdersMatched remains retained for cross-checks even with wallet mismatch.
+   * Already retained identities bypass this filter (including reorg/retries).
+   */
+  private irrelevant(log: RawLog & {blockHash:string}): boolean {
+    if(log.removed) return false;
+    if(!/^0x[0-9a-fA-F]{64}$/.test(log.transactionHash) || !/^0x[0-9a-fA-F]{64}$/.test(log.blockHash)
+      || !Number.isSafeInteger(Number(log.blockNumber)) || Number(log.blockNumber)<0
+      || !Number.isSafeInteger(Number(log.logIndex)) || Number(log.logIndex)<0) return false;
+    const key=`${this.cfg.chainId}:${log.address.toLowerCase()}:${log.transactionHash}:${Number(log.logIndex)}:${log.blockHash.toLowerCase()}`;
+    if(this.store.identityState(key).raw) return false;
+    if(!log.topics.every(t=>/^0x[0-9a-fA-F]{64}$/.test(t)) || !/^0x[0-9a-fA-F]{448}$/.test(log.data)
+      || !log.topics.slice(2).every(t=>/^0x0{24}/i.test(t))) return false;
+    try {
+      const d=decodeV2Log(log);
+      return d?.kind==='OrderFilled' && d.makerAmountFilled>0n && d.takerAmountFilled>0n && !classifyFill(d,this.cfg.watchedWallets);
+    } catch {return false;}
+  }
 
   constructor(
     private cfg: ShadowConfig,
@@ -148,7 +184,11 @@ export class ChainWatcher {
 
   /** Serialize scan/validate/replay/recovery: one transition at a time. */
   private runExclusive(fn: () => Promise<void>): Promise<void> {
-    const run = this.exclusive.then(fn, fn);
+    // Keep at most running + one follow-up transition. Excess notifications
+    // coalesce: durable pending/tombstones/cursor remain for the next verifier.
+    if(this.exclusiveDepth>=2) return Promise.resolve();
+    this.exclusiveDepth++;
+    const run = this.exclusive.then(fn, fn).finally(()=>{this.exclusiveDepth--;});
     this.exclusive = run.catch(() => {});
     return run;
   }
@@ -220,6 +260,8 @@ export class ChainWatcher {
 
   /** Visible failure record — failures are evidence, never swallowed. */
   private recordFailure(where: string, err: unknown): void {
+    // A fatal cache failure is operational state, not recurring scientific evidence.
+    if (err instanceof EvidenceIndexError || this.store.indexTelemetry().indexInvalid) return;
     this.store.appendQuarantine({
       kind: 'TRANSIENT_FAILURE',
       detail: { where, error: String(err) },
@@ -252,6 +294,8 @@ export class ChainWatcher {
     log: RawLog & { blockHash: string },
     preservedArrivalUtc?: string,
   ): Promise<void> {
+    this.store.assertUsable();
+    if (this.store.indexRebuildPending) await this.store.initializeIndex();
     const logIndex = Number(log.logIndex);
     const emitter = log.address.toLowerCase();
     const removedKey = `${this.cfg.chainId}:${emitter}:${log.transactionHash}:${logIndex}`;
@@ -261,8 +305,7 @@ export class ChainWatcher {
     //    (tx, logIndex) under a different blockHash is its own evidence.
     if (log.removed === true) {
       const removalKey = `${removedKey}:${log.blockHash.toLowerCase()}`;
-      if (!this.seenRemoved.has(removalKey)) {
-        this.seenRemoved.add(removalKey);
+      if (!this.removed(removalKey)) {
         this.store.appendTombstone({
           chainId: this.cfg.chainId, emitter,
           txHash: log.transactionHash, logIndex, blockHash: log.blockHash,
@@ -285,12 +328,13 @@ export class ChainWatcher {
 
     // 2) Dedup includes blockHash — re-inclusion in a different block is new.
     const dedupKey = `${removedKey}:${log.blockHash.toLowerCase()}`;
-    if (this.seenRaw.has(dedupKey)) return;
+    if(this.irrelevant(log)) {this.filteredLogs++; this.lastProgressUtc=this.nowIso(); return;}
+    if (this.committed(dedupKey)) return;
 
     // 2a) Tombstone dominance: this exact identity was removed/rewound (or
     //    conflicted) — terminalize, never process. (Covers PENDING rows
     //    delivered again after a removal, and post-rewind redeliveries.)
-    if (this.seenRemoved.has(dedupKey)) {
+    if (this.removed(dedupKey)) {
       this.recordDisposition(log, 'REMOVED_INVALID');
       return;
     }
@@ -300,6 +344,15 @@ export class ChainWatcher {
     // path runs exactly once per identity.
     const existing = this.inflight.get(dedupKey);
     if (existing) return existing;
+    if(this.inflight.size >= 256) {
+      // Durable spill, not an unbounded JS wait queue. The verifier/reconnect
+      // reads it back with its original arrival. No raw payload is lost.
+      if(!this.rawCommitted(dedupKey)) this.store.appendRawLog({chainId:this.cfg.chainId,emitter,
+        txHash:log.transactionHash,logIndex,blockHash:log.blockHash,blockNumber:Number(log.blockNumber),
+        topic0:log.topics[0]?.toLowerCase() ?? '',topics:log.topics,data:log.data,firstSeenUtc:preservedArrivalUtc ?? this.nowIso()});
+      this.recordDisposition(log,'PENDING');
+      return;
+    }
     const work = this.processLog(log, dedupKey, preservedArrivalUtc)
       .finally(() => { this.inflight.delete(dedupKey); });
     this.inflight.set(dedupKey, work);
@@ -318,16 +371,16 @@ export class ChainWatcher {
     const gen = this.generation;
     // Discovery time of the RAW evidence — preserved across retries and
     // replays so latency measurement is never misrepresented by rework.
-    const arrivedUtc = preservedArrivalUtc ?? this.nowIso();
+    const arrivedUtc = this.store.identityState(dedupKey).arrival ?? preservedArrivalUtc ?? this.nowIso();
 
     const finish = (d: Disposition): void => {
       this.recordDisposition(log, d);
-      this.seenRaw.add(dedupKey);
+      this.lastProgressUtc=this.nowIso();
     };
 
     try {
       // 3) Raw evidence first (guarded so retries don't duplicate the row).
-      if (!this.rawCommitted.has(dedupKey)) {
+      if (!this.rawCommitted(dedupKey)) {
         this.store.appendRawLog({
           chainId: this.cfg.chainId,
           emitter,
@@ -340,7 +393,15 @@ export class ChainWatcher {
           data: log.data,
           firstSeenUtc: arrivedUtc,
         });
-        this.rawCommitted.add(dedupKey);
+      }
+
+      // Resume publication from the first persisted row, not a re-decoded row
+      // with a new completion timestamp or a fresh provider dependency.
+      const canonical = this.store.canonicalObservation(dedupKey);
+      if (canonical) {
+        this.onObservation(canonical);
+        finish('OBSERVED');
+        return;
       }
 
       let decoded;
@@ -385,7 +446,7 @@ export class ChainWatcher {
       }
 
       // A removal/rewind tombstoned this exact identity while we awaited.
-      if (this.seenRemoved.has(dedupKey)) {
+      if (this.removed(dedupKey)) {
         finish('REMOVED_INVALID');
         return;
       }
@@ -421,6 +482,9 @@ export class ChainWatcher {
           txHash: log.transactionHash, logIndex, blockHash: log.blockHash,
         },
       };
+      // Persist the incomplete stage before any observation/publication append:
+      // even a process death between stages must replay this canonical row.
+      this.recordDisposition(log, 'PENDING');
       this.store.appendObservation(obsRow);
       // Phase 3: source racing records this source's first-seen evidence.
       this.onObservation(obsRow);
@@ -428,6 +492,11 @@ export class ChainWatcher {
       // 4) Only now is the event fully committed.
       finish('OBSERVED');
     } catch (err) {
+      if (err instanceof EvidenceIndexError) {
+        // Shared-source failure also stops canonical recovery/cursor writes.
+        this.store.invalidateIndex();
+        throw err;
+      }
       if (err instanceof ReorgSignal) {
         // Do NOT emit with a conflicting timestamp. Invalidate this raw
         // identity terminally so replay can never revive it, quarantine the
@@ -437,7 +506,6 @@ export class ChainWatcher {
           txHash: log.transactionHash, logIndex, blockHash: log.blockHash,
           removedAtUtc: this.nowIso(), reason: 'HASH_CONFLICT',
         });
-        this.seenRemoved.add(dedupKey);
         this.store.appendQuarantine({
           kind: 'REORG_ANOMALY',
           detail: { blockNumber, logBlockHash: log.blockHash, error: String(err) },
@@ -452,7 +520,8 @@ export class ChainWatcher {
       // replay. If the process dies first, startup replay recovers it.
       this.recordFailure(`handleLog:${log.transactionHash}:${logIndex}`, err);
       this.recordDisposition(log, 'PENDING');
-      this.retryQueue.push({ log, arrivedUtc });
+      if(this.retryQueue.length < 256) this.retryQueue.push({ log, arrivedUtc });
+      // Overflow is still durably PENDING; processRetries replays the store.
     }
   }
 
@@ -473,13 +542,8 @@ export class ChainWatcher {
 
   /** Replay logs that failed transiently (called by the verifier tick). */
   async processRetries(): Promise<void> {
-    if (this.retryQueue.length === 0) return;
-    const pending = this.retryQueue;
     this.retryQueue = [];
-    for (const item of pending) {
-      // on repeated failure it re-queues itself (arrival still preserved)
-      await this.handleLog(item.log, item.arrivedUtc);
-    }
+    await this.replayIncompleteFromStore();
   }
 
   /** Null is an unavailable block, never proof of a hash conflict. */
@@ -526,7 +590,7 @@ export class ChainWatcher {
     const head = await this.providerBlock(cursor.blockNumber);
     if (head.hash.toLowerCase() === cursor.blockHash.toLowerCase()) return;
 
-    const stored = this.store.latestBlockHashes();
+    const stored = this.store.latestBlockHashes(cursor.blockNumber - REORG_LOOKBACK, cursor.blockNumber);
     let ancestor: number | null = null;
     for (let n = cursor.blockNumber - 1; n >= cursor.blockNumber - REORG_LOOKBACK && n > 0; n--) {
       const known = stored.get(n);
@@ -575,11 +639,7 @@ export class ChainWatcher {
     // their commit, and awaiting callers still get a settled promise.
     this.generation++;
     this.blockCache.clear();
-    this.seenRaw.clear();
-    this.rawCommitted.clear();
-    // Re-seed tombstone dominance: REORG_REWIND tombstones must dominate any
-    // PENDING dispositions for the exact tombstoned identities.
-    for (const key of this.store.tombstoneIndex()) this.seenRemoved.add(key);
+    // Tombstone dominance is read directly from the durable index.
   }
 
   private async recoverFromReorg(): Promise<void> {
@@ -604,79 +664,30 @@ export class ChainWatcher {
    * Original arrival time is preserved so discovery latency survives replay.
    */
   async replayIncompleteFromStore(): Promise<number> {
-    const raws = this.store.rawLogs();
-    const dispositions = this.store.dispositionIndex();
-
-    // Seed dedup state from durable evidence (idempotent restart delivery).
-    for (const r of raws) {
-      this.rawCommitted.add(
-        `${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}:${r.blockHash.toLowerCase()}`);
-    }
-    // Tombstone dominance seeded from ALL tombstone reasons: a removed,
-    // rewound, or hash-conflicted identity must never be replayed.
-    for (const key of this.store.tombstoneIndex()) this.seenRemoved.add(key);
-    for (const [key, d] of dispositions) {
-      if (d !== 'PENDING') this.seenRaw.add(key);
-    }
-
-    // Latest raw row per blockHash-blind identity (file order = arrival order).
-    const latestByIdentity = new Map<string, (typeof raws)[number]>();
-    for (const r of raws) {
-      latestByIdentity.set(`${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}`, r);
-    }
-
-    const observed = new Set(
-      this.store.observations().map((o) =>
-        `${o.evidence.chainId}:${o.evidence.emitter}:${o.evidence.txHash}:` +
-        `${o.evidence.logIndex}:${o.evidence.blockHash.toLowerCase()}`),
-    );
-    const terminal = new Set(
-      this.store.quarantine()
-        .filter((q) => q.kind === 'AMBIGUOUS_FILL')
-        .map((q) => `${q.detail['txHash']}:${q.detail['logIndex']}`),
-    );
-
-    let replayed = 0;
-    for (const r of raws) {
-      const key = `${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}:${r.blockHash.toLowerCase()}`;
-      const d = dispositions.get(key);
-      // Tombstone dominance at restart: a PENDING row whose exact identity
-      // was later removed/rewound/conflicted is terminalized, never replayed.
-      if (this.seenRemoved.has(key)) {
-        if (d === 'PENDING') {
-          this.store.appendDisposition({
-            chainId: r.chainId, emitter: r.emitter, txHash: r.txHash,
-            logIndex: r.logIndex, blockHash: r.blockHash,
-            disposition: 'REMOVED_INVALID', atUtc: this.nowIso(),
-          });
+    let replayed=0, seq=0;
+    this.replayActive=true;
+    try {
+      await this.store.initializeIndex();
+      for(const r of this.store.rows<import('./storage.js').RawLogRow>('raw_logs.ndjson')) {
+        seq++; this.replayRows++;
+        const key=`${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}:${r.blockHash.toLowerCase()}`;
+        const s=this.store.identityState(key);
+        if(s.removed) {
+          if(s.disposition==='PENDING') this.store.appendDisposition({...r,disposition:'REMOVED_INVALID',atUtc:this.nowIso()});
+        } else if((s.disposition==='PENDING' ||
+            (!s.observed && !s.disposition && this.store.legacyEligible(r,seq) && this.store.logStatus(r)!=='REMOVED')) && !this.inflight.has(key)) {
+          replayed++;
+          await this.handleLog({address:r.emitter, topics:r.topics, data:r.data,
+            transactionHash:r.txHash, logIndex:r.logIndex, blockNumber:r.blockNumber, blockHash:r.blockHash},r.firstSeenUtc);
         }
-        continue;
+        if(seq % 256 === 0) {
+          this.lastProgressUtc=this.nowIso();
+          await new Promise<void>(resolve=>setImmediate(resolve));
+        }
       }
-      const pending =
-        d === 'PENDING' ||
-        (d === undefined &&
-          latestByIdentity.get(`${r.chainId}:${r.emitter}:${r.txHash}:${r.logIndex}`) === r &&
-          !observed.has(key) &&
-          !terminal.has(`${r.txHash}:${r.logIndex}`) &&
-          this.store.logStatus(r) !== 'REMOVED');
-      if (!pending) continue;
-      if (this.seenRaw.has(key)) continue;
-      if (this.inflight.has(key)) continue; // currently committing — never await ourselves
-      replayed++;
-      await this.handleLog(
-        {
-          address: r.emitter,
-          topics: r.topics,
-          data: r.data,
-          transactionHash: r.txHash,
-          logIndex: r.logIndex,
-          blockNumber: r.blockNumber,
-          blockHash: r.blockHash,
-        },
-        r.firstSeenUtc, // original arrival — discovery latency survives replay
-      );
-    }
-    return replayed;
+      this.lastProgressUtc=this.nowIso();
+      return replayed;
+    } finally {this.replayActive=false;}
   }
 
   /** Resume from durable cursor; then periodic verification backfill.
@@ -776,7 +787,7 @@ export class ChainWatcher {
         // emitting a duplicate failure or advancing past unavailable evidence.
         // Tombstoned/conflicting evidence must not advance the cursor before
         // queued reorg recovery validates the old cursor and proves ancestry.
-        if (!this.seenRaw.has(key) || this.seenRemoved.has(key)) return;
+        if ((!this.committed(key) && !this.irrelevant(log)) || this.removed(key)) return;
       }
       // Dense rolling checkpoints: spacing < REORG_LOOKBACK guarantees a
       // genuinely stored hash inside any ancestor-walk window, so a routine
