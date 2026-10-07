@@ -20,6 +20,23 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npx tsc --noEmit
       - run: npx vitest run
+      - uses: actions/setup-python@v5
+        id: py312
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-python@v5
+        id: py314
+        with:
+          python-version: "3.14"
+      - name: synthetic operational readiness and status regressions
+        env:
+          TMPDIR: ${{ runner.temp }}
+          PYTHONDONTWRITEBYTECODE: "1"
+          POLY_SHADOW_TEST_PYTHON_312: ${{ steps.py312.outputs.python-path }}
+          POLY_SHADOW_TEST_PYTHON_314: ${{ steps.py314.outputs.python-path }}
+        run: |
+          "$POLY_SHADOW_TEST_PYTHON_312" -B -m unittest discover -s tests -p '*.py' -v
+          "$POLY_SHADOW_TEST_PYTHON_314" -B -m unittest discover -s tests -p '*.py' -v
       # PHASE2_REMOVAL_PLAN §6: static dependency / network-client /
       # signing-API guard.
       - run: node scripts/static-safety.mjs

@@ -196,8 +196,10 @@ class Lifecycle(unittest.TestCase):
         def lookup(cmd, cwd=None):
             if cmd[1:] == ['branch', '--show-current']:
                 return runner.BRANCH
-            if cmd[1:] == ['rev-parse', 'HEAD']:
+            if cmd[1:] in (['rev-parse', 'HEAD'], ['rev-parse', 'origin/main']):
                 return SHA
+            if cmd[1:] == ['rev-list', '--left-right', '--count', 'HEAD...origin/main']:
+                return '0\t0'
             return ' M runs/tracked.json'
         with mock.patch.object(runner, 'call', side_effect=lookup), mock.patch.object(runner, 'production_snapshot') as production, mock.patch.object(runner, 'orphans'), mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(runner.Blocked):
@@ -213,8 +215,10 @@ class Lifecycle(unittest.TestCase):
         def lookup(cmd, cwd=None):
             if cmd[1:] == ['branch', '--show-current']:
                 return runner.BRANCH
-            if cmd[1:] == ['rev-parse', 'HEAD']:
+            if cmd[1:] in (['rev-parse', 'HEAD'], ['rev-parse', 'origin/main']):
                 return SHA
+            if cmd[1:] == ['rev-list', '--left-right', '--count', 'HEAD...origin/main']:
+                return '0\t0'
             return real_call(cmd, cwd)
         with mock.patch.object(runner, 'call', side_effect=lookup), mock.patch.object(runner, 'production_snapshot', return_value={'synthetic': True}) as production, mock.patch.object(runner, 'orphans'), mock.patch.dict(os.environ, {}, clear=True):
             runner.preflight(self.repo, SHA, self.target)  # real ?? runs evidence
@@ -669,8 +673,10 @@ class Lifecycle(unittest.TestCase):
             commands.append(cmd)
             if cmd[1:] == ['branch', '--show-current']:
                 return runner.BRANCH
-            if cmd[1:] == ['rev-parse', 'HEAD']:
+            if cmd[1:] in (['rev-parse', 'HEAD'], ['rev-parse', 'origin/main']):
                 return SHA
+            if cmd[1:] == ['rev-list', '--left-right', '--count', 'HEAD...origin/main']:
+                return '0\t0'
             return ''
         with mock.patch.object(runner, 'call', side_effect=lookup), mock.patch.object(runner, 'orphans'), mock.patch.object(runner, 'production_snapshot', return_value=snapshot), mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(runner.preflight(self.repo, SHA, self.target)['poly2'], snapshot)

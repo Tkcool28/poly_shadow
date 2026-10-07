@@ -17,13 +17,12 @@ import tempfile
 import time
 from zoneinfo import ZoneInfo
 
-RUN = Path('/opt/poly-shadow/runs/phase4-real-20261006T091721Z-controlled')
+RUNS_ROOT = Path('/opt/poly-shadow/runs')
+POINTER = Path('/var/lib/poly-shadow/current-run.json')
 OUTPUT = Path('/var/www/poly-shadow-status/status.json')
 CACHE = Path('/root/.hermes/cache/scratch/poly-shadow-status-state.json')
 LIMIT = 128 * 1024
-START = dt.datetime(2026, 10, 6, 10, tzinfo=dt.timezone.utc).timestamp()
-END = dt.datetime(2026, 10, 7, 10, tzinfo=dt.timezone.utc).timestamp()
-SHA = '54d8ee34ad4098b843ed62b362c6bf4a47244398'
+WINDOW_SECONDS = 86400
 SOURCES = ('CHAIN', 'REST_TRADES', 'REST_ACTIVITY')
 FILES = ('raw_logs.ndjson', 'source_observations.ndjson', 'rest_raw.ndjson', 'poll_telemetry.ndjson')
 CODES = {'END_WINDOW_COMPLETE', 'MISSED_START', 'OBSERVER_EXITED_EARLY', 'SIGNAL_TERMINATION', 'PRESTART_GATE_FAILED', 'WINDOW_SEAL_FAILED', 'OBSERVER_START_FAILED', 'CLEANUP_FAILED', 'EVIDENCE_MISSING', 'REPORT_FAILED', 'INTERNAL_ERROR'}
@@ -52,6 +51,7 @@ def safe_stat(path):
 def read_bytes(path, tail=False):
     """Single bounded read, reject symlinks/nonregular files, detect growth races."""
     try:
+        safe_path(path)
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, 'rb') as stream:
             s = os.fstat(stream.fileno())
@@ -65,16 +65,48 @@ def read_bytes(path, tail=False):
                 # Discard first possibly-partial row, even if offset hits a boundary.
                 data = data.partition(b'\n')[2]
             return data, complete
-    except OSError:
+    except (OSError, ValueError, TypeError):
         return None, False
 
 
+def safe_path(path):
+    path = Path(path)
+    if not path.is_absolute() or '..' in path.parts:
+        raise ValueError('unsafe path')
+    if any(p.is_symlink() for p in (path, *path.parents)):
+        raise ValueError('symlink path')
+    return path
+
+
+def strict_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError('duplicate key')
+        result[key] = value
+    return result
+
+
+def reject_constant(value):
+    raise ValueError('nonfinite JSON')
+
+
+def finite_float(value):
+    import math
+    result = float(value)
+    if not math.isfinite(result):
+        raise ValueError('nonfinite JSON number')
+    return result
+
+
 def obj(path):
-    data, complete = read_bytes(path)
     try:
-        value = json.loads(data) if complete else None
+        safe_path(path)
+        data, complete = read_bytes(path)
+        value = json.loads(data, object_pairs_hook=strict_pairs,
+                           parse_constant=reject_constant, parse_float=finite_float) if complete and data is not None else None
         return value if isinstance(value, dict) else {}
-    except (ValueError, TypeError, UnicodeError):
+    except (OSError, ValueError, TypeError, UnicodeError):
         return {}
 
 
@@ -262,9 +294,101 @@ def memory_status(run, observer_token, now):
     return result
 
 
-def collect(run=RUN, now=None, cache_path=CACHE, health_provider=production_health):
+def unknown_memory():
+    # Same public whitelist as a missing snapshot, without touching evidence/proc.
+    result = {k: None for k in ('rssBytes', 'heapUsedBytes', 'heapTotalBytes', 'externalBytes',
+              'cgroupUsageBytes', 'cgroupLimitBytes', 'inflight', 'retryQueue',
+              'replayRows', 'filteredLogs', 'blockCache', 'matchedCache', 'aggregateCache',
+              'indexRows', 'racingIndexRows', 'exclusiveDepth', 'pressureRatio', 'sampledUtc',
+              'ageSeconds', 'lastProgressUtc', 'progressAgeSeconds', 'replayActive')}
+    for prefix in ('index', 'racingIndex'):
+        for suffix in ('Invalid', 'RebuildActive', 'File', 'LastProgressUtc', 'ProgressAgeSeconds'):
+            result[prefix + suffix] = None
+    result.update(status='unknown', identityVerified=False, warnings=[],
+                  scope='verified runtime snapshot; cgroup usage includes all members/cache, not heap')
+    return result
+
+
+def utc_epoch(value):
+    if not isinstance(value, str):
+        raise ValueError('UTC timestamp required')
+    parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if parsed.tzinfo is None or parsed.utcoffset() != dt.timedelta(0):
+        raise ValueError('UTC timestamp required')
+    return parsed.timestamp()
+
+
+def binding_context(run, pointer_path, runs_root):
+    """Read-only binding, not launch authority. Only AUTHORIZED pointer state accepted.
+
+    Manifest remains immutable SEALED_NOT_STARTED after launch; terminal markers
+    and the window determine inactivity. No ledger hashing or index rebuild here.
+    """
+    import re
+    explicit = run is not None
+    try:
+        root = safe_path(runs_root)
+        pointer = {}
+        if not explicit:
+            p = safe_path(pointer_path)
+            if not p.exists():
+                return None, 'NO_ACTIVE_RUN'
+            pointer = obj(p)
+            fields = {'schemaVersion', 'runDirectory', 'runId', 'approvedShadowSha',
+                      'startUtc', 'endUtc', 'lifecycleState'}
+            if set(pointer) != fields or type(pointer.get('schemaVersion')) is not int or pointer['schemaVersion'] != 1 or pointer.get('lifecycleState') != 'AUTHORIZED':
+                raise ValueError('pointer schema/state')
+            run = pointer.get('runDirectory')
+            if not isinstance(run, str):
+                raise ValueError('directory required')
+        run = safe_path(run)
+        if run.parent != root or not re.fullmatch(r'phase4-[A-Za-z0-9_-]+', run.name) or not run.is_dir():
+            raise ValueError('run outside configured root')
+        if (run / 'INVALID').exists() or (run / 'INVALID').is_symlink():
+            raise ValueError('invalid seal')
+        safe_path(run / 'shadow-data')
+        manifest = obj(run / 'run-manifest.json')
+        sha = manifest.get('shadowSha')
+        window = manifest.get('window', {})
+        if not isinstance(window, dict) or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha):
+            raise ValueError('manifest SHA/window')
+        start, end = utc_epoch(window.get('startUtc')), utc_epoch(window.get('endUtc'))
+        if manifest.get('state') != 'SEALED_NOT_STARTED' or manifest.get('experimentDirectory') != str(run) or type(manifest.get('durationSeconds')) is not int or manifest['durationSeconds'] != WINDOW_SECONDS or end-start != WINDOW_SECONDS:
+            raise ValueError('manifest mismatch')
+        if not explicit and (pointer.get('runId') != run.name or pointer.get('approvedShadowSha') != sha or utc_epoch(pointer.get('startUtc')) != start or utc_epoch(pointer.get('endUtc')) != end):
+            raise ValueError('pointer mismatch')
+        return {'run': run, 'start': start, 'end': end, 'sha': sha, 'explicit': explicit}, 'VALID'
+    except (OSError, ValueError, TypeError, OverflowError):
+        return None, 'INVALID_BINDING'
+
+
+def unbound_status(now, state):
+    return {'schemaVersion': 1, 'generatedUtc': utc(now), 'experimentId': None,
+            'shadowSha': None, 'state': state, 'currentActive': False, 'currentInactive': True,
+            'historical': False, 'binding': {'status': state, 'mode': 'current', 'runDirectory': None},
+            'scope': 'Operational status only; no observer activation.',
+            'window': {k: None for k in ('startUtc', 'endUtc', 'startMdt', 'endMdt', 'elapsedSeconds', 'remainingSeconds', 'startsInSeconds', 'durationSeconds')},
+            'processes': {k: process_status({}) for k in ('runner', 'guardian', 'observer')},
+            'memory': unknown_memory(), 'terminal': {'restartCount': None, 'classification': None, 'exitReason': None, 'bindingValid': False},
+            'heartbeat': {'latestUtc': None, 'ageSeconds': None},
+            'evidence': {'files': [], 'totalBytes': None, 'growthBytes': None, 'sampleSeconds': None},
+            'sources': [], 'quarantine': {'count': None, 'sampleCount': 0, 'scope': 'unbound; unknown', 'recoveryRequired': None},
+            'poly2': dict(reduce_health({}, now), ageSeconds=None), 'disk': {'availableBytes': None},
+            'boundedReads': {'maxBytesPerEvidenceFile': LIMIT, 'chainRawBytes': 0},
+            'warnings': [state + ': no trusted current run; telemetry unknown']}
+
+
+def collect(run=None, now=None, cache_path=CACHE, health_provider=production_health,
+            pointer_path=POINTER, runs_root=RUNS_ROOT):
     now = time.time() if now is None else now
+    context, binding = binding_context(run, pointer_path, runs_root)
+    if context is None:
+        return unbound_status(now, binding)
+    run = context['run']
+    START, END, SHA = context['start'], context['end'], context['sha']
     cache = obj(cache_path)
+    if cache.get('runDirectory') != str(run):
+        cache = {'runDirectory': str(run)}
     warnings = []
     start_receipt = obj(run / 'runner-start.json')
     orchestration = obj(run / 'launch-orchestration-receipt.json')
@@ -273,9 +397,12 @@ def collect(run=RUN, now=None, cache_path=CACHE, health_provider=production_heal
               'observer': launch.get('childToken', {})}
     tokens['guardian'] = guardian_token(tokens['runner'], orchestration, launch)
     processes = {name: process_status(token) for name, token in tokens.items()}
-    memory = memory_status(run, tokens['observer'], now)
-    warnings.extend(memory['warnings'])
     report = terminal(run)
+    terminal_present = report['present'] or (run / 'REPORT_FAILED.json').exists()
+    current_active = not context['explicit'] and START <= now < END and not terminal_present and processes['observer'].get('alive') is True
+    historical = context['explicit'] or now >= END or terminal_present
+    memory = memory_status(run, tokens['observer'], now) if current_active else unknown_memory()
+    warnings.extend(memory['warnings'])
     report['restartCountSource'] = 'terminal receipt' if report['restartCount'] is not None else 'unknown'
     if report['restartCount'] is None and type(start_receipt.get('restartCount')) is int and start_receipt['restartCount'] >= 0:
         report['restartCount'] = start_receipt['restartCount']
@@ -387,7 +514,10 @@ def collect(run=RUN, now=None, cache_path=CACHE, health_provider=production_heal
         warnings.append('disk free below 10 GiB')
     atomic_json(cache_path, cache)
     return {'schemaVersion': 1, 'generatedUtc': utc(now), 'experimentId': run.name,
-            'shadowSha': SHA, 'state': state, 'scope': 'Operational status only. COMPLETE means lifecycle completion only.',
+            'shadowSha': SHA, 'state': state, 'currentActive': current_active,
+            'currentInactive': not current_active, 'historical': historical,
+            'binding': {'status': binding, 'mode': 'historical' if context['explicit'] else 'current', 'runDirectory': str(run)},
+            'scope': 'Operational status only. COMPLETE means lifecycle completion only.',
             'window': {'startUtc': utc(START), 'endUtc': utc(END),
                        'startMdt': dt.datetime.fromtimestamp(START, ZoneInfo('America/Denver')).strftime('%Y-%m-%d %H:%M %Z'),
                        'endMdt': dt.datetime.fromtimestamp(END, ZoneInfo('America/Denver')).strftime('%Y-%m-%d %H:%M %Z'),
@@ -410,7 +540,9 @@ def collect(run=RUN, now=None, cache_path=CACHE, health_provider=production_heal
 def main():
     import argparse
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--run', type=Path, default=RUN)
+    parser.add_argument('--run', type=Path, help='Explicit historical read (never live memory)')
+    parser.add_argument('--current-run', type=Path, default=POINTER, help='Read-only current-run pointer')
+    parser.add_argument('--runs-root', type=Path, default=RUNS_ROOT)
     parser.add_argument('--output', type=Path, default=OUTPUT)
     parser.add_argument('--cache', type=Path, default=CACHE)
     args = parser.parse_args()
@@ -421,7 +553,7 @@ def main():
         except BlockingIOError:
             print('{"collector":"already running"}')
             return 0
-        result = collect(run=args.run, cache_path=args.cache)
+        result = collect(run=args.run, cache_path=args.cache, pointer_path=args.current_run, runs_root=args.runs_root)
         atomic_json(args.output, result, 0o644)
         print(json.dumps({'state': result['state'], 'warnings': result['warnings'],
                           'pids': {k:v['pid'] for k,v in result['processes'].items()},

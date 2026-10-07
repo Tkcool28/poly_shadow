@@ -39,8 +39,10 @@ class MemoryTests(unittest.TestCase):
    self.assertNotIn('racing index rebuild progress stalled > 90s',m['warnings'])
  def test_public_collect_field(self):
   with tempfile.TemporaryDirectory() as d:
-   root=Path(d);(root/'shadow-data').mkdir()
-   result=c.collect(root,now=c.START-1,cache_path=root/'cache.json',health_provider=lambda:{})
+   root=Path(d);run=root/'phase4-synthetic';run.mkdir();(run/'shadow-data').mkdir()
+   start=100000
+   (run/'run-manifest.json').write_text(json.dumps(dict(state='SEALED_NOT_STARTED',experimentDirectory=str(run),shadowSha='a'*40,durationSeconds=86400,window=dict(startUtc=c.utc(start),endUtc=c.utc(start+86400)))))
+   result=c.collect(run,now=start-1,runs_root=root,cache_path=root/'cache.json',health_provider=lambda:{})
    self.assertIn('memory',result);self.assertEqual(result['memory']['status'],'unknown');self.assertIsNone(result['memory']['cgroupLimitBytes'])
  def test_ui_card(self):
   html=(Path(__file__).resolve().parents[1]/'scripts/status/index.html').read_text()
