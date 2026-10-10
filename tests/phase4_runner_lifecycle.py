@@ -153,6 +153,8 @@ class Lifecycle(unittest.TestCase):
         (self.repo / 'runs').mkdir()
         self.target = self.repo / 'runs/phase4-synthetic'
         self.children = []
+        disk = mock.patch.object(runner, 'prelaunch_disk', return_value={'state': 'GREEN', 'synthetic': True})
+        disk.start(); self.addCleanup(disk.stop)
 
     def tearDown(self):
         for p in self.children:

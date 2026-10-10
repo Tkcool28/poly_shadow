@@ -1,0 +1,23 @@
+# EXAMPLE ONLY: not installed or enabled. Installation requires authorization.
+[Unit]
+Description=Poly Shadow independent operational status publisher
+After=local-fs.target
+
+[Service]
+Type=simple
+# Set these paths to an approved read-only checkout and external status directory.
+ExecStart=/usr/bin/python3 /srv/poly-shadow/scripts/status/publisher.py --output /var/www/poly-shadow-status/status.json --cache /var/lib/poly-shadow-status/cache.json --current-run /var/lib/poly-shadow/current-run.json --runs-root /opt/poly-shadow/runs --cadence-seconds 60
+Restart=always
+RestartSec=10
+User=poly-shadow-status
+Group=poly-shadow-status
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/opt/poly-shadow/runs /var/lib/poly-shadow/current-run.json /srv/poly-shadow
+ReadWritePaths=/var/www/poly-shadow-status /var/lib/poly-shadow-status
+# Do not couple publisher lifetime to runner/observer units or finite timers.
+
+[Install]
+WantedBy=multi-user.target

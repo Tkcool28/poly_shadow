@@ -29,7 +29,8 @@ it('shared runtime publisher uses persisted unresolved quarantine and resolution
   let snapshot = publish(d,e);
   expect(snapshot.unresolvedQuarantine).toBe(10);
   expect(snapshot.failureClass).toBe('SOURCE_FAILURE');
-  expect(snapshot.dataQuality).toEqual({state:'AT_RISK',rules:['unresolved quarantine count >= 10']});
+  expect(snapshot.dataQuality).toEqual({state:'AT_RISK',rules:['unresolved quarantine count >= 10','CHAIN: unresolved quarantine count >= 10']});
+  expect(snapshot.sourceHealth.find((s:{source:string})=>s.source==='CHAIN').quality).toEqual({state:'AT_RISK',rules:['unresolved quarantine count >= 10']});
   for (let i=0; i<10; i++) e.resolveQuarantine(`q-${i}`, 'RECOVERED', 'obs', 'OBSERVED', false);
   snapshot = publish(d,e);
   expect(snapshot.unresolvedQuarantine).toBe(0);

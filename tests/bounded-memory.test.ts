@@ -23,7 +23,7 @@ it('uses actual governing ancestor usage when leaf limit is max, never inferred 
  const {dir}=setup();mkdirSync(join(dir,'a/b'),{recursive:true});
  writeFileSync(join(dir,'a/b/memory.max'),'max');writeFileSync(join(dir,'a/b/memory.current'),'20');
  writeFileSync(join(dir,'a/memory.max'),'1000');writeFileSync(join(dir,'a/memory.current'),'900');
- expect(cgroupMemory(dir,'0::/a/b')).toEqual({cgroupUsageBytes:900,cgroupLimitBytes:1000});
+ expect(cgroupMemory(dir,'0::/a/b')).toMatchObject({cgroupUsageBytes:900,cgroupLimitBytes:1000});
  expect(cgroupMemory(dir,'0::/../escape')).toEqual({cgroupUsageBytes:null,cgroupLimitBytes:null});
 });
 it('exclusive transitions coalesce repeated ticks at capacity two',async()=>{

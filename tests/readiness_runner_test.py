@@ -38,6 +38,8 @@ class Readiness(unittest.TestCase):
         self.target = self.repo / 'runs/phase4-synthetic'
         self.production = mock.Mock(return_value={'synthetic': True})
         self.real_call = runner.call
+        disk = mock.patch.object(runner, 'prelaunch_disk', return_value={'state': 'GREEN', 'synthetic': True})
+        disk.start(); self.addCleanup(disk.stop)
 
     def tearDown(self):
         self.tmp.cleanup()

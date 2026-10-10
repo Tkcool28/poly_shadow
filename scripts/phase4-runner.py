@@ -376,6 +376,17 @@ def classify_untracked(repo):
     return result
 
 
+def prelaunch_disk(repo, target):
+    disk_module = types.ModuleType('phase5_storage_budget')
+    disk_path = repo / 'scripts/storage_budget.py'
+    disk_module.__file__ = str(disk_path)
+    try:
+        exec(compile(disk_path.read_bytes(), str(disk_path), 'exec', dont_inherit=True), disk_module.__dict__)
+        return disk_module.prelaunch_gate(target)
+    except (OSError, ValueError) as error:
+        raise Blocked('PREFLIGHT_FAILED', str(error)) from error
+
+
 def preflight(repo, expected_sha, target, baseline=None):
     credentials(os.environ)
     require(re.fullmatch('[0-9a-f]{40}', expected_sha) is not None, 'PREFLIGHT_FAILED', 'Explicit full expected Shadow SHA required')
@@ -387,13 +398,16 @@ def preflight(repo, expected_sha, target, baseline=None):
     tracked = call(['git', 'status', '--porcelain=v1', '--untracked-files=no'], repo)
     require(not tracked, 'PREFLIGHT_FAILED', 'Shadow tracked checkout not clean')
     classification = classify_untracked(repo)
+    # Gate before any production adapter or launch side effect. Source-loaded
+    # from this checkout; no sealed scientific helper or comparator changes.
+    disk_budget = prelaunch_disk(repo, target)
     orphans(repo, target)
     snapshot = production_snapshot()
     if baseline:
         require(all(snapshot[k] == baseline[k] for k in ('sha', 'config', 'envFileSha256', 'container')),
                 'PREFLIGHT_FAILED', 'Protected Poly2 baseline changed')
     return {'shadowSha': expected_sha, 'branch': BRANCH, 'poly2': snapshot,
-            'untrackedClassification': classification, 'capturedUtc': utc()}
+            'untrackedClassification': classification, 'diskBudget': disk_budget, 'capturedUtc': utc()}
 
 def rename_new(source, target):
     # Atomic directory publication with NOREPLACE (Linux), not exists()+rename().
