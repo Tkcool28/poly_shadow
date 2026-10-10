@@ -14,6 +14,20 @@ import struct
 import types
 import os
 from pathlib import Path
+import functools
+
+@functools.lru_cache(maxsize=1)
+def _exact_clock():
+    # Load source bytes only when clocks are consumed, never unchecked .pyc.
+    # The observer entry consumes runtime_env only and need not load this dependency.
+    path = Path(__file__).with_name('exact_clock.py')
+    module = types.ModuleType('runner_exact_clock')
+    exec(compile(path.read_bytes(), str(path), 'exec'), module.__dict__)
+    return module
+
+def epoch_micros(value):
+    return _exact_clock().epoch_micros(value)
+
 import re
 import signal
 import subprocess
@@ -34,7 +48,7 @@ BANNED = {'PRIVATE_KEY', 'CLOB_API_KEY', 'CLOB_API_SECRET', 'CLOB_API_PASSPHRASE
 CODES = {'COMPLETE', 'MISSED_START', 'EARLY_EXIT', 'INTERRUPTED', 'RUNNER_LOST',
          'PREFLIGHT_FAILED', 'SEAL_INVALID', 'DUPLICATE_RUN', 'ORPHAN_DETECTED',
          'LAUNCH_FAILED', 'LAUNCH_LATE', 'CLEANUP_FAILED', 'EVIDENCE_MISSING',
-         'REPORT_FAILED', 'INTERNAL_ERROR'}
+         'REPORT_FAILED', 'INTERNAL_ERROR', 'EVIDENCE_SINK_FAILURE'}
 
 CANONICAL = {
     'COMPLETE': 'END_WINDOW_COMPLETE', 'MISSED_START': 'MISSED_START',
@@ -46,6 +60,7 @@ CANONICAL = {
     # Operational extensions: never mislabel a reporting failure as an export.
     'CLEANUP_FAILED': 'CLEANUP_FAILED', 'EVIDENCE_MISSING': 'EVIDENCE_MISSING',
     'REPORT_FAILED': 'REPORT_FAILED', 'INTERNAL_ERROR': 'INTERNAL_ERROR',
+    'EVIDENCE_SINK_FAILURE': 'EVIDENCE_SINK_FAILURE',
 }
 CANONICAL_CLASSIFICATIONS = set(CANONICAL.values()) | {
     'POSTRUN_EXPORT_FAILED', 'COMPARATOR_FAILED', 'DASHBOARD_FAILED'}
@@ -118,9 +133,10 @@ def utc(t=None):
     return dt.datetime.fromtimestamp(time.time() if t is None else t, dt.timezone.utc).isoformat(timespec='microseconds').replace('+00:00', 'Z')
 
 def epoch(s):
-    value = dt.datetime.fromisoformat(s.replace('Z', '+00:00'))
-    require(value.tzinfo is not None and value.utcoffset() == dt.timedelta(0), 'SEAL_INVALID', 'UTC timestamp required')
-    return value.timestamp()
+    try:
+        return epoch_micros(s) / 1000000 # OS scheduling/display only; membership uses integer authority
+    except ValueError as error:
+        raise Blocked('SEAL_INVALID', str(error)) from error
 
 def digest(p):
     h = hashlib.sha256()
@@ -385,10 +401,11 @@ def rename_new(source, target):
     if libc.renameat2(-100, os.fsencode(source), -100, os.fsencode(target), 1) != 0:
         raise OSError(ctypes.get_errno(), 'Atomic no-overwrite publication failed')
 
-def seal_files(repo, target, start, end, checks, duration=WINDOW_SECONDS):
+def seal_files(repo, target, start, end, checks, duration=WINDOW_SECONDS, original_window=None):
     """Core writer; production CLI fixes duration; tests call on isolated repos."""
     target = experiment_path(repo, target)
-    require(math.isfinite(start) and math.isfinite(end) and end - start == duration and start > time.time(),
+    window = original_window or {'startUtc': utc(start), 'endUtc': utc(end)}
+    require(math.isfinite(start) and math.isfinite(end) and epoch_micros(window['endUtc']) - epoch_micros(window['startUtc']) == duration * 1000000 and epoch_micros(window['startUtc']) > epoch_micros(utc()),
             'SEAL_INVALID', 'Fresh future exact fixed window required')
     require(not target.exists(), 'SEAL_INVALID', 'Never overwrite an experiment')
     stage = target.parent / ('.phase4-stage-' + uuid.uuid4().hex)
@@ -396,19 +413,21 @@ def seal_files(repo, target, start, end, checks, duration=WINDOW_SECONDS):
     published = False
     try:
         (stage / 'shadow-data').mkdir()
-        cohort = {'window': {'startUtc': utc(start), 'endUtc': utc(end)}, 'controlled': WALLETS, 'exploratory': []}
+        cohort = {'window': window, 'controlled': WALLETS, 'exploratory': []}
         write_new(stage / 'cohorts.json', cohort)
         write_new(stage / 'preflight.json', checks)
         with (stage / 'runner.py').open('xb') as f:
             f.write(Path(__file__).read_bytes()); f.flush(); os.fsync(f.fileno())
+        with (stage / 'exact_clock.py').open('xb') as f:
+            f.write(Path(__file__).with_name('exact_clock.py').read_bytes()); f.flush(); os.fsync(f.fileno())
         manifest = {'state': 'SEALED_NOT_STARTED', 'experimentDirectory': str(target), 'window': cohort['window'],
                     'controlled': WALLETS, 'exploratory': [], 'shadowSha': checks['shadowSha'], 'poly2Sha': POLY2_SHA,
-                    'helperSha256': digest(stage / 'runner.py'), 'cohortsSha256': digest(stage / 'cohorts.json'),
+                    'helperSha256': digest(stage / 'runner.py'), 'timestampParserSha256': digest(stage / 'exact_clock.py'), 'cohortsSha256': digest(stage / 'cohorts.json'),
                     'preflightSha256': digest(stage / 'preflight.json'), 'sealedUtc': utc(), 'durationSeconds': duration}
         write_new(stage / 'run-manifest.json', manifest)
-        for name in ('cohorts.json', 'preflight.json', 'runner.py', 'run-manifest.json'):
+        for name in ('cohorts.json', 'preflight.json', 'runner.py', 'exact_clock.py', 'run-manifest.json'):
             (stage / name).chmod(0o444)
-        require(start > time.time(), 'MISSED_START', 'Start passed during seal; no publication')
+        require(epoch_micros(window['startUtc']) > epoch_micros(utc()), 'MISSED_START', 'Start passed during seal; no publication')
         fsync_dir(stage)
         rename_new(stage, target); published = True
         fsync_dir(target.parent)
@@ -433,18 +452,19 @@ def seal_files(repo, target, start, end, checks, duration=WINDOW_SECONDS):
 def validate(repo, target, expected_sha, duration=WINDOW_SECONDS):
     target = experiment_path(repo, target)
     require(target.is_dir() and not (target / 'INVALID').exists(), 'SEAL_INVALID', 'Missing/invalid seal')
-    for name in ('cohorts.json', 'preflight.json', 'runner.py', 'run-manifest.json', 'shadow-data'):
+    for name in ('cohorts.json', 'preflight.json', 'runner.py', 'exact_clock.py', 'run-manifest.json', 'shadow-data'):
         no_symlinks(target / name)
     m = json.loads((target / 'run-manifest.json').read_text())
     c = json.loads((target / 'cohorts.json').read_text())
     require(m['state'] == 'SEALED_NOT_STARTED' and m['experimentDirectory'] == str(target) and
             m['shadowSha'] == expected_sha and m['poly2Sha'] == POLY2_SHA and
             m['helperSha256'] == digest(__file__) == digest(target / 'runner.py') and
+            m['timestampParserSha256'] == digest(Path(__file__).with_name('exact_clock.py')) == digest(target / 'exact_clock.py') and
             m['cohortsSha256'] == digest(target / 'cohorts.json') and
             m['preflightSha256'] == digest(target / 'preflight.json') and
             c == {'window': m['window'], 'controlled': WALLETS, 'exploratory': []} and
             m['controlled'] == WALLETS and m['exploratory'] == [] and m['durationSeconds'] == duration and
-            epoch(m['window']['endUtc']) - epoch(m['window']['startUtc']) == duration,
+            epoch_micros(m['window']['endUtc']) - epoch_micros(m['window']['startUtc']) == duration * 1000000,
             'SEAL_INVALID', 'Seal hash/cohort/window/SHA mismatch')
     require(not any((target / x).exists() for x in ('execution-receipt.json', 'launch-receipt.json', 'runner-start.json')),
             'DUPLICATE_RUN', 'Experiment already attempted; no restart')
@@ -461,6 +481,10 @@ def evidence_stats(target):
 
 def first_observation(target, launch, end):
     # ONE bounded complete line only, after stop. Not a claim of all-source start.
+    # Real callers supply original clocks; numeric legacy test seams carry only their available precision.
+    from decimal import Decimal
+    launch_exact = epoch_micros(launch) if isinstance(launch, str) else int(Decimal(str(launch)) * 1000000)
+    end_exact = epoch_micros(end) if isinstance(end, str) else int(Decimal(str(end)) * 1000000)
     result = {'actualObservationStartUtc': None, 'observationStartProvenance': 'not observable: no valid first REST poll evidence',
               'perSourceObservationStartUtc': {'CHAIN': None, 'REST_TRADES': None, 'REST_ACTIVITY': None},
                 'perSourceObservationStartProvenance': {},
@@ -477,7 +501,7 @@ def first_observation(target, launch, end):
         try:
             row = json.loads(line)
             value = row.get('requestStartUtc')
-            if row.get('source') in ('REST_TRADES', 'REST_ACTIVITY') and value and launch <= epoch(value) <= end:
+            if row.get('source') in ('REST_TRADES', 'REST_ACTIVITY') and value and launch_exact <= epoch_micros(value) <= end_exact:
                 result['actualObservationStartUtc'] = value
                 result['perSourceObservationStartUtc'][row['source']] = value
                 result['observationStartProvenance'] = name + ': first complete row requestStartUtc; REST observation only'
@@ -492,7 +516,7 @@ def first_observation(target, launch, end):
         if len(line) <= 65536 and line.endswith(b'\n'):
             try:
                 value = json.loads(line).get('firstSeenUtc')
-                if value and launch <= epoch(value) <= end:
+                if value and launch_exact <= epoch_micros(value) <= end_exact:
                     result['perSourceObservationStartUtc']['CHAIN'] = value
                     result['perSourceObservationStartProvenance']['CHAIN'] = 'raw_logs.ndjson:firstSeenUtc; first raw evidence arrival, NOT subscription startup'
             except (ValueError, TypeError, AttributeError, Blocked):
@@ -510,10 +534,27 @@ def inventory(target):
 def child_exited(child):
     return os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
 
+def sink_failure(target):
+    # Control-only marker, independent of NDJSON authority. Any present marker
+    # (even a partial diagnostic) is fail-closed, never evidence of recovery.
+    marker = target / 'shadow-data/operational-failure.json'
+    if marker.exists() or marker.is_symlink():
+        return True
+    memory = target / 'shadow-data/runtime-memory.json'
+    if memory.is_file() and not memory.is_symlink():
+        try:
+            with memory.open('rb') as stream:
+                raw = stream.read(65537)
+            return len(raw) <= 65536 and json.loads(raw).get('operationalSinkBroken') is True
+        except (OSError, ValueError, AttributeError):
+            pass
+    return False
+
 def supervise(repo, target, m, command, env, parent_token, heartbeat_seconds=30):
     # Independent guardian: not in observer process group; survives runner SIGKILL.
     # Subreaper permits bounded collection of npm/node descendants, including zombies.
     start, end = epoch(m['window']['startUtc']), epoch(m['window']['endUtc'])
+    start_exact, end_exact = epoch_micros(m['window']['startUtc']), epoch_micros(m['window']['endUtc'])
     receipt = {'classification': 'INTERNAL_ERROR', 'experimentId': target.name, 'restartCount': 0,
                'restartEvents': [], 'outageGaps': [], 'outageGapAssessment': 'UNKNOWN',
                'frozenWindow': m['window'], 'runnerPid': parent_token['pid'],
@@ -528,13 +569,13 @@ def supervise(repo, target, m, command, env, parent_token, heartbeat_seconds=30)
     mono = time.monotonic()
     try:
         require(ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0, 'LAUNCH_FAILED', 'Linux subreaper unavailable')
-        while time.time() < start:
+        while epoch_micros(utc()) < start_exact:
             if interrupted:
                 raise Blocked('INTERRUPTED', 'Interrupted before launch')
             if not owner_alive(parent_token):
                 raise Blocked('RUNNER_LOST', 'Runner died before launch')
             time.sleep(min(.02, max(0, start - time.time())))
-        require(time.time() <= start + 1 and time.time() < end, 'MISSED_START', 'Frozen start missed; no shifted window')
+        require(epoch_micros(utc()) <= start_exact + 1000000 and epoch_micros(utc()) < end_exact, 'MISSED_START', 'Frozen start missed; no shifted window')
         with (target / 'observer.log').open('xb') as log:
             child = subprocess.Popen(command, cwd=repo, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             launch = time.time()
@@ -548,18 +589,20 @@ def supervise(repo, target, m, command, env, parent_token, heartbeat_seconds=30)
             receipt['childToken'] = token
             require(captured, 'LAUNCH_FAILED', 'Could not capture /proc child identity; reserved-child cleanup required')
             def deadline(sig, frame):
-                if time.time() >= end:
+                if epoch_micros(utc()) >= end_exact:
                     raise Blocked('COMPLETE', 'Absolute frozen UTC end reached')
                 raise Blocked('INTERRUPTED', 'Premature deadline signal; fail closed')
             handlers[signal.SIGALRM] = signal.signal(signal.SIGALRM, deadline)
             signal.setitimer(signal.ITIMER_REAL, max(.000001, end - time.time()))
             write_new(target / 'launch-receipt.json', receipt)
-            require(launch <= start + 1 and launch < end, 'LAUNCH_LATE', 'Popen completed beyond fixed tolerance')
+            require(epoch_micros(receipt['actualProcessLaunchUtc']) <= start_exact + 1000000 and epoch_micros(receipt['actualProcessLaunchUtc']) < end_exact, 'LAUNCH_LATE', 'Popen completed beyond fixed tolerance')
             next_beat = 0
             with (target / 'heartbeat.ndjson').open('x') as beats:
                 while True:
                     now = time.time()
-                    if now >= end:
+                    if sink_failure(target):
+                        raise Blocked('EVIDENCE_SINK_FAILURE', 'Operational evidence sink broken; no restart')
+                    if epoch_micros(utc(now)) >= end_exact:
                         receipt['classification'] = 'COMPLETE'
                         break
                     if interrupted:
@@ -590,7 +633,7 @@ def supervise(repo, target, m, command, env, parent_token, heartbeat_seconds=30)
             signal.signal(sig, signal.SIG_IGN)
         receipt['stopRequestedUtc'] = utc()
         receipt['stopDeviationSeconds'] = time.time() - end
-        immediate = time.time() >= end
+        immediate = epoch_micros(utc()) >= end_exact
         receipt['stopSignalPolicy'] = 'FROZEN_END_IMMEDIATE_SIGKILL' if immediate else 'EARLY_STOP_BOUNDED_TERM_THEN_KILL'
         receipt['firstStopSignal'] = 'SIGKILL' if immediate else 'SIGTERM'
         if child is not None and token is not None:
@@ -619,8 +662,12 @@ def supervise(repo, target, m, command, env, parent_token, heartbeat_seconds=30)
                 receipt['directChildCleanupErrorType'] = type(e).__name__
         receipt['elapsedRunnerMonotonicSeconds'] = time.monotonic() - mono
         try:
+            if sink_failure(target) or receipt.get('exitCode') == 74:
+                receipt['operationalFailure'] = 'EVIDENCE_SINK_FAILURE'
+                if receipt['classification'] in ('COMPLETE', 'EARLY_EXIT'):
+                    receipt['classification'] = 'EVIDENCE_SINK_FAILURE'
             if receipt['actualProcessLaunchUtc'] is not None:
-                receipt.update(first_observation(target, epoch(receipt['actualProcessLaunchUtc']), end))
+                receipt.update(first_observation(target, receipt['actualProcessLaunchUtc'], m['window']['endUtc']))
             if receipt['classification'] == 'COMPLETE' and not any(evidence_stats(target).values()):
                 receipt['classification'] = 'EVIDENCE_MISSING'
             receipt['artifactInventory'] = inventory(target)
@@ -697,7 +744,7 @@ def pointer_value(value):
             re.fullmatch(r'[0-9a-f]{40}', value['approvedShadowSha']) is not None,
             'PREFLIGHT_FAILED', 'Invalid current-run identity')
     start, end = epoch(value['startUtc']), epoch(value['endUtc'])
-    require(math.isfinite(start) and math.isfinite(end) and end - start == WINDOW_SECONDS,
+    require(math.isfinite(start) and math.isfinite(end) and epoch_micros(value['endUtc']) - epoch_micros(value['startUtc']) == WINDOW_SECONDS * 1000000,
             'PREFLIGHT_FAILED', 'Invalid current-run window')
     return start, end
 
@@ -820,15 +867,15 @@ def main():
             require(args.approve_seal and args.start_utc and args.end_utc, 'SEAL_INVALID', 'Explicit operator approval/start/end required')
             require(not target.exists(), 'SEAL_INVALID', 'Existing run cannot be sealed')
             checks = preflight(repo, args.expected_shadow_sha, target)
-            seal_files(repo, target, epoch(args.start_utc), epoch(args.end_utc), checks)
+            seal_files(repo, target, epoch(args.start_utc), epoch(args.end_utc), checks, original_window={'startUtc': args.start_utc, 'endUtc': args.end_utc})
             return 0
         m = validate(repo, target, args.expected_shadow_sha)
         validated = True
-        require(time.time() < epoch(m['window']['startUtc']), 'MISSED_START', 'Runner not ready before frozen start')
+        require(epoch_micros(utc()) < epoch_micros(m['window']['startUtc']), 'MISSED_START', 'Runner not ready before frozen start')
         baseline = json.loads((target / 'preflight.json').read_text())['poly2']
         preflight(repo, args.expected_shadow_sha, target, baseline)
         # Fail before creating HOME/start marker if seal has missed its start.
-        require(time.time() < epoch(m['window']['startUtc']), 'MISSED_START', 'Runner not ready before frozen start')
+        require(epoch_micros(utc()) < epoch_micros(m['window']['startUtc']), 'MISSED_START', 'Runner not ready before frozen start')
         env = runtime_env(target)
         (target / 'runtime-home').mkdir()
         publish_current_run(repo, target, m, args.current_run_pointer)

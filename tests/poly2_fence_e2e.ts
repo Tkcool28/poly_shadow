@@ -1,0 +1,34 @@
+import { readFileSync } from 'node:fs';
+import { sealFencedArchive, validateFencedArchive } from '../src/compare/poly2-fenced-archive.js';
+import { compare } from '../src/compare/phase4.js';
+import { canonical, digest } from '../src/compare/poly2-snapshot.js';
+import assert from 'node:assert/strict';
+const input=JSON.parse(readFileSync(process.argv[2]!, 'utf8'));
+const archive=sealFencedArchive(input);
+validateFencedArchive(archive,input.binding.cohort,input.binding.window,true);
+const result=compare(archive,new Map(),input.binding.window,w=>input.binding.cohort.includes(w)?'CONTROLLED_OVERLAP':null,new Map());
+let checks=0;
+const rejected=(mutate:(x:any)=>void)=>{
+  const x=structuredClone(input); mutate(x);
+  // Rehash mutated chains so semantics, not just old byte hashes, must reject.
+  for (const journal of [x.fenceJournal,x.drainJournal]) journal.forEach((e:any,i:number)=>{ e.previousSha256=i?digest(journal[i-1]):null; if ('seq' in e) e.seq=i+1; else e.cursor=i+1; });
+  assert.throws(()=>sealFencedArchive(x)); checks++;
+};
+rejected(x=>{x.fenceJournal=x.fenceJournal.filter((e:any)=>e.kind!=='ACK');});
+rejected(x=>{x.fenceJournal=x.fenceJournal.filter((e:any)=>e.kind!=='COMMITTED');});
+rejected(x=>{x.fenceJournal.find((e:any)=>e.kind==='ATTEMPT').payload.worker='unknown:worker';});
+rejected(x=>{x.fenceJournal.find((e:any)=>e.kind==='CLOSE').observedUtc=x.binding.window.endUtc;});
+rejected(x=>{x.fenceJournal.find((e:any)=>e.kind==='FENCE').payload.committed++;});
+rejected(x=>{x.fenceJournal.find((e:any)=>e.kind==='FREEZE').payload.frozenIds.push(3);});
+rejected(x=>{x.fenceJournal.find((e:any)=>e.kind==='FREEZE').payload.query.sourceFactsSha256='0'.repeat(64);});
+rejected(x=>{x.fenceJournal.find((e:any)=>e.kind==='COMMITTED').payload.witness.trades[0].ingestedUtc='2026-01-02T00:00:00.000001Z';});
+rejected(x=>{x.drainJournal.at(-1).perId['event:1'].state='NO_INITIAL_DECISION_EXPECTED';});
+rejected(x=>{x.drainJournal.at(-1).perId['event:1'].state='PENDING';});
+rejected(x=>{x.drainJournal.at(-1).perId['event:1'].decision.decisionUtc=x.binding.window.endUtc;});
+rejected(x=>{x.drainJournal.at(-1).query.decisionsSha256='0'.repeat(64);});
+rejected(x=>{x.binding.evidenceKind='observational';});
+const altered=structuredClone(archive); altered.manifest.fenceReceiptSha256='0'.repeat(64);
+assert.throws(()=>validateFencedArchive(altered,input.binding.cohort,input.binding.window,true)); checks++;
+assert.throws(()=>validateFencedArchive(archive,input.binding.cohort,input.binding.window)); checks++;
+assert.equal(canonical(sealFencedArchive(input)),canonical(archive));
+console.log(JSON.stringify({ids:archive.rows.map(r=>r.sourceRecordId),decisionClocks:archive.rows.map(r=>r.decisionUtc),normalized:archive.rows.map(r=>r.normalizedUtc),comparisonPrimary:result.coverage.poly2Only,negativeReplayChecks:checks,manifest:archive.manifest}));

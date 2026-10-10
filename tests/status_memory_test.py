@@ -8,6 +8,21 @@ spec=importlib.util.spec_from_file_location('collector',Path(__file__).resolve()
 assert spec and spec.loader
 c=importlib.util.module_from_spec(spec);spec.loader.exec_module(c)
 class MemoryTests(unittest.TestCase):
+ def test_sink_failure_control_overrides_green_while_process_alive(self):
+  with tempfile.TemporaryDirectory() as d:
+   root=Path(d);(root/'shadow-data').mkdir()
+   token={'pid':123,'startTicks':'7','pgid':123,'session':123}
+   (root/'shadow-data/runtime-memory.json').write_text(json.dumps(dict(token=token,atUtc=c.utc(1000),dataQuality={'state':'GREEN','rules':[]})))
+   failure=dict(token=token,atUtc=c.utc(1000),code='EVIDENCE_SINK_FAILURE',operationalSinkBroken=True,operationalSink={'state':'BROKEN','code':'EVIDENCE_SINK_FAILURE','file':'runtime_telemetry.ndjson','error':'Error: ENOSPC exact','secret':'not exported'},secret='not exported')
+   (root/'shadow-data/operational-failure.json').write_text(json.dumps(failure))
+   with patch.object(c,'process_status',return_value={'alive':True}),patch.object(c,'proc',return_value=dict(token,ppid=1,state='S')):
+    for now in (1000,1040):
+     m=c.memory_status(root,token,now)
+     self.assertTrue(m['operationalSinkBroken'])
+     self.assertEqual(m['failureClass'],'EVIDENCE_SINK_FAILURE')
+     self.assertEqual(m['dataQuality'],{'state':'AT_RISK','rules':['EVIDENCE_SINK_FAILURE']})
+     self.assertEqual(m['operationalSink']['error'],'Error: ENOSPC exact')
+     self.assertNotIn('secret',str(m))
  def test_missing_is_unknown(self):
   with tempfile.TemporaryDirectory() as d:
    m=c.memory_status(Path(d),{},1000)

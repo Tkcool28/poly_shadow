@@ -49,11 +49,42 @@ class BindingTests(unittest.TestCase):
         self.assertEqual(result['shadowSha'], SHA); self.assertEqual(result['state'], 'SEALED')
         self.assertEqual(result['window']['startUtc'], START); self.assertFalse(result['currentActive'])
         self.assertEqual(result['binding']['status'], 'VALID')
+    def test_committed_sink_failure_survives_observer_exit_without_live_control(self):
+        spec = importlib.util.spec_from_file_location('status_fixture_runner', Path(__file__).resolve().parents[1] / 'scripts/phase4-runner.py')
+        assert spec and spec.loader
+        runner = importlib.util.module_from_spec(spec); spec.loader.exec_module(runner)
+        receipt = {'classification': 'EVIDENCE_SINK_FAILURE'}
+        runner.terminal_metadata(receipt, self.target)
+        runner.publish_report(self.target, receipt)
+        self.assertTrue(runner.report_valid(self.target))
+        token = dict(pid=123, startTicks='7', pgid=123, session=123)
+        (self.target/'launch-receipt.json').write_text(json.dumps(dict(childToken=token)))
+        (self.target/'shadow-data/operational-failure.json').write_text(json.dumps(dict(
+            token=token, atUtc=START, code='EVIDENCE_SINK_FAILURE', operationalSinkBroken=True)))
+        with patch.object(c, 'proc', return_value=None), patch.object(c, 'memory_status', side_effect=AssertionError('exited observer must not require live control')):
+            result = c.collect(now=c.epoch(START)+10, cache_path=self.root/'cache.json', health_provider=lambda:{},
+                               pointer_path=self.pointer, runs_root=self.targets)
+        self.assertFalse(result['processes']['observer']['alive'])
+        self.assertEqual(result['state'], 'FAILED')
+        self.assertFalse(result['currentActive'])
+        self.assertEqual(result['memory']['status'], 'unknown')
+        self.assertTrue(result['terminal']['bindingValid'])
+        self.assertEqual(result['terminal']['classification'], 'EVIDENCE_SINK_FAILURE')
+        self.assertEqual(result['terminal']['exitReason'], 'EVIDENCE_SINK_FAILURE')
+        self.assertFalse(result['terminal']['completedLifecycleOnly'])
+
     def test_pointer_mismatches(self):
-        for field, value in [('approvedShadowSha','b'*40),('approvedShadowSha','g'*40),('runId','wrong'),('endUtc','2030-01-03T00:00:00Z'),('startUtc','2030-01-01T01:00:00+01:00'),('schemaVersion',True),('lifecycleState','INACTIVE')]:
+        for field, value in [('approvedShadowSha','b'*40),('approvedShadowSha','g'*40),('runId','wrong'),('endUtc','2030-01-03T00:00:00Z'),('startUtc','2030-01-01T01:00:00.000001+01:00'),('schemaVersion',True),('lifecycleState','INACTIVE')]:
             with self.subTest(field=field):
                 old=self.binding[field]; self.binding[field]=value; self.save()
                 self.unknown(self.collect()); self.binding[field]=old
+    def test_equivalent_offset_binding_and_microsecond_mismatch(self):
+        original = self.binding['startUtc']
+        self.binding['startUtc'] = '2030-01-01T01:00:00+01:00'
+        self.save()
+        self.assertEqual(self.collect()['binding']['status'], 'VALID')
+        self.binding['startUtc'] = original
+
     def test_manifest_mismatches(self):
         for field,value in [('experimentDirectory',str(self.targets)),('shadowSha','b'*40),('state','RUNNING'),('durationSeconds',1)]:
             with self.subTest(field=field):

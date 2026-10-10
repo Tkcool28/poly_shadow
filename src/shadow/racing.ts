@@ -15,6 +15,7 @@
  *   reconciliation.ndjson    group membership: FIRST / CORROBORATOR
  */
 
+import { clockEvidence } from '../compare/exact-clock.js';
 import { appendFileSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -83,6 +84,7 @@ export interface SourceObservationRow {
   groupKey: string;
   /** Metadata hydration state — raw observation survives regardless. */
   hydration: 'FULL' | 'PARTIAL';
+  clockEvidence?: ReturnType<typeof clockEvidence>;
 }
 
 export interface ReconciliationRow {
@@ -192,9 +194,13 @@ export function normalizeRestRaw(raw:RestRawRow):SourceObservationRow {
 
 export class RacingStore {
   readonly dir: string;
-  constructor(dir: string) {
+  constructor(dir: string, private publicationGate:()=>void=()=>{}) {
     this.dir = dir;
     mkdirSync(dir, { recursive: true });
+  }
+  gatePublications(gate:()=>void):void {
+    const prior=this.publicationGate;
+    this.publicationGate=()=>{prior();gate();};
   }
 
   private db: DatabaseSync | null=null;
@@ -220,6 +226,7 @@ export class RacingStore {
       racingIndexFile:this.indexFile,racingIndexLastProgressUtc:this.indexLastProgressUtc};
   }
   initializeIndex(): Promise<void> {
+    try {this.publicationGate();} catch(error) {return Promise.reject(error);}
     if (this.indexInvalid) return Promise.reject(new EvidenceIndexError('racing index invalid; close and reopen store to rebuild authoritative evidence'));
     if(this.rebuilding) return this.rebuilding;
     if(this.db) return Promise.resolve();
@@ -341,8 +348,13 @@ export class RacingStore {
     this.recoveryAppend('reconciliation.ndjson',{groupKey:row.groupKey,source:row.source,identity:row.identity,position,atUtc:row.sourceFirstSeenUtc});
   }
   private recoveryAppend(name:string,row:unknown):void {
+    this.publicationGate(); // recovery can resume after another source breaks the sink
     // Only the startup owner may publish while rebuildActive; any error is
     // caught by rebuildIndex and latches the store invalid before delivery.
+    if (name === 'source_observations.ndjson') {
+      const original = row as Record<string, unknown>;
+      row = {...original, clockEvidence: clockEvidence(original, ['sourceFirstSeenUtc','completedUtc'])};
+    }
     appendFileSync(this.file(name),JSON.stringify(row)+'\n');
     this.indexRow(name,row);
   }
@@ -379,6 +391,7 @@ export class RacingStore {
   hasGroup(key:string):boolean {this.index();return !!this.stmt('SELECT key FROM groups WHERE key=?').get(key);}
   private file(name: string): string { return join(this.dir, name); }
   private append(name: string, row: unknown): void {
+    this.publicationGate(); // outside the index-error wrapper: retain the exact sink error
     if(this.rebuildActive) throw Error('cannot append during racing index rebuild');
     this.assertUsable();
     try {
@@ -401,7 +414,7 @@ export class RacingStore {
 
   appendRestRaw(row: RestRawRow): void { this.append('rest_raw.ndjson', row); }
   appendPollTelemetry(row: PollTelemetryRow): void { this.append('poll_telemetry.ndjson', row); }
-  appendSourceObservation(row: SourceObservationRow): void { this.append('source_observations.ndjson', row); }
+  appendSourceObservation(row: SourceObservationRow): void { this.append('source_observations.ndjson', { ...row, clockEvidence: clockEvidence(row as unknown as Record<string, unknown>, ['sourceFirstSeenUtc','completedUtc']) }); }
   appendReconciliation(row: ReconciliationRow): void { this.append('reconciliation.ndjson', row); }
 
   restRaw(): RestRawRow[] { return this.readAll('rest_raw.ndjson'); }

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { ShadowStore } from '../src/shadow/storage.js';
 import { ChainWatcher } from '../src/shadow/watcher.js';
+import { OperationalEvidence } from '../src/shadow/operational-evidence.js';
 import { RacingStore, Reconciler, chainGroupKey, publishChainObservation } from '../src/shadow/racing.js';
 import { startMemoryPublisher } from '../src/shadow/runtime-memory.js';
 import { EXCHANGE_V2_STANDARD, TOPIC_ORDER_FILLED_V2 } from '../src/shadow/v2constants.js';
@@ -26,8 +27,10 @@ for(const stage of ['reconciliation','source','completion'] as const) for(const 
    ? vi.spyOn(store,'appendDisposition').mockImplementation(row=>{if(fail&&row.disposition==='OBSERVED')throw Error('completion failure');originalDisposition(row);})
    : vi.spyOn(racing,stage==='reconciliation'?'appendReconciliation':'appendSourceObservation').mockImplementation(()=>{if(fail) throw Error('injected publication failure');});
   const spy=installFailure();
-  let watcher=new ChainWatcher(cfg,store,()=>now,rpc,callback);
+  const operational=new OperationalEvidence(dir);
+  let watcher=new ChainWatcher(cfg,store,()=>now,rpc,callback,operational);
   await watcher.handleLog(log,arrival);
+  expect(operational.quarantineState().unresolved).toBe(1);
   const canonical=store.observations()[0]!;expect(canonical).toBeDefined();
   expect(store.identityState(identity).disposition).toBe('PENDING');
   await watcher.scanRange(1,1);expect(store.readCursor(cfg.polygonHttpRpcUrl)).toBeNull();
@@ -56,8 +59,10 @@ for (const stage of ['canonical', 'source', 'group', 'position'] as const) it(`s
  const table={canonical:'canonical_observations',source:'identities',group:'groups',position:'positions'}[stage];
  (target as any).db.exec(`CREATE TRIGGER fail_update BEFORE INSERT ON ${table} BEGIN SELECT RAISE(FAIL, 'injected index failure'); END`);
  const callback=(obs:any)=>publishChainObservation(racing,reconciler,obs);
- let watcher=new ChainWatcher(cfg,store,()=>completion,rpc,callback);
+ const operational=new OperationalEvidence(dir);
+ let watcher=new ChainWatcher(cfg,store,()=>completion,rpc,callback,operational);
  await expect(watcher.handleLog(log,arrival)).rejects.toThrow(/index invalid/);
+ expect(operational.quarantineState()).toMatchObject({unresolved:1,total:1});
  const files=['raw_logs.ndjson','dispositions.ndjson','observations.ndjson','source_observations.ndjson','reconciliation.ndjson','quarantine.ndjson'];
  const bytes=()=>files.map(file=>existsSync(join(dir,file))?readFileSync(join(dir,file),'utf8'):null);
  const before=bytes();

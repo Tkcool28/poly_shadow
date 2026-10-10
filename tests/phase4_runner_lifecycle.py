@@ -33,6 +33,13 @@ def fixture_run(repo, target, duration, mode):
         command = [sys.executable, SELF, '--dummy', mode]
         if mode == 'launchfail':
             command = [str(repo / 'missing-harmless-fixture')]
+        if mode == 'sink-at-end-control':
+            real_stop = runner.stop_owned
+            def stop_with_failure(*args, **kwargs):
+                result = real_stop(*args, **kwargs)
+                (target / 'shadow-data/operational-failure.json').write_text('{')
+                return result
+            setattr(runner, 'stop_owned', stop_with_failure)
         if mode == 'term-tree':
             real_killpg = os.killpg
             def traced_killpg(pgid, sig):
@@ -105,6 +112,13 @@ def dummy(mode):
         time.sleep(30)
         return
     data = Path(os.environ['SHADOW_DATA_DIR'])
+    if mode == 'sink-exit-no-diagnostic':
+        # Reserved observer exit survives unavailable disk/stderr diagnostics.
+        sys.exit(74)
+    if mode == 'sink-broken-alive':
+        (data / 'operational-failure.json').write_text(json.dumps({'code': 'EVIDENCE_SINK_FAILURE'}))
+        time.sleep(30)
+        return
     if mode in ('grandchild', 'term-grandchild'):
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         if mode == 'term-grandchild':
@@ -191,6 +205,18 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(runner.digest(self.target / 'execution-receipt.json'),
                          json.loads((self.target / 'execution-receipt.sha256.json').read_text())['sha256'])
         return r
+
+    def test_operational_sink_failure_never_completes_window(self):
+        for mode in ('sink-broken-alive', 'sink-exit-no-diagnostic', 'sink-at-end-control'):
+            with self.subTest(mode=mode):
+                self.target = self.repo / ('runs/phase4-' + mode)
+                self.seal()
+                p = self.launch(mode)
+                receipt = self.receipt(p)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertEqual(receipt['classification'], 'EVIDENCE_SINK_FAILURE')
+                self.assertEqual(receipt['observationPhase'], 'FAILED')
+                self.assertNotEqual(receipt['classification'], 'END_WINDOW_COMPLETE')
 
     def test_tracked_runs_dirty_rejected_before_production_adapter(self):
         def lookup(cmd, cwd=None):

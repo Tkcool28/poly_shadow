@@ -7,10 +7,15 @@ Every evidence read and receipt is bounded to 128 KiB; raw CHAIN is stat-only.
 import datetime as dt
 import fcntl
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
+import types
+_CLOCK_PATH = Path(__file__).resolve().parents[1] / 'exact_clock.py'
+_CLOCK = types.ModuleType('status_exact_clock')
+exec(compile(_CLOCK_PATH.read_bytes(), str(_CLOCK_PATH), 'exec', dont_inherit=True), _CLOCK.__dict__)
+epoch_micros = _CLOCK.epoch_micros
+
 import stat
 import sys
 import tempfile
@@ -25,7 +30,7 @@ LIMIT = 128 * 1024
 WINDOW_SECONDS = 86400
 SOURCES = ('CHAIN', 'REST_TRADES', 'REST_ACTIVITY')
 FILES = ('raw_logs.ndjson', 'source_observations.ndjson', 'rest_raw.ndjson', 'poll_telemetry.ndjson')
-CODES = {'END_WINDOW_COMPLETE', 'MISSED_START', 'OBSERVER_EXITED_EARLY', 'SIGNAL_TERMINATION', 'PRESTART_GATE_FAILED', 'WINDOW_SEAL_FAILED', 'OBSERVER_START_FAILED', 'CLEANUP_FAILED', 'EVIDENCE_MISSING', 'REPORT_FAILED', 'INTERNAL_ERROR'}
+CODES = {'END_WINDOW_COMPLETE', 'MISSED_START', 'OBSERVER_EXITED_EARLY', 'SIGNAL_TERMINATION', 'PRESTART_GATE_FAILED', 'WINDOW_SEAL_FAILED', 'OBSERVER_START_FAILED', 'CLEANUP_FAILED', 'EVIDENCE_MISSING', 'REPORT_FAILED', 'INTERNAL_ERROR', 'EVIDENCE_SINK_FAILURE'}
 
 
 def utc(t):
@@ -34,8 +39,7 @@ def utc(t):
 
 def epoch(value):
     try:
-        parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
-        return parsed.timestamp() if parsed.tzinfo else None
+        return epoch_micros(value) / 1000000 # diagnostic units only
     except (ValueError, TypeError, AttributeError, OverflowError):
         return None
 
@@ -229,6 +233,9 @@ def memory_status(run, observer_token, now):
         for suffix in ('Invalid', 'RebuildActive', 'File', 'LastProgressUtc', 'ProgressAgeSeconds'):
             result[prefix + suffix] = None
     row = obj(run / 'shadow-data/runtime-memory.json')
+    control = obj(run / 'shadow-data/operational-failure.json')
+    if control.get('code') == 'EVIDENCE_SINK_FAILURE' and control.get('operationalSinkBroken') is True:
+        row = control
     stamp = epoch(row.get('atUtc'))
     token = row.get('token', {})
     if not isinstance(token, dict) or not isinstance(observer_token, dict):
@@ -247,6 +254,15 @@ def memory_status(run, observer_token, now):
     if not related or not process_status(token).get('alive'):
         return result
     result['identityVerified'] = True
+    result['operationalSinkBroken'] = row.get('operationalSinkBroken') if type(row.get('operationalSinkBroken')) is bool else None
+    result['failureClass'] = ('EVIDENCE_SINK_FAILURE' if result['operationalSinkBroken'] is True
+                              else row.get('failureClass') if row.get('failureClass') == 'SOURCE_FAILURE' else None)
+    sink = row.get('operationalSink')
+    result['operationalSink'] = ({k: sink.get(k) for k in ('state', 'code', 'file', 'error')}
+                                 if isinstance(sink, dict) and sink.get('state') in ('READY', 'BROKEN') else None)
+    if result['operationalSinkBroken'] is True:
+        result['dataQuality'] = {'state': 'AT_RISK', 'rules': ['EVIDENCE_SINK_FAILURE']}
+        result['warnings'].append('EVIDENCE_SINK_FAILURE')
     if stamp is None or not 0 <= now-stamp <= 30:
         result['warnings'].append('runtime memory telemetry stale or unavailable; progress unknown')
         return result
@@ -268,6 +284,9 @@ def memory_status(run, observer_token, now):
     if progress is not None and progress <= now:
         result.update(lastProgressUtc=utc(progress), progressAgeSeconds=now-progress)
     result['replayActive'] = row.get('replayActive') if type(row.get('replayActive')) is bool else None
+    quality = row.get('dataQuality')
+    if result['operationalSinkBroken'] is not True:
+        result['dataQuality'] = quality if isinstance(quality, dict) and quality.get('state') in ('GREEN', 'DEGRADED', 'AT_RISK', 'UNKNOWN') else None
     index_files = {'raw_logs.ndjson', 'raw_log_tombstones.ndjson', 'observations.ndjson',
                    'dispositions.ndjson', 'quarantine.ndjson', 'rest_raw.ndjson',
                    'source_observations.ndjson', 'reconciliation.ndjson'}
@@ -312,10 +331,7 @@ def unknown_memory():
 def utc_epoch(value):
     if not isinstance(value, str):
         raise ValueError('UTC timestamp required')
-    parsed = dt.datetime.fromisoformat(value.replace('Z', '+00:00'))
-    if parsed.tzinfo is None or parsed.utcoffset() != dt.timedelta(0):
-        raise ValueError('UTC timestamp required')
-    return parsed.timestamp()
+    return epoch_micros(value) / 1000000 # display/scheduling, never binding authority
 
 
 def binding_context(run, pointer_path, runs_root):
@@ -353,11 +369,11 @@ def binding_context(run, pointer_path, runs_root):
         if not isinstance(window, dict) or not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha):
             raise ValueError('manifest SHA/window')
         start, end = utc_epoch(window.get('startUtc')), utc_epoch(window.get('endUtc'))
-        if manifest.get('state') != 'SEALED_NOT_STARTED' or manifest.get('experimentDirectory') != str(run) or type(manifest.get('durationSeconds')) is not int or manifest['durationSeconds'] != WINDOW_SECONDS or end-start != WINDOW_SECONDS:
+        if manifest.get('state') != 'SEALED_NOT_STARTED' or manifest.get('experimentDirectory') != str(run) or type(manifest.get('durationSeconds')) is not int or manifest['durationSeconds'] != WINDOW_SECONDS or epoch_micros(window['endUtc'])-epoch_micros(window['startUtc']) != WINDOW_SECONDS * 1000000:
             raise ValueError('manifest mismatch')
-        if not explicit and (pointer.get('runId') != run.name or pointer.get('approvedShadowSha') != sha or utc_epoch(pointer.get('startUtc')) != start or utc_epoch(pointer.get('endUtc')) != end):
+        if not explicit and (pointer.get('runId') != run.name or pointer.get('approvedShadowSha') != sha or epoch_micros(pointer.get('startUtc')) != epoch_micros(window['startUtc']) or epoch_micros(pointer.get('endUtc')) != epoch_micros(window['endUtc'])):
             raise ValueError('pointer mismatch')
-        return {'run': run, 'start': start, 'end': end, 'sha': sha, 'explicit': explicit}, 'VALID'
+        return {'run': run, 'start': start, 'end': end, 'sha': sha, 'explicit': explicit, 'window': window}, 'VALID'
     except (OSError, ValueError, TypeError, OverflowError):
         return None, 'INVALID_BINDING'
 
@@ -376,6 +392,53 @@ def unbound_status(now, state):
             'poly2': dict(reduce_health({}, now), ageSeconds=None), 'disk': {'availableBytes': None},
             'boundedReads': {'maxBytesPerEvidenceFile': LIMIT, 'chainRawBytes': 0},
             'warnings': [state + ': no trusted current run; telemetry unknown']}
+
+
+def poly2_capture_status(run, start, end, now, window=None):
+    """Bounded diagnostic only; never turns a cached health row into source proof."""
+    from decimal import Decimal
+    start_exact = epoch_micros(window['startUtc']) if window else int(Decimal(str(start)) * 1000000)
+    end_exact = epoch_micros(window['endUtc']) if window else int(Decimal(str(end)) * 1000000)
+    path = run / 'poly2-comparison-capture/poly2_capture_health.json'
+    unknown = {'state': 'NOT_ARMED', 'quality': 'UNKNOWN_UNPROVEN',
+               'lastSuccessUtc': None, 'cursor': None, 'endCoverage': False,
+               'failures': None, 'gaps': None, 'count': None, 'error': None,
+               'scope': 'prospective capture diagnostic; not producer/cursor proof'}
+    if not path.exists():
+        return unknown
+    value = obj(path)
+    bound = value.get('binding', {})
+    try:
+        canonical_binding = json.dumps(bound, sort_keys=True, separators=(',', ':'), ensure_ascii=False, allow_nan=False)
+        valid = (value.get('version') == 1 and bound.get('shadowRunId') == run.name
+                 and epoch_micros(bound.get('window', {}).get('startUtc')) == start_exact
+                 and epoch_micros(bound.get('window', {}).get('endUtc')) == end_exact
+                 and value.get('bindingSha256') == hashlib.sha256(canonical_binding.encode()).hexdigest()
+                 and len(bound.get('cohort', [])) == 5
+                 and len(set(bound.get('cohort', []))) == 5
+                 and value.get('state') in ('ARMED', 'ACTIVE', 'SEALED', 'FAILED')
+                 and value.get('quality') in ('HEALTHY', 'AT_RISK')
+                 and all(type(value.get(k)) is int and value[k] >= 0 for k in ('cursor', 'failures', 'count'))
+                 and type(value.get('endCoverage')) is bool
+                 and isinstance(value.get('gaps'), list)
+                 and all(isinstance(g, str) for g in value['gaps'])
+                 and (value.get('lastSuccessUtc') is None or epoch(value['lastSuccessUtc']) is not None))
+    except (TypeError, ValueError, AttributeError):
+        valid = False
+    if not valid:
+        return {**unknown, 'state': 'UNVERIFIED', 'quality': 'AT_RISK', 'error': 'malformed or misbound capture diagnostic'}
+    result = {k: value.get(k) for k in ('state', 'quality', 'lastSuccessUtc', 'cursor', 'endCoverage', 'failures', 'gaps', 'count', 'error')}
+    last = epoch(result['lastSuccessUtc'])
+    result['ageSeconds'] = max(0, now-last) if last is not None else None
+    if result['state'] == 'ACTIVE' and (last is None or now-last > 90):
+        result['quality'] = 'AT_RISK'
+        result['endCoverage'] = False
+        result['error'] = result['error'] or 'capture source receipt stale; continuity unproven'
+    if result['gaps'] or result['state'] == 'FAILED':
+        result['endCoverage'] = False
+        result['quality'] = 'AT_RISK'
+    result['scope'] = unknown['scope']
+    return result
 
 
 def collect(run=None, now=None, cache_path=CACHE, health_provider=production_health,
@@ -518,7 +581,8 @@ def collect(run=None, now=None, cache_path=CACHE, health_provider=production_hea
             'currentInactive': not current_active, 'historical': historical,
             'binding': {'status': binding, 'mode': 'historical' if context['explicit'] else 'current', 'runDirectory': str(run)},
             'scope': 'Operational status only. COMPLETE means lifecycle completion only.',
-            'window': {'startUtc': utc(START), 'endUtc': utc(END),
+            'window': {'startUtc': context['window']['startUtc'], 'endUtc': context['window']['endUtc'],
+                       'clockEvidence': _CLOCK.evidence(context['window'], ['startUtc','endUtc']),
                        'startMdt': dt.datetime.fromtimestamp(START, ZoneInfo('America/Denver')).strftime('%Y-%m-%d %H:%M %Z'),
                        'endMdt': dt.datetime.fromtimestamp(END, ZoneInfo('America/Denver')).strftime('%Y-%m-%d %H:%M %Z'),
                        'elapsedSeconds': round(max(0, min(END-START, now-START))),
@@ -531,7 +595,8 @@ def collect(run=None, now=None, cache_path=CACHE, health_provider=production_hea
                          'scope': 'total: all regular direct shadow-data files, stat-only; growth: four required files only; shared sizes are not per-source counts; CHAIN raw stat-only'},
             'sources': sources, 'quarantine': {'count': len(quarantine) if q_complete or q_absent else None,
                         'sampleCount': len(quarantine), 'scope': 'file absent' if q_absent else 'complete file' if q_complete else 'bounded tail; full count unknown', 'recoveryRequired': recovery},
-            'poly2': health, 'disk': {'availableBytes': free, 'warningThresholdBytes': 10*1024**3},
+            'poly2': health, 'poly2ComparisonCapture': poly2_capture_status(run, START, END, now, context['window']),
+            'disk': {'availableBytes': free, 'warningThresholdBytes': 10*1024**3},
             'boundedReads': {'maxBytesPerEvidenceFile': LIMIT, 'heartbeatBytes': heartbeat_read, 'sourceObservationBytes': obs_read,
                              'pollTelemetryBytes': polls_read, 'restRawBytes': rest_read, 'quarantineBytes': q_read, 'chainRawBytes': 0},
             'warnings': warnings}

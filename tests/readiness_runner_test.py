@@ -207,6 +207,7 @@ class Readiness(unittest.TestCase):
         # lifecycle fork or production adapter is reachable from this harness.
         helper = self.repo/'scripts/phase4-runner.py'
         helper.write_bytes((ROOT/'scripts/phase4-runner.py').read_bytes())
+        helper.with_name('exact_clock.py').write_bytes((ROOT / 'scripts/exact_clock.py').read_bytes())
         (self.repo/'runs').mkdir()
         pointer = self.root/'current-run.json'
         args = ['runner', 'run', '--experiment', str(self.target), '--expected-shadow-sha', SHA,
@@ -259,6 +260,7 @@ class Readiness(unittest.TestCase):
     def test_duplicate_pointer_rejected_preserved_no_lifecycle(self):
         helper = self.repo / 'scripts/phase4-runner.py'
         helper.write_bytes((ROOT / 'scripts/phase4-runner.py').read_bytes())
+        helper.with_name('exact_clock.py').write_bytes((ROOT / 'scripts/exact_clock.py').read_bytes())
         (self.repo / 'runs').mkdir()
         start = time.time() + 100
         with mock.patch.object(runner, '__file__', str(helper)):

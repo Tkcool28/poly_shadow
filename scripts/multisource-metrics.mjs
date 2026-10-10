@@ -9,6 +9,7 @@
 
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { epochMicros, secondsMicros } from '../src/compare/exact-clock.ts';
 
 const dir = process.argv[2] ?? './shadow-data';
 
@@ -50,15 +51,15 @@ for (const r of rec.filter((x) => x.position === 'FIRST')) {
 function latencyStats(s) {
   const ds = bySource(s)
     .filter((o) => o.sourceTs !== null && o.sourceFirstSeenUtc)
-    .map((o) => Date.parse(o.sourceFirstSeenUtc) / 1000 - o.sourceTs)
-    .filter((d) => d >= 0 && d < 86_400)
-    .sort((a, b) => a - b);
+    .map((o) => epochMicros(o.sourceFirstSeenUtc) - secondsMicros(o.sourceTs))
+    .filter((d) => d >= 0n && d < 86400000000n)
+    .sort((a, b) => a < b ? -1 : a > b ? 1 : 0).map(d => Number(d) / 1000000);
   return { n: ds.length, p50: pct(ds, 50), p95: pct(ds, 95) };
 }
 
 // REST response delay + cache behavior.
 const restTel = tel.filter((t) => t.responseUtc);
-const delays = restTel.map((t) => Date.parse(t.responseUtc) - Date.parse(t.requestStartUtc)).sort((a, b) => a - b);
+const delays = restTel.map((t) => epochMicros(t.responseUtc) - epochMicros(t.requestStartUtc)).sort((a,b) => a < b ? -1 : a > b ? 1 : 0).map(d => Number(d) / 1000);
 const ages = restTel.map((t) => Number(t.ageHeader)).filter((a) => !Number.isNaN(a)).sort((a, b) => a - b);
 
 const report = {

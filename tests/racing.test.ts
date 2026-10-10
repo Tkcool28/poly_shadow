@@ -13,7 +13,7 @@
  *  11. metadata hydration failure never loses the raw observation
  */
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -21,6 +21,7 @@ import {
   RacingStore, Reconciler, activityIdentity, chainGroupKey, tradeGroupKey, tradesIdentity,
 } from '../src/shadow/racing.js';
 import { RestPoller } from '../src/shadow/rest-poller.js';
+import { OperationalEvidence } from '../src/shadow/operational-evidence.js';
 import type { RestGetResult } from '../src/shadow/egress.js';
 
 const WATCHED = '0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029';
@@ -240,5 +241,28 @@ describe('phase 3 source racing', () => {
     expect(tel.newestSourceTs).toBe(1_724_210_494);
     // No freshness rejection: an old trade is still recorded.
     expect(store.sourceObservations()).toHaveLength(1);
+  });
+
+  it('13. REST 429 and timeout become structured quarantine evidence', async () => {
+    for (const [status,fetchFn,klass] of [[429,restOk([]), 'HTTP_429'],[503,restOk([]),'HTTP_503'],[500,restOk([]),'HTTP_FAILURE'],[null,async()=>{throw Error('timeout')},'TIMEOUT']] as const) {
+      const store=tempRacing(); const op=new OperationalEvidence((store as unknown as {dir:string}).dir);
+      const fn=status===null?fetchFn:async()=>({...(await (fetchFn as () => Promise<RestGetResult>)()),status});
+      const p=new RestPoller({source:'REST_ACTIVITY',endpoint:'activity',baseUrl:'https://data-api.test',wallets:new Set([WATCHED]),intervalMs:1000},store,new Reconciler(store),clock(),fn as never,op);
+      await p.pollAll(); expect(op.quarantineState().unresolved).toBe(1); expect(op.quarantineStateIds()).toHaveLength(1);
+      expect(JSON.parse(readFileSync(join((store as unknown as {dir:string}).dir,'quarantine_v2.ndjson'),'utf8')).errorClass).toBe(klass);
+    }
+  });
+
+  it('14. malformed REST item emits a structured quarantine before direct wallet rejection', async () => {
+    const store=tempRacing();const op=new OperationalEvidence((store as unknown as {dir:string}).dir);
+    const p=new RestPoller({source:'REST_TRADES',endpoint:'trades',baseUrl:'https://data-api.test',wallets:new Set([WATCHED]),intervalMs:1000},store,new Reconciler(store),clock(),restOk([null as never]) as never,op);
+    await expect(p.pollWallet(WATCHED)).rejects.toThrow(/malformed REST item/);expect(op.quarantineState()).toMatchObject({unresolved:1,total:1});
+  });
+
+  it('15. capped REST page creates an explicit completeness quarantine', async () => {
+    const store=tempRacing();const op=new OperationalEvidence((store as unknown as {dir:string}).dir);
+    const rows=Array.from({length:100},(_,i)=>trade({transactionHash:`0x${String(i).padStart(64,'0')}`}));
+    const p=new RestPoller({source:'REST_TRADES',endpoint:'trades',baseUrl:'https://data-api.test',wallets:new Set([WATCHED]),intervalMs:1000},store,new Reconciler(store),clock(),restOk(rows),op);
+    await p.pollAll();expect(op.quarantineState()).toMatchObject({unresolved:1,total:1});
   });
 });

@@ -20,32 +20,49 @@ import { RacingStore, Reconciler, publishChainObservation } from './racing.js';
 import { RestPoller } from './rest-poller.js';
 import { startMemoryPublisher } from './runtime-memory.js';
 import { selfToken } from './memory.js';
+import { OperationalEvidence } from './operational-evidence.js';
+import { runtimeHealthSnapshot } from './runtime-health.js';
+import { installSinkFailureControl, reportSinkFailureControl } from './operational-control.js';
 
 async function main(): Promise<void> {
   const cfg = loadConfig(); // fail-closed: throws on any credential material
+  let operational:OperationalEvidence;
+  try { operational = new OperationalEvidence(cfg.dataDir); }
+  catch (error) {
+    reportSinkFailureControl(cfg.dataDir,error,{state:'BROKEN',code:'EVIDENCE_SINK_FAILURE',file:null,error:String(error)},()=>{process.exitCode=74;});
+    throw error;
+  }
   const store = new ShadowStore(cfg.dataDir);
-  const racing = new RacingStore(cfg.dataDir);
+  const racing = new RacingStore(cfg.dataDir,()=>operational.assertUsable());
   const reconciler = new Reconciler(racing);
 
   // CHAIN source: each committed observation also enters the racer with its
   // own arrival timestamp. Chain timing evidence is never overwritten.
   const watcher = new ChainWatcher(cfg, store, undefined, undefined, (obs) => {
+    operational.assertUsable();
     publishChainObservation(racing, reconciler, obs);
-  });
+  }, operational);
 
   let trades: RestPoller | undefined;
   let activity: RestPoller | undefined;
+  let stopMemory=()=>{};
+  installSinkFailureControl(operational,cfg.dataDir,()=>{
+    process.exitCode=74;
+    // Reserved operational failure exit is independent of diagnostic disk IO.
+    setImmediate(()=>process.exit(74));
+    stopMemory(); watcher.stop(); trades?.stop(); activity?.stop();
+  });
   const initializePollers=()=>{
     trades = new RestPoller({
       source: 'REST_TRADES', endpoint: 'trades',
       baseUrl: cfg.dataApiBaseUrl, wallets: cfg.watchedWallets,
       intervalMs: cfg.tradesPollMs,
-    }, racing, reconciler);
+    }, racing, reconciler, undefined, undefined, operational);
     activity = new RestPoller({
       source: 'REST_ACTIVITY', endpoint: 'activity',
       baseUrl: cfg.dataApiBaseUrl, wallets: cfg.watchedWallets,
       intervalMs: cfg.activityPollMs,
-    }, racing, reconciler);
+    }, racing, reconciler, undefined, undefined, operational);
   };
 
   console.log('[poly-shadow] starting multi-source observation-only shadow', {
@@ -56,34 +73,46 @@ async function main(): Promise<void> {
   });
 
   // Operational mutable snapshot, separate from arrival/scientific evidence.
-  const {publish:publishMemory,stop:stopMemory}=startMemoryPublisher(cfg.dataDir,()=>({
-    ...watcher.memoryTelemetry(),...racing.indexTelemetry(),token:selfToken(),
-  }));
+  let lastAuditAt=0;
+  const memoryPublisher=startMemoryPublisher(cfg.dataDir,()=>runtimeHealthSnapshot(watcher,racing,operational,selfToken), undefined, (snapshot)=>{
+    operational.telemetry(snapshot as Record<string, unknown>);
+    if (Date.now()-lastAuditAt >= 10*60_000) { lastAuditAt=Date.now(); operational.auditSnapshot({processHealth:'ALIVE',dataQuality:(snapshot as {dataQuality?:unknown}).dataQuality ?? 'UNKNOWN',telemetry:snapshot}); }
+  }, (err)=>{ operational.quarantine({component:'PUBLISHER',source:null,sourceIdentity:null,rawEvidenceRef:null,rpcRequestId:null,errorClass:'PUBLICATION_ERROR',reason:`memory publisher: ${String(err).slice(0,256)}`,eventIdentityKnown:false,wallet:null,txHash:null,logIdentity:null,affectedRange:null,scientificImpactPossible:true}); }, ()=>{stopMemory();});
+  stopMemory=memoryPublisher.stop;
+  const publishMemory=memoryPublisher.publish;
 
   const shutdown = () => {
     stopMemory();
-    watcher.stop();
     trades?.stop();
     activity?.stop();
-    process.exit(0);
+    try { watcher.stop(); } finally { process.exit(operational.isUsable()?0:74); }
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
   try {
+    operational.assertUsable();
     await store.initializeIndex();
+    operational.assertUsable();
     await racing.initializeIndex();
+    operational.assertUsable();
     initializePollers();
     publishMemory();
     watcher.start();
     trades!.start();
     activity!.start();
   } catch (err) {
+    // Operational evidence exists before index initialization; preserve startup
+    // failure context without attempting any source or live action.
+    try {
+      operational.assertUsable(); // do not recursively quarantine a broken sink
+      operational.quarantine({component:'STARTUP',source:null,sourceIdentity:null,rawEvidenceRef:null,rpcRequestId:null,errorClass:'INDEX_ERROR',reason:`startup index/reconciliation failure: ${String(err).slice(0,256)}`,eventIdentityKnown:false,wallet:null,txHash:null,logIdentity:null,affectedRange:null,scientificImpactPossible:true});
+    } catch (sinkError) { err=sinkError; } // retain the first latched sink exception
     stopMemory();
-    watcher.stop(); trades?.stop(); activity?.stop();
+    trades?.stop(); activity?.stop(); watcher.stop();
     process.off('SIGINT', shutdown); process.off('SIGTERM', shutdown);
     store.close(); racing.close();
     throw err;
   }
 }
 
-void main().catch(err => { console.error('[poly-shadow] startup failed', err); process.exitCode=1; });
+void main().catch(err => { console.error('[poly-shadow] startup failed', err); process.exitCode ||= 1; });
