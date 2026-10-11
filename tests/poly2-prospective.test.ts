@@ -1,13 +1,14 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { appendFileSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { canonical, digest } from '../src/compare/poly2-snapshot.js';
 import { JOURNAL, ProspectiveCapture, type Binding, type SourceFrame, type TradeFact, type IO } from '../src/compare/poly2-prospective.js';
 import { buildShadowGroups, compare } from '../src/compare/phase4.js';
 import type { SourceObservationRow } from '../src/shadow/racing.js';
-const root = process.env['TMPDIR'] ?? '/root/.hermes/cache/scratch';
+const root = tmpdir();
 const dirs: string[] = [];
 const dir = () => { const d = mkdtempSync(join(root, 'prospective-capture-test-')); dirs.push(d); return d; };
 afterEach(() => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
