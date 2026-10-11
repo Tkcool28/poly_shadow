@@ -69,8 +69,8 @@ it('bounded cgroup telemetry distinguishes governing group cache/kernel usage fr
  const m=cgroupMemory(d,'0::/leaf');expect(m).toMatchObject({cgroupUsageBytes:900,cgroupLimitBytes:1000,cgroupHighBytes:800,cgroupSwapUsageBytes:12,cgroupSwapLimitBytes:30,cgroupEvents:{low:1,high:2,max:3,oom:4,oom_kill:5},cgroupMemoryStat:{file:700,kernel:100},cgroupPsi:{some:{avg10:1.25,total:123},full:{total:7}}});
  expect(cgroupMemory(d,'0::/../escape')).toEqual({cgroupUsageBytes:null,cgroupLimitBytes:null});
 });
-it('storage gate reconciles engineering envelope margin with 10GiB reserve and exact boundaries',()=>{
- const b=storageBudget();expect(b.requiredFreeBytes).toBe(b.upperBytes+b.marginBytes+10*1024**3);expect(Object.keys(b.families)).toHaveLength(8);
+it('storage gate uses expected engineering envelope plus margin and untouched 10GiB reserve',()=>{
+ const b=storageBudget();expect(b.launchBasis).toBe('expected');expect(b.launchBytes).toBe(b.expectedBytes);expect(b.requiredFreeBytes).toBe(b.expectedBytes+b.marginBytes+10*1024**3);expect(b.requiredFreeBytes).toBe(27096358240);expect(Object.keys(b.families)).toHaveLength(8);
  expect(diskState(b.requiredFreeBytes,b.seconds).state).toBe('GREEN');expect(diskState(b.requiredFreeBytes-1,b.seconds).state).toBe('DEGRADED');expect(diskState(storagePlan.alertReserveBytes-1,0).state).toBe('AT_RISK');expect(diskState(null,0).state).toBe('UNKNOWN');
  expect(()=>assertPrelaunchDisk(dir(),()=>({bavail:1,bsize:1,blocks:2}) as ReturnType<typeof import('node:fs').statfsSync>)).toThrow('PRELAUNCH_DISK_GATE');
  expect(storageTelemetry(dir(),0).files['rpc_lineage.ndjson']).toBeNull();
