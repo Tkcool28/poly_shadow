@@ -17,9 +17,11 @@ def budget(seconds=None):
     families = {k: dict(expectedBytes=math.ceil(r['expectedBytesPerSecond']*seconds), upperBytes=math.ceil(r['upperBytesPerSecond']*seconds)) for k, r in p['families'].items()}
     expected = sum(r['expectedBytes'] for r in families.values())
     upper = sum(r['upperBytes'] for r in families.values())
-    margin = math.ceil(upper*p['marginRatio'])
-    return dict(seconds=seconds, families=families, expectedBytes=expected, upperBytes=upper, marginBytes=margin,
-                reserveBytes=p['alertReserveBytes'], requiredFreeBytes=upper+margin+p['alertReserveBytes'])
+    launch = expected if p['launchBasis'] == 'expected' else upper
+    margin = math.ceil(launch*p['marginRatio'])
+    return dict(seconds=seconds, families=families, expectedBytes=expected, upperBytes=upper,
+                launchBasis=p['launchBasis'], launchBytes=launch, marginBytes=margin,
+                reserveBytes=p['alertReserveBytes'], requiredFreeBytes=launch+margin+p['alertReserveBytes'])
 
 def disk_state(available, capacity=None, seconds=None):
     b = budget(seconds)
