@@ -74,6 +74,9 @@ class PsqlConnection:
     def fetchall(self):
         return self.rows
 
+    def commit(self):
+        self.execute('COMMIT')
+
     def rollback(self):
         self.execute('ROLLBACK')
 
@@ -91,7 +94,7 @@ class NativeDrainTests(unittest.TestCase):
     def setUp(self):
         self.admin = PsqlConnection('postgres')
         self.addCleanup(self.admin.disconnect)
-        self.admin.execute('TRUNCATE paper_orders, signals, trades, wallets, markets')
+        self.admin.execute('TRUNCATE decision_log, paper_orders, signals, trades, wallets, markets')
         self.admin.execute("INSERT INTO markets VALUES(1,'condition'); INSERT INTO wallets VALUES(1,'"+COHORT[0]+"')")
         self.reader = PsqlConnection()
         self.addCleanup(self.reader.disconnect)
@@ -112,6 +115,10 @@ class NativeDrainTests(unittest.TestCase):
 
     def decision(self, ident, clock='2026-01-02T00:01:00Z'):
         self.admin.execute(f"INSERT INTO signals VALUES({ident},'event:{ident}'); INSERT INTO paper_orders VALUES({ident},{ident},'{clock}',NULL)")
+        # Immutable original-decision audit linkage required by the production adapter.
+        context = json.dumps(dict(signal_id=ident, source_trade_id=f'event:{ident}', reason=None))
+        self.admin.execute('INSERT INTO decision_log(actor,action,context) VALUES(%s,%s,%s::jsonb)',
+                           ['bot', 'paper_order_executed', context])
 
     def test_A_all_before_end_native_read_only_and_equation(self):
         self.trade(1)
@@ -179,6 +186,85 @@ class NativeDrainTests(unittest.TestCase):
         p = self.producer()
         self.assertEqual(p.step(),f)
         self.assertEqual(p.status()['cursor'],cursor)
+
+    def test_four_writer_instances_each_missing_enrollment_or_ack_blocks_restart_closure(self):
+        spec = importlib.util.spec_from_file_location('drain_native_four_writer_fence', ROOT/'scripts/poly2-comparison-fence.py')
+        assert spec is not None and spec.loader is not None
+        fence_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fence_module)
+        workers = ['backend:one', 'backend:two', 'bot:one', 'bot:two']
+        binding = dict(runId='four-instance-native', shadowRunId='shadow', poly2CodeSha='a'*40,
+                       componentSha256='b'*64, cohort=COHORT, window=dict(startUtc=START,endUtc=END),
+                       evidenceKind='synthetic', sourcePublicKey=None, expectedWorkers=workers)
+        for missing in workers:
+            with self.subTest(missing_enrollment=missing), tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
+                now = [START]
+                f = fence_module.Fence(directory,binding,read_clock=lambda:now[0])
+                for worker in workers:
+                    if worker != missing: f.enroll(worker)
+                now[0] = '2026-01-02T00:00:00.000001Z'
+                f.close_epoch()
+                for worker in workers:
+                    if worker != missing: f._ack(worker)
+                f.close()
+                f = fence_module.Fence(directory,binding,read_clock=lambda:'2026-01-02T00:00:00.000001Z')
+                try:
+                    self.assertNotIn(missing,f.state()['workers'])
+                    self.assertIsNone(f.complete())
+                    with self.assertRaisesRegex(ValueError, 'completed authoritative'):
+                        f.freeze(fence_module.C.SQLAdapter(self.reader, 'postgres', checkpoint=True))
+                finally: f.close()
+            with self.subTest(missing_ack=missing), tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
+                # Exercise a populated admitted/committed source transaction,
+                # its native witness and an explicitly enabled SQL checkpoint.
+                self.admin.execute('CREATE TABLE IF NOT EXISTS comparison_transaction_witness(transaction_id text PRIMARY KEY,binding_sha256 text NOT NULL,payload text NOT NULL,payload_sha256 text NOT NULL)')
+                self.admin.execute('GRANT SELECT ON comparison_transaction_witness TO capture_reader')
+                self.admin.execute('TRUNCATE comparison_transaction_witness, decision_log, paper_orders, signals, trades')
+                now = [START]
+                f = fence_module.Fence(directory,binding,read_clock=lambda:now[0])
+                for worker in workers: f.enroll(worker)
+                writer = PsqlConnection('postgres')
+                try:
+                    driver = fence_module.TransactionDriver(f, workers[0], writer)
+                    writer.execute("INSERT INTO trades VALUES(1,'event:1',1,1,'7','BUY',100,'2026-01-01T09:59:00Z','2026-01-01T10:00:00Z')")
+                    driver.commit([1])
+                finally:
+                    writer.disconnect()
+                now[0] = '2026-01-02T00:00:00.000001Z'
+                f.close_epoch()
+                for worker in workers:
+                    if worker != missing: f._ack(worker)
+                f.close()
+                f = fence_module.Fence(directory,binding,read_clock=lambda:'2026-01-02T00:00:00.000001Z')
+                try:
+                    f.recover(self.reader)
+                    self.assertEqual(f.state()['acks'],set(workers)-{missing})
+                    self.assertIsNone(f.complete())
+                    with self.assertRaisesRegex(ValueError, 'completed authoritative'):
+                        f.freeze(fence_module.C.SQLAdapter(self.reader, 'postgres', checkpoint=True))
+                    f._ack(missing)
+                    before = f.events(); f._ack(missing)
+                    self.assertEqual(f.events(),before)
+                    with self.assertRaisesRegex(ValueError,'ACK'):
+                        f._append('ACK',dict(worker=missing,epoch=0))
+                    self.assertIsNotNone(f.complete())
+                    adapter = fence_module.C.SQLAdapter(self.reader, 'postgres', checkpoint=True)
+                    population = f.freeze(adapter)
+                    self.assertEqual(population['payload']['frozenIds'], [1])
+                    checkpoint = population['payload']['query']['sourceSQLCheckpoint']
+                    self.assertEqual(checkpoint['sourceRecordIds'], [1])
+                    self.assertEqual(checkpoint['isolation'], 'repeatable read')
+                    self.assertEqual(checkpoint['readOnly'], 'on')
+                    self.decision(1)
+                    drain = fence_module.FencedDrain(Path(directory)/'drain', f, adapter,
+                                                    read_clock=lambda:'2026-01-02T00:02:00Z')
+                    try:
+                        frame = drain.step()
+                        self.assertEqual(frame['counts']['DECISION_RECORDED'], 1)
+                        self.assertTrue(frame['comparisonEligible'])
+                    finally:
+                        drain.close()
+                finally: f.close()
 
     def test_G_post_end_and_new_inwindow_ids_excluded(self):
         self.trade(1)

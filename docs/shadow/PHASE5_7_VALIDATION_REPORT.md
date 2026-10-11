@@ -1,6 +1,52 @@
 # Phases 5–7 final reconciliation / validation report
 
-## Verdict
+## Current checkpoint reconciliation
+
+The completed independent review returned **PASS** before checkpoint
+`ed64333e09827a55bed90f52815ed4b17e78f078` on
+`feat/comparison-ready-instrumentation-v2`. The checkpoint validation was
+**483 TypeScript tests / 28 files** and **199 Python discovered / 146 passed /
+53 skipped**; build, safety and diff checks passed. Native skips were never
+counted as native proof. This reconciles the superseded pending/no-review
+statements retained below as historical intermediate records.
+
+The current repository-only readiness validation is recorded separately in
+`FINAL_INTEGRATED_READINESS.md`. After repairing the new four-instance fixture,
+fresh native fence/drain/AsyncSession/timestamp suites passed **23 / 18 / 6 / 4**,
+with zero skips; native-dependent versus disk/parser cases are distinguished
+there. Root cause was omitted `checkpoint=True`, not empty population alone.
+The regression now uses a native admitted/committed trade and same-transaction
+witness, eight restart denial subcases, then four populated successful
+freeze/drain closures, preserving all production checks. Fresh actual array/file
+comparator handoffs passed; successful current 390px mobile evidence is reused
+unchanged (scrollWidth 390, overflow [], owned server stopped).
+
+Fresh exact-final full TypeScript passed **492 / 28 files**; full Python passed
+**200 discovered / 146 executed successfully / 54 skipped**. Separate focused
+TypeScript passed **299 / 10 files**, including four actual observer-entrypoint
+startup-gate cases. Storage/publisher/lifecycle/status Python suites passed
+**5 / 5 / 38 / 8**; Phase4 TS smoke passed **19 / 2 files**. Build, safety and
+frozen scientific-path diff each exited 0. Individual commands, exits and counts
+are retained in `/root/.hermes/cache/scratch/final-readiness-current/completed-final-pass/validation-exits.json`;
+native commands/exits/source hashes/cleanup are retained in the same directory.
+Only newly owned network-none/tmpfs fixtures were used and removed by verified
+full ID; older fixtures were not operated on. Discovery skips are not native proof.
+
+**Independent readiness review returned PASS with no blocking findings** for
+the four-file inventory (`deleg_c5bef39a`). This is precommit evidence; the
+readiness checkpoint is the Git commit containing this report and descends
+directly from `ed64333e09827a55bed90f52815ed4b17e78f078`. Exact remote readback
+is a separate publication gate. Earlier 488-test/199-discovered logs predate
+final additions and are not exact-final full-suite proof.
+Protected pycache and historical logs remain. No production installation,
+enrollment, scheduler change or experiment is implied.
+
+All sections below are **historical pre-ed64333 records**, retained for the
+checkpoint's correction provenance. Their pending-review/no-commit/old-HEAD
+wording does not describe today's checkpoint, and their prior validation or
+browser logs do not substitute for the current report's freshly executed proof.
+
+## Historical pre-checkpoint verdict (superseded)
 
 **READY_FOR_REREVIEW — independent review pending.** Both rereview blockers are corrected and fresh direct-tool validation passed: `npm test` **483/483 tests in 28 files**; `python3 -m unittest discover -s tests -p '*.py' -v` **199 discovered, 146 executed successfully, 53 skipped**. `npm run build`, `npm run safety` and `git diff --check` passed. Phase 4 smoke reruns: **19 TypeScript tests / 38 Python lifecycle tests passed**. Five new concrete blocker regressions passed independently and in the full TS suite. These totals supersede the pre-correction 478-test TS baseline below. Native PostgreSQL skips are not native proof. Earlier browser artifacts are unchanged historical dashboard proof, not a new render. No commit/push; fresh independent review remains required.
 
@@ -15,7 +61,7 @@
 
 Current pass modifies only operational health/publisher/shutdown/collector code, the existing runtime-health regression, this report, and adds `tests/runtime-blockers.test.ts`. Frozen comparator and native capture/fence/drain/archive files are untouched by this correction.
 
-## Identity and safety boundary
+## Historical identity and safety boundary (pre-checkpoint)
 
 - Worktree: `/root/poly-shadow-comparison-ready-v2`.
 - Branch: `feat/comparison-ready-instrumentation-v2`.
@@ -98,7 +144,7 @@ The earlier parallel execution request was intercepted before any tool call ran 
 | `npx vitest run tests/phase4-compare.test.ts tests/phase4-runner.test.ts` | `/root/.hermes/cache/scratch/phase5-7-reconciled-phase4-ts.log` |
 | `python3 -m unittest discover -s tests -p phase4_runner_lifecycle.py -v` | `/root/.hermes/cache/scratch/phase5-7-reconciled-phase4-python.log` |
 
-## Remaining boundaries
+## Historical remaining boundaries (superseded by checkpoint PASS above)
 
 1. Final validation has passed as recorded above. Independent review must complete against the final inventory before staging or committing.
 2. Independent review has not occurred. No final integrated fault matrix is claimed.
