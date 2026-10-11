@@ -4,7 +4,7 @@ Repository-only engineering plan. This is not an observed volume forecast, a sou
 
 ## Horizon and assumptions
 
-The observation window is 86,400 seconds (24 hours), with a separately budgeted maximum drain/grace of 7,200 seconds. The launch calculation uses all 93,600 seconds (26 hours), not just the observation window. Expected and upper rates are explicit conservative engineering allowances, not measurements from protected runs. Source rates can exceed an allowance; callers must treat that as a sizing assumption failure rather than drop evidence. There is no evidence rotation, truncation, sampling away of failures, or automatic deletion to meet this budget.
+The observation window is 86,400 seconds (24 hours), with a separately budgeted maximum drain/grace of 7,200 seconds. The launch calculation uses all 93,600 seconds (26 hours), not just the observation window. Expected and upper rates are explicit engineering allowances. The launch gate uses the expected-rate envelope; upper rates remain diagnostic stress allowances rather than a simultaneous prelaunch requirement. Source rates can exceed an allowance; callers must treat that as a sizing assumption failure rather than drop evidence. There is no evidence rotation, truncation, sampling away of failures, or automatic deletion to meet this budget.
 
 | Family | Expected bytes/s | Upper bytes/s | 26h expected bytes | 26h upper bytes | Accounting scope / rationale |
 |---|---:|---:|---:|---:|---|
@@ -21,19 +21,20 @@ For any horizon `seconds`, each family is `ceil(rate * seconds)`. Sum the expect
 
 - Expected: **13,087,152,000 bytes**.
 - Upper: **86,657,126,400 bytes**.
-- Additional margin: **21,664,281,600 bytes** (`ceil(upper * 0.25)`).
+- Launch basis: **expected 26-hour envelope = 13,087,152,000 bytes**.
+- Additional margin: **3,271,788,000 bytes** (`ceil(expected * 0.25)`).
 - Untouched alert/headroom reserve: **10,737,418,240 bytes (10 GiB)**.
-- Required launch free space: **119,058,826,240 bytes (approximately 110.882 GiB)**.
+- Required launch free space: **27,096,358,240 bytes (approximately 25.236 GiB)**.
 
-The old 10 GiB warning is a reserve floor, **not** sufficient launch capacity. It is added after the upper envelope and margin, not counted twice or substituted for the evidence budget. Margin accounts for uncertainty, transient filesystem/index/archive working space and overhead; it is not a promise of an unlimited-volume run. Validate approved traffic assumptions and free space again before any separately authorized launch.
+The expected-rate basis is a conservative capacity-planning gate, not a completeness guarantee or a promise that source volume cannot exceed it. It is intentionally calibrated against the protected 24-hour run, which sealed **4,747,993,359 bytes** across 37 artifacts while processing roughly 1.33 million raw CHAIN identities and tens of thousands of REST polls. The upper envelope remains reported as diagnostic stress headroom, but simultaneous saturation of every independent upper allowance is no longer required before launch. The 10 GiB reserve remains untouched and is added after the expected envelope and 25% margin. There is still no evidence rotation, truncation, or scientific-data dropping to remain within budget.
 
 ## Gates and runtime thresholds
 
-Both runner preflight and observer startup reject launch unless available filesystem bytes are at least the full envelope + margin + reserve. Runner preflight applies this before production adapter or launch side effects. Unavailable sizing inputs fail the launch gate; no weaker default restores permission.
+Both runner preflight and observer startup reject launch unless available filesystem bytes are at least the expected envelope + 25% margin + 10 GiB reserve. Runner preflight applies this before production adapter or launch side effects. Unavailable sizing inputs fail the launch gate; no weaker default restores permission.
 
 Runtime inventory is stat-only for a fixed set of evidence files and a bounded scan of direct capture files. No dashboard read reparses raw CHAIN evidence. Remaining budget uses `max(0, ceil(93600 - elapsedSeconds))` from observer startup; the status collector independently derives remaining horizon from the bound run window. Disk states are:
 
-- `GREEN`: free bytes >= remaining upper envelope + margin + 10 GiB reserve.
+- `GREEN`: free bytes >= remaining expected envelope + 25% margin + 10 GiB reserve.
 - `DEGRADED`: reserve <= free bytes < remaining required amount.
 - `AT_RISK`: free bytes < 10 GiB reserve.
 - `UNKNOWN`: free-space measurement unavailable.
