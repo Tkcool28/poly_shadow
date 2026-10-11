@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, readFileSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { sealPoly2Archive, validatePoly2Archive, type ArchiveInput } from '../src/compare/poly2-archive.js';
 import { canonical, digest, inventory, type Snapshot, type CaptureReceipt } from '../src/compare/poly2-snapshot.js';
@@ -24,7 +25,7 @@ function input(): ArchiveInput {
 }
 function recapture(i: ArchiveInput) { i.captureReceipt.inventory = inventory(i.snapshot); return i; }
 const dirs: string[] = [];
-function dir() { const d=mkdtempSync(join(process.env.TMPDIR ?? '/root/.hermes/cache/scratch','poly2-offline-')); dirs.push(d); return d; }
+function dir() { const d=mkdtempSync(join(tmpdir(),'poly2-offline-')); dirs.push(d); return d; }
 afterEach(() => dirs.splice(0).forEach(d => rmSync(d,{recursive:true,force:true})));
 function run(script:string,args:string[]) { return execFileSync(process.execPath,['--import','tsx',`src/compare/${script}.ts`,...args],{encoding:'utf8',stdio:'pipe'}); }
 
