@@ -1,5 +1,5 @@
 /** Offline replay of the locally-authored authoritative fence adapter. No DB/network. */
-import { canonical, digest, utc } from './poly2-snapshot.js';
+import { canonical as legacyCanonical, digest as legacyDigest, utc } from './poly2-snapshot.js';
 import { createHash } from 'node:crypto';
 import { DiskIndex, DiskMap, journalLines } from './disk-index.js';
 import { openSync, closeSync, writeSync, fsyncSync, linkSync, unlinkSync, mkdtempSync, rmSync } from 'node:fs';
@@ -9,18 +9,20 @@ import { JsonCursor } from './json-cursor.js';
 import { inWindow, clockEvidence } from './exact-clock.js';
 import { validatePoly2Export, type Poly2Export } from './phase4.js';
 import type { Binding, TradeFact, DecisionFact } from './poly2-prospective.js';
+import { validateAuthority, verifyAuthenticated, authorityCanonical, authorityDigest, type AuthorityInput, type ProductionBinding } from './production-authority.js';
 
 export type FenceBinding = Binding & { expectedWorkers: string[] };
-type Event = { seq: number; previousSha256: string | null; bindingSha256: string; observedUtc: string; kind: string; payload: any };
+type Event = { seq: number; previousSha256: string | null; bindingSha256: string; observedUtc: string; kind: string; payload: any; signature?:string; signedPayload?:string };
 type Attempt = { transactionId: string; worker: string; epoch: number; retryOf: string | null; state: string; witness?: { transactionId: string; bindingSha256: string; worker: string; epoch: number; trades: TradeFact[] } };
-type Drain = { bindingSha256: string; cursor: number; previousSha256: string | null; frozenIds: (string|number)[]; frozenIdsSha256: string; sourceFacts: TradeFact[]; sourceFactsSha256: string; perId: Record<string,{state:string;decision:DecisionFact|null}>; perIdSha256: string; counts: Record<string,number>; state:string; error:string|null; comparisonEligible:boolean; incompleteProperty:string|null; signature:null; query: { isolation:string; observedUtc:string; tradesSha256:string; decisionsSha256:string; tradeCount:number; decisionCount:number; sourceSQLCheckpoint:any }; [key:string]: unknown };
+type Drain = { bindingSha256: string; cursor: number; previousSha256: string | null; frozenIds: (string|number)[]; frozenIdsSha256: string; sourceFacts: TradeFact[]; sourceFactsSha256: string; perId: Record<string,{state:string;decision:DecisionFact|null}>; perIdSha256: string; counts: Record<string,number>; state:string; error:string|null; comparisonEligible:boolean; incompleteProperty:string|null; signature:string|null; query: { isolation:string; observedUtc:string; tradesSha256:string; decisionsSha256:string; tradeCount:number; decisionCount:number; sourceSQLCheckpoint:any }; [key:string]: unknown };
 export interface FenceSealInput { binding: FenceBinding; fenceJournal: Event[]; drainJournal: Drain[] }
 export interface FencedArchive extends Poly2Export {
   rows: (Poly2Export['rows'][number] & { sourceRecordId:string|number; sourceEventId:string; paperRecordId:string|number })[];
-  manifest: { schemaVersion: 5; version: 'poly2-fenced-v1'; binding: FenceBinding; bindingSha256:string; fenceJournalSha256:string; populationReceiptSha256:string; fenceReceiptSha256:string; decisionJournalSha256:string; decisionReceiptSha256:string; payloadSha256:string; rowCount:number; completenessScope:'COMMITTED_ORIGINAL_INGESTIONS_FIXED_ID_INITIAL_DECISIONS' };
+  manifest: { schemaVersion: 5; version: 'poly2-fenced-v1'; binding: FenceBinding; bindingSha256:string; fenceJournalSha256:string; populationReceiptSha256:string; fenceReceiptSha256:string; decisionJournalSha256:string; decisionReceiptSha256:string; payloadSha256:string; rowCount:number; completenessScope:'COMMITTED_ORIGINAL_INGESTIONS_FIXED_ID_INITIAL_DECISIONS'; authoritySha256?:string };
   evidence: FenceSealInput;
 }
 const check = (v:unknown, error:string):void => { if (!v) throw new Error(`fenced archive: ${error}`); };
+const canonical=legacyCanonical, digest=legacyDigest;
 const equal = (a:unknown,b:unknown):boolean => canonical(a) === canonical(b);
 const validSignalIdentity = (v:unknown): v is string|number =>
   (typeof v==='string'&&v.length>0&&v.trim()===v)||(typeof v==='number'&&Number.isSafeInteger(v));
@@ -30,13 +32,16 @@ function validateWriterRoster(workers:unknown): asserts workers is string[] {
   const services=new Set((workers as string[]).map(w=>w.slice(0,w.indexOf(':'))));
   check(services.size===REQUIRED_WRITER_SERVICES.length&&REQUIRED_WRITER_SERVICES.every(s=>services.has(s)),'complete backend/bot writer-service inventory');
 }
-/** Synthetic-only until independent source installation/enrollment/custody review.
- * Replay proves recorded lifecycle and comparator mapping, not deployment authenticity. */
-export function sealFencedArchive(input: FenceSealInput): FencedArchive { return replayFencedArchive(input); }
+/** Synthetic engineering replay or observational replay with independent authority.
+ * Cryptographic replay validates approved custody; operator installation review is external. */
+export function sealFencedArchive(input: FenceSealInput, authority?:AuthorityInput): FencedArchive { return replayFencedArchive(input, authority); }
 type StreamingSealInput = {binding:FenceBinding; fenceJournal:Iterable<Event>; drainJournal:Iterable<Drain>};
-function replayFencedArchive(input: StreamingSealInput): FencedArchive {
+function replayFencedArchive(input: StreamingSealInput, external?:AuthorityInput): FencedArchive {
   const { binding:b, fenceJournal:events, drainJournal:drains } = input;
-  check(b?.evidenceKind === 'synthetic', 'UNINSTALLED observational producer; no authority fabricated');
+  const authority=b?.evidenceKind==='observational'?validateAuthority(external,b):undefined;
+  check(b?.evidenceKind==='synthetic'||authority,'explicit evidence kind required');
+  check(!external||authority,'synthetic evidence is not production authority');
+  const canonical=authority?authorityCanonical:legacyCanonical, digest=authority?authorityDigest:legacyDigest;
   check(b.cohort.length === 5 && new Set(b.cohort).size === 5 && b.cohort.every(w=>/^0x[a-f0-9]{40}$/.test(w)), 'exact wallet inventory');
   validateWriterRoster(b.expectedWorkers);
   check(b.runId && b.shadowRunId && /^[a-f0-9]{40}$/.test(b.poly2CodeSha) && /^[a-f0-9]{64}$/.test(b.componentSha256) && utc(b.window.startUtc)<utc(b.window.endUtc), 'run/revision/window binding');
@@ -62,16 +67,21 @@ function replayFencedArchive(input: StreamingSealInput): FencedArchive {
     for (const a of attempts.values()) if (a.epoch===0) {admitted++; if(a.state==='COMMITTED')committed++;else if(a.state==='ROLLED_BACK')rolledBack++;else if(a.state==='OUTSTANDING')outstanding++;}
     return {protocol:'source-epoch-inflight-v1',runId:b.runId,endpointUtc:b.window.endUtc,closingEpoch:0,requiredWriterServices:[...REQUIRED_WRITER_SERVICES],expectedWorkers:[...b.expectedWorkers].sort(),acknowledgements:[...acks].sort(),admitted,committed,rolledBack,outstanding,highWaterMark:close?.seq??null};
   };
+  let archived:Event|undefined;
   let i=0, previousEvent:Event|undefined;
   const fenceHash=createHash('sha256').update('[');
   for (const e of events) {
+    check(!archived,'journal authority is terminal after ARCHIVE');
+    if(authority)verifyAuthenticated(e as unknown as Record<string,unknown>,b as ProductionBinding,authority,'fence');
+    else check(e.signature===undefined&&e.signedPayload===undefined,'synthetic fence cannot carry observational signatures');
     fenceHash.update((i?',':'')+canonical(e));
     check(e.seq===i+1 && e.previousSha256===(previousEvent?digest(previousEvent):null)&&e.bindingSha256===digest(b), 'journal chain/binding');
     previousEvent=e; i++;
     utc(e.observedUtc); const p=e.payload;
-    if (i===1) { check(e.kind==='ARM'&&equal(p,b)&&utc(e.observedUtc)<=utc(b.window.startUtc),'pre-start ARM'); continue; }
-    if (e.kind==='ENROLL') { check(!close&&b.expectedWorkers.includes(p.worker)&&!enrolled.has(p.worker),'worker enrollment'); enrolled.add(p.worker); }
+    if (i===1) { check(e.kind==='ARM'&&equal(p,b)&&(authority?utc(e.observedUtc)<utc(b.window.startUtc):utc(e.observedUtc)<=utc(b.window.startUtc)),'pre-start ARM'); continue; }
+    if (e.kind==='ENROLL') { check(!close&&b.expectedWorkers.includes(p.worker)&&!enrolled.has(p.worker),'worker enrollment'); if(authority)check(utc(e.observedUtc)<utc(b.window.startUtc)&&equal(p,{worker:p.worker,installation:authority.installations[p.worker]}),'approved pre-start installation enrollment'); enrolled.add(p.worker); }
     else if (e.kind==='ATTEMPT') {
+      if(authority)check(equal([...enrolled].sort(),[...b.expectedWorkers].sort()),'all approved instances enrolled before admission');
       check(enrolled.has(p.worker)&&!attempts.has(p.transactionId)&&p.epoch===epoch,'admission generation/identity');
       check(p.retryOf===null||attempts.get(p.retryOf)?.state==='ROLLED_BACK','unknown outcome retry');
       attempts.set(p.transactionId,{...p,state:'OUTSTANDING'});
@@ -89,6 +99,8 @@ function replayFencedArchive(input: StreamingSealInput): FencedArchive {
         a!.witness=w;
       }
       a!.state=e.kind; attempts.set(p.transactionId,a!);
+    } else if (e.kind==='ARCHIVE') {
+      check(authority&&population&&equal(Object.keys(p).sort(),['decisionReceiptSha256','populationReceiptSha256'])&&/^[a-f0-9]{64}$/.test(p.decisionReceiptSha256)&&p.populationReceiptSha256===digest(population),'authenticated archive terminal');archived=e;
     } else if (e.kind==='ERROR') throw new Error('fenced archive: retained capture/source failure '+p.error);
     else if (e.kind==='FENCE') { const r=receipt(); check(!fence&&close&&equal(p,r)&&r.outstanding===0&&equal([...acks].sort(),[...b.expectedWorkers].sort()),'all workers/preepoch outcomes not drained'); fence=e; }
     else if (e.kind==='FREEZE') {
@@ -99,12 +111,14 @@ function replayFencedArchive(input: StreamingSealInput): FencedArchive {
     } else throw new Error('fenced archive: unknown journal event');
   }
   check(fence&&population,'no completed fence/population');
+  if(authority)check(archived,'missing authenticated ARCHIVE terminal (truncated journal)');
   const frozen = population!.payload.sourceFacts as TradeFact[], ids=frozen.map(t=>t.sourceRecordId), eventIds=frozen.map(t=>t.sourceEventId);
   let previous:Drain|undefined, drainCount=0;
   const drainHash=createHash('sha256').update('[');
   for (const d of drains) {
+    if(authority)verifyAuthenticated(d,b as ProductionBinding,authority,'drain');
     const i=drainCount++; drainHash.update((i?',':'')+canonical(d));
-    check(d.bindingSha256===digest(b)&&d.cursor===i+1&&d.previousSha256===(previous?digest(previous):null)&&d.signature===null,'decision chain/binding');
+    check(d.bindingSha256===digest(b)&&d.cursor===i+1&&d.previousSha256===(previous?digest(previous):null)&& (authority?typeof d.signature==='string':d.signature===null),'decision chain/binding');
     check(equal(d.sourceFacts,frozen)&&equal(d.frozenIds,ids)&&d.sourceFactsSha256===digest(frozen)&&d.frozenIdsSha256===digest(ids)&&equal(Object.keys(d.perId).sort(),[...eventIds].sort())&&d.perIdSha256===digest(d.perId),'fixed ID decision population/digests');
     const counts={DECISION_RECORDED:0,NO_INITIAL_DECISION_EXPECTED:0,PENDING:0,CAPTURE_ERROR:0};
     for (const t of frozen) {
@@ -135,19 +149,21 @@ function replayFencedArchive(input: StreamingSealInput): FencedArchive {
     check(!previous||previous.state!=='COMPLETE','decision terminal transition'); previous=d;
   }
   check(previous?.state==='COMPLETE','pending/error initial decisions cannot seal');
+  if(authority)check(archived!.payload.decisionReceiptSha256===digest(previous),'authenticated archive/drain terminal commitment');
   const rows=frozen.map(t=>{
     const d=previous!.perId[t.sourceEventId]!.decision!, p=t.sourceEventId.split(':');
     return {wallet:t.wallet,txHash:p[0]==='data-api'?p[1]!:null,asset:t.asset,conditionId:t.conditionId,side:t.side,size:t.size,price:null,sourceTs:t.sourceTs,sourceEpochMicros:t.tradedAtUtc===null?null:utc(t.tradedAtUtc).toString(),tradedAtUtc:t.tradedAtUtc,ingestedUtc:t.ingestedUtc,normalizedUtc:null,decisionUtc:d.decisionUtc,signalUtc:null,source:p[0]!,freshnessAgeSec:null,freshnessRejection:d.rejectionReason==='stale_signal'?'stale_signal':null,policyEligible:null,copyabilityOutcome:null,rejectionReason:d.rejectionReason,paperOutcome:null,sourceRecordId:t.sourceRecordId,sourceEventId:t.sourceEventId,paperRecordId:d.paperRecordId};
   });
   const payload={window:b.window,rows}; validatePoly2Export(payload);
-  return {...payload,evidence:input as FenceSealInput,manifest:{schemaVersion:5,version:'poly2-fenced-v1',binding:b,bindingSha256:digest(b),fenceJournalSha256:fenceHash.update(']').digest('hex'),populationReceiptSha256:digest(population),fenceReceiptSha256:digest(fence),decisionJournalSha256:drainHash.update(']').digest('hex'),decisionReceiptSha256:digest(previous),payloadSha256:digest(payload),rowCount:rows.length,completenessScope:'COMMITTED_ORIGINAL_INGESTIONS_FIXED_ID_INITIAL_DECISIONS'}};
+  return {...payload,evidence:input as FenceSealInput,manifest:{...(authority?{authoritySha256:authorityDigest(authority)}:{}),schemaVersion:5,version:'poly2-fenced-v1',binding:b,bindingSha256:digest(b),fenceJournalSha256:fenceHash.update(']').digest('hex'),populationReceiptSha256:digest(population),fenceReceiptSha256:digest(fence),decisionJournalSha256:drainHash.update(']').digest('hex'),decisionReceiptSha256:digest(previous),payloadSha256:digest(payload),rowCount:rows.length,completenessScope:'COMMITTED_ORIGINAL_INGESTIONS_FIXED_ID_INITIAL_DECISIONS'}};
   } finally {index.close();}
 }
 /** Bounded in journal length: replay full authority, then serialize evidence directly
  * from disk. One complete frame/frozen population remains the schema-sized unit. */
-export function sealFencedArchiveFiles(binding:FenceBinding, fencePath:string, drainPath:string, outputPath:string):FencedArchive['manifest'] {
+export function sealFencedArchiveFiles(binding:FenceBinding, fencePath:string, drainPath:string, outputPath:string, authority?:AuthorityInput):FencedArchive['manifest'] {
   function* records<T>(path:string):Generator<T> {for(const line of journalLines(path)) yield JSON.parse(line) as T;}
-  const result=replayFencedArchive({binding,fenceJournal:records<Event>(fencePath),drainJournal:records<Drain>(drainPath)});
+  const result=replayFencedArchive({binding,fenceJournal:records<Event>(fencePath),drainJournal:records<Drain>(drainPath)},authority);
+  const canonical=authority?authorityCanonical:legacyCanonical;
   const fd=openSync(outputPath+'.pending','wx',0o600);
   const write=(text:string):void=>{const b=Buffer.from(text);let n=0;while(n<b.length){const k=writeSync(fd,b,n,b.length-n);if(k<=0)throw new Error('short archive write');n+=k;}};
   const array=(path:string,expected:string):void=>{write('[');const hash=createHash('sha256').update('[');let first=true;for(const line of journalLines(path)){const text=(first?'':',')+canonical(JSON.parse(line));hash.update(text);write(text);first=false;}write(']');check(hash.update(']').digest('hex')===expected,'authority changed during archive serialization');};
@@ -163,8 +179,9 @@ export function sealFencedArchiveFiles(binding:FenceBinding, fencePath:string, d
   return result.manifest;
 }
 /** File replay retains one receipt rather than JSON.parse-ing full evidence history. */
-export function validateFencedArchiveFile(path:string, cohort:string[], window:Binding['window'], allowSynthetic=false):Omit<FencedArchive,'evidence'> {
-  check(allowSynthetic,'UNINSTALLED: synthetic fence is not production authority');
+export function validateFencedArchiveFile(path:string, cohort:string[], window:Binding['window'], allowSynthetic=false, external?:AuthorityInput):Omit<FencedArchive,'evidence'> {
+  check(allowSynthetic||external,'UNINSTALLED: independent production authority required');
+  if(external)validateAuthority(external,external.authority.binding);
   const dir=mkdtempSync(join(tmpdir(),'poly2-fenced-replay-')), cursor=new JsonCursor(path);
   let binding:FenceBinding|undefined, manifest:FencedArchive['manifest']|undefined, archiveWindow:Binding['window']|undefined;
   const rows:FencedArchive['rows']=[];
@@ -186,17 +203,18 @@ export function validateFencedArchiveFile(path:string, cohort:string[], window:B
     check(binding&&manifest&&archiveWindow,'v5 full lifecycle evidence required');
     check(equal(archiveWindow,window)&&equal([...binding!.cohort].sort(),[...cohort].sort()),'frozen window/cohort');
     function* records<T>(path:string):Generator<T>{for(const line of journalLines(path))yield JSON.parse(line) as T;}
-    const expected=replayFencedArchive({binding:binding!,fenceJournal:records<Event>(journals.fenceJournal),drainJournal:records<Drain>(journals.drainJournal)});
+    check(allowSynthetic?binding!.evidenceKind==='synthetic':binding!.evidenceKind==='observational','production/synthetic-only evidence kind boundary');
+    const expected=replayFencedArchive({binding:binding!,fenceJournal:records<Event>(journals.fenceJournal),drainJournal:records<Drain>(journals.drainJournal)},external);
     check(equal(manifest,expected.manifest)&&equal(rows,expected.rows)&&equal(archiveWindow,expected.window),'archive replay manifest/journal/payload SHA/count mismatch');
     return {window:expected.window,rows:expected.rows,manifest:expected.manifest};
   } finally {cursor.close();rmSync(dir,{recursive:true,force:true});}
 }
-export function validateFencedArchive(value:unknown, cohort:string[], window:Binding['window'], allowSynthetic=false):FencedArchive {
+export function validateFencedArchive(value:unknown, cohort:string[], window:Binding['window'], allowSynthetic=false, external?:AuthorityInput):FencedArchive {
   const a=value as FencedArchive;
   check(a?.manifest?.schemaVersion===5&&a.evidence,'v5 full lifecycle evidence required');
-  check(allowSynthetic,'UNINSTALLED: synthetic fence is not production authority');
+  check(allowSynthetic?a.evidence.binding.evidenceKind==='synthetic':a.evidence.binding.evidenceKind==='observational'&&external,'production/synthetic-only evidence kind boundary');
   check(equal(a.window,window)&&equal([...a.manifest.binding.cohort].sort(),[...cohort].sort()),'frozen window/cohort');
-  const expected=sealFencedArchive(a.evidence);
+  const expected=sealFencedArchive(a.evidence,external);
   check(equal(a,expected),'archive replay manifest/journal/payload SHA/count mismatch');
   return a;
 }

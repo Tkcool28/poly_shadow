@@ -17,10 +17,11 @@ import { compare, validatePoly2Export } from './phase4.js';
 import { validatePoly2Archive } from './poly2-archive.js';
 import { validateFencedArchiveFile } from './poly2-fenced-archive.js';
 import { archiveSchemaVersion } from './json-cursor.js';
+import { loadAuthority } from './production-authority.js';
 import { ProspectiveCapture, type Binding } from './poly2-prospective.js';
 import { readMarketMetadata, readShadowGroups } from './evidence.js';
 
-const [, , dataDir, exportPath, cohortsPath, outDir] = process.argv;
+const [, , dataDir, exportPath, cohortsPath, outDir, authorityPath, authorityPin] = process.argv;
 if (!dataDir || !exportPath || !cohortsPath || !outDir) {
   console.error('usage: tsx src/compare/cli.ts <shadowDataDir> <poly2-export.json> <cohorts.json> <outDir>');
   process.exit(1);
@@ -48,7 +49,7 @@ if (schemaVersion === 3) {
   }
 }
 const exportData = validatePoly2Export(schemaVersion === 5
-  ? validateFencedArchiveFile(exportPath, cohorts.controlled, cohorts.window)
+  ? validateFencedArchiveFile(exportPath, cohorts.controlled, cohorts.window, false, loadAuthority(authorityPath!,authorityPin!))
   : schemaVersion === 4
   ? ProspectiveCapture.validateFile(exportPath, cohorts.controlled, cohorts.window, false, cohorts.poly2CaptureBinding)
   : validatePoly2Archive(legacyArchive, cohorts.controlled, cohorts.window));

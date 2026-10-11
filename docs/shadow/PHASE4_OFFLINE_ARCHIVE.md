@@ -1,5 +1,11 @@
 # Phase 4 minimal prospective archive
 
+> **V5 authority amendment:** the older synthetic-only implementation/refusal
+> descriptions below are historical. The separately authorized observational
+> identity/custody path is specified in [V5_PRODUCTION_AUTHORITY_V1.md](V5_PRODUCTION_AUTHORITY_V1.md).
+> It requires independent operator-approved installation authority and pins; no
+> production installation, observation launch or scientific verdict is claimed.
+
 > **Current format/scope note:** the v4 description below is a historical design
 > snapshot. The current executable fenced archive is v5 and retains the complete
 > authorized `backend`/`bot` writer roster, generation ACKs, original PostgreSQL

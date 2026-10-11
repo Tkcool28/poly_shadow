@@ -1,5 +1,11 @@
 # Phase 4 authorized fence resume — implementation checkpoint
 
+> **V5 authority amendment:** the older synthetic-only implementation/refusal
+> descriptions below are historical. The separately authorized observational
+> identity/custody path is specified in [V5_PRODUCTION_AUTHORITY_V1.md](V5_PRODUCTION_AUTHORITY_V1.md).
+> It requires independent operator-approved installation authority and pins; no
+> production installation, observation launch or scientific verdict is claimed.
+
 Timestamp amendment independent PASS: parent receipt `deleg_37e63713`. The
 prospective authorized writer set is `backend` + `bot`; watchdog/frontend are
 excluded, and unlisted direct SQL is an out-of-contract violation rather than a

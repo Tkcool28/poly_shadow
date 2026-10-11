@@ -21,6 +21,17 @@ assert _SPEC is not None and _SPEC.loader is not None
 C = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(C)
 canonical, digest, epoch = C.canonical, C.digest, C.epoch
+A = None
+
+def _load_authority():
+    global A
+    if A is None:
+        import types
+        path = Path(__file__).with_name('production_authority.py')
+        A = types.ModuleType('fence_production_authority')
+        A.__file__ = str(path)
+        exec(compile(path.read_bytes(), str(path), 'exec', dont_inherit=True), A.__dict__)
+    return A
 _BSPEC = importlib.util.spec_from_file_location('bounded_journal', Path(__file__).with_name('bounded_journal.py'))
 assert _BSPEC and _BSPEC.loader
 B = importlib.util.module_from_spec(_BSPEC)
@@ -48,26 +59,37 @@ def validate_writer_roster(binding):
         raise ValueError('complete bot/backend writer-service inventory required')
 
 
-def replay(events, binding, state=None, start=1, previous=None):
+def replay(events, binding, state=None, start=1, previous=None, *, authority=None):
     """Rebuild authority, including every transition, never trust a status cache."""
+    digest = _load_authority().digest if authority is not None else C.digest
     validate_writer_roster(binding)
+    if binding['evidenceKind'] == 'observational' and authority is None:
+        raise ValueError('independent production authority required')
     if state is None:
         state = dict(epoch=0, closed=None, workers=set(), acks=set(), attempts={},
-                     error=None, receipt=None, population=None)
+                     error=None, receipt=None, population=None, archive=None)
     for index, e in enumerate(events, start):
+        if state.get('archive') is not None:
+            raise ValueError('fence authority is terminal after ARCHIVE')
+        if authority is not None:
+            A.verify(e, binding, authority, 'fence')
         if e['seq'] != index or e['previousSha256'] != previous or e['bindingSha256'] != digest(binding):
             raise ValueError('fence journal chain/binding conflict')
         previous = digest(e)
         p, kind = e['payload'], e['kind']
         if index == 1:
-            if kind != 'ARM' or p != binding or epoch(e['observedUtc']) > epoch(binding['window']['startUtc']):
+            if kind != 'ARM' or p != binding or epoch(e['observedUtc']) > epoch(binding['window']['startUtc']) or (authority is not None and epoch(e['observedUtc']) >= epoch(binding['window']['startUtc'])):
                 raise ValueError('pre-start ARM with exact binding required')
             continue
         if kind == 'ENROLL':
             if state['closed'] or p['worker'] not in binding['expectedWorkers'] or p['worker'] in state['workers']:
                 raise ValueError('unknown/duplicate/late worker incarnation')
+            if authority is not None and (epoch(e['observedUtc']) >= epoch(binding['window']['startUtc']) or p != {'worker': p['worker'], 'installation': authority['installations'][p['worker']]}):
+                raise ValueError('approved pre-start installation enrollment required')
             state['workers'].add(p['worker'])
         elif kind == 'ATTEMPT':
+            if authority is not None and state['workers'] != set(binding['expectedWorkers']):
+                raise ValueError('all approved instances must enroll before admission')
             if p['worker'] not in state['workers'] or p['transactionId'] in state['attempts'] or p['epoch'] != state['epoch']:
                 raise ValueError('unregistered/duplicate/generation race attempt')
             if p['retryOf'] is not None and state['attempts'].get(p['retryOf'], {}).get('state') != 'ROLLED_BACK':
@@ -104,6 +126,10 @@ def replay(events, binding, state=None, start=1, previous=None):
                 a['witness'] = w
             a['state'] = kind
             state['attempts'][token] = a
+        elif kind == 'ARCHIVE':
+            if authority is None or not state['population'] or state['error'] or set(p) != {'decisionReceiptSha256', 'populationReceiptSha256'} or not re.fullmatch('[a-f0-9]{64}', p['decisionReceiptSha256']) or p['populationReceiptSha256'] != digest(state['population']):
+                raise ValueError('authenticated archive terminal requires complete frozen population')
+            state['archive'] = e
         elif kind == 'ERROR':
             state['error'] = p['error']
         elif kind == 'FENCE':
@@ -166,12 +192,23 @@ def committed_population(state, binding):
 
 
 class Fence:
-    def __init__(self, directory, binding, *, read_clock=C.now):
+    def __init__(self, directory, binding, *, read_clock=C.now, authority=None, authority_pin=None, private_key=None):
         if len(binding['cohort']) != 5 or len(set(binding['cohort'])) != 5:
             raise ValueError('exact five-wallet cohort required')
         validate_writer_roster(binding)
+        # Detached public run inputs cannot change underneath authenticated replay.
+        binding = json.loads(canonical(binding))
+        authority = json.loads(canonical(authority)) if authority is not None else None
+        self.authority, self.private_key, self.authority_pin = authority, private_key, authority_pin
+        self.hash = _load_authority().digest if authority is not None else digest
         if binding['evidenceKind'] != 'synthetic':
-            raise ValueError('UNINSTALLED: independent production enrollment/custody review required')
+            if authority is None or private_key is None:
+                raise ValueError('UNINSTALLED: independent production authority and custody key required')
+            A.validate(authority, authority_pin, binding)
+            if A.public_pem(private_key.public_key()) != binding['sourcePublicKey']:
+                raise ValueError('private key differs from independent pinned producer')
+        elif authority is not None or private_key is not None or authority_pin is not None:
+            raise ValueError('synthetic path cannot use production authority/key')
         self.directory, self.binding, self.clock = Path(directory), binding, read_clock
         self.directory.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.directory/'source_fence.sqlite', timeout=10, isolation_level=None)
@@ -183,8 +220,10 @@ class Fence:
         try:
             with self.transaction():
                 if not self.events():
-                    event = dict(seq=1, previousSha256=None, bindingSha256=digest(binding), observedUtc=self.clock(), kind='ARM', payload=binding)
-                    replay([event], binding)
+                    event = dict(seq=1, previousSha256=None, bindingSha256=self.hash(binding), observedUtc=self.clock(), kind='ARM', payload=binding)
+                    if self.authority is not None:
+                        A.sign(event, binding, self.authority, 'fence', self.private_key)
+                    replay([event], binding, authority=self.authority)
                     self.db.execute('INSERT INTO events VALUES(?,?)', (1, canonical(event)))
                 self.db.execute('CREATE TEMP TABLE attempt_index(id TEXT PRIMARY KEY, body TEXT NOT NULL)')
                 self.db.execute("CREATE INDEX temp.attempt_state ON attempt_index(json_extract(body,'$.epoch'),json_extract(body,'$.state'),id)")
@@ -194,8 +233,8 @@ class Fence:
                 self.db.execute("CREATE TEMP TRIGGER attempt_update AFTER UPDATE ON attempt_index WHEN json_extract(new.body,'$.epoch')=0 BEGIN UPDATE attempt_counts SET count=count-1 WHERE kind=json_extract(old.body,'$.state'); UPDATE attempt_counts SET count=count+1 WHERE kind=json_extract(new.body,'$.state'); END")
                 self.db.execute("CREATE TEMP TRIGGER attempt_delete AFTER DELETE ON attempt_index WHEN json_extract(old.body,'$.epoch')=0 BEGIN UPDATE attempt_counts SET count=count-1 WHERE kind=json_extract(old.body,'$.state'); END")
                 self._state = dict(epoch=0, closed=None, workers=set(), acks=set(),
-                    attempts=B.DiskMap(self.db), error=None, receipt=None, population=None)
-                replay(self.events(), binding, self._state)
+                    attempts=B.DiskMap(self.db), error=None, receipt=None, population=None, archive=None)
+                replay(self.events(), binding, self._state, authority=self.authority)
                 self._indexed_seq = len(self.events())
         except BaseException:
             self.db.close()
@@ -223,32 +262,51 @@ class Fence:
     def _rebuild(self):
         self.db.execute('DELETE FROM attempt_index')
         self._state = dict(epoch=0, closed=None, workers=set(), acks=set(),
-            attempts=B.DiskMap(self.db), error=None, receipt=None, population=None)
-        replay(self.events(), self.binding, self._state)
+            attempts=B.DiskMap(self.db), error=None, receipt=None, population=None, archive=None)
+        replay(self.events(), self.binding, self._state, authority=self.authority)
         self._indexed_seq = len(self.events())
 
     def state(self):
+        if self.authority is not None:
+            A.validate(self.authority, self.authority_pin, self.binding)
         # Cross-process writers: consume every new authoritative event, never a tail.
         for row in self.db.execute('SELECT body FROM events WHERE seq>? ORDER BY seq', (self._indexed_seq,)):
             event = json.loads(row[0])
-            previous = digest(self.events()[event['seq']-2]) if event['seq'] > 1 else None
-            replay([event], self.binding, self._state, event['seq'], previous)
+            previous = self.hash(self.events()[event['seq']-2]) if event['seq'] > 1 else None
+            replay([event], self.binding, self._state, event['seq'], previous, authority=self.authority)
             self._indexed_seq = event['seq']
         return self._state
 
     def _append(self, kind, payload):
         events = self.events()
-        event = dict(seq=len(events)+1, previousSha256=digest(events[-1]) if events else None,
-                     bindingSha256=digest(self.binding), observedUtc=self.clock(), kind=kind, payload=payload)
+        event = dict(seq=len(events)+1, previousSha256=self.hash(events[-1]) if events else None,
+                     bindingSha256=self.hash(self.binding), observedUtc=self.clock(), kind=kind, payload=payload)
         state = self.state()
-        replay([event], self.binding, state, event['seq'], event['previousSha256'])
+        if self.authority is not None:
+            A.sign(event, self.binding, self.authority, 'fence', self.private_key)
+        replay([event], self.binding, state, event['seq'], event['previousSha256'], authority=self.authority)
         self.db.execute('INSERT INTO events VALUES(?,?)', (event['seq'], canonical(event)))
         self._indexed_seq = event['seq']
         return event
 
+    def authenticate_archive(self, frame):
+        if self.authority is None:
+            return
+        if frame['state'] != 'COMPLETE' or not frame['comparisonEligible']:
+            raise ValueError('complete authenticated drain required for ARCHIVE')
+        A.verify(frame, self.binding, self.authority, 'drain')
+        with self.transaction():
+            state = self.state()
+            payload = dict(decisionReceiptSha256=self.hash(frame), populationReceiptSha256=self.hash(state['population']))
+            if state.get('archive') is not None:
+                if state['archive']['payload'] != payload:
+                    raise ValueError('conflicting authenticated archive terminal')
+                return
+            self._append('ARCHIVE', payload)
+
     def publish(self):
         # Diagnostics only. Readback always rebuilds the SQLite journal.
-        value = dict(version=1, binding=self.binding, bindingSha256=digest(self.binding), window=self.binding['window'], **self.status())
+        value = dict(version=1, binding=self.binding, bindingSha256=self.hash(self.binding), window=self.binding['window'], **self.status())
         path = self.directory/'poly2_fence_health.json'
         temp = path.with_suffix('.pending')
         with temp.open('wb') as stream:
@@ -269,7 +327,12 @@ class Fence:
         with self.transaction():
             if worker in self.state()['workers']:
                 return  # exact reattachment; never erases death/outstanding state
-            self._append('ENROLL', {'worker': worker})
+            payload = {'worker': worker}
+            if self.authority is not None:
+                if worker not in self.authority['installations']:
+                    raise ValueError('instance absent from approved install roster')
+                payload['installation'] = self.authority['installations'][worker]
+            self._append('ENROLL', payload)
 
     def _admit(self, worker, retry_of=None):
         with self.transaction():
@@ -305,13 +368,13 @@ class Fence:
             after = token
             c = reader.cursor()
             try:
-                c.execute('SELECT payload, payload_sha256 FROM comparison_transaction_witness WHERE transaction_id=%s AND binding_sha256=%s', (token, digest(self.binding)))
+                c.execute('SELECT payload, payload_sha256 FROM comparison_transaction_witness WHERE transaction_id=%s AND binding_sha256=%s', (token, self.hash(self.binding)))
                 rows = c.fetchall()
             finally:
                 c.close()
             if not rows:
                 continue  # rollback/crash/death/unknown are NOT inferred from absence
-            if len(rows) != 1 or digest(json.loads(rows[0][0])) != rows[0][1]:
+            if len(rows) != 1 or self.hash(json.loads(rows[0][0])) != rows[0][1]:
                 self.error('corrupt commit witness')
                 raise ValueError('corrupt commit witness')
             witness = json.loads(rows[0][0])
@@ -353,9 +416,9 @@ class Fence:
             raise ValueError('unregistered/invisible/changed source population')
         ids = [t['sourceRecordId'] for t in facts]
         with self.transaction():
-            return self._append('FREEZE', dict(sourceFacts=facts, sourceFactsSha256=digest(facts), frozenIds=ids,
-                frozenIdsSha256=digest(ids), count=len(ids), fenceReceiptSha256=digest(s['receipt']),
-                query=dict(observedUtc=self.clock(), isolation='REPEATABLE_READ_READ_ONLY', sourceFactsSha256=digest(facts), sourceSQLCheckpoint=adapter.last_checkpoint)))
+            return self._append('FREEZE', dict(sourceFacts=facts, sourceFactsSha256=self.hash(facts), frozenIds=ids,
+                frozenIdsSha256=self.hash(ids), count=len(ids), fenceReceiptSha256=self.hash(s['receipt']),
+                query=dict(observedUtc=self.clock(), isolation='REPEATABLE_READ_READ_ONLY', sourceFactsSha256=self.hash(facts), sourceSQLCheckpoint=adapter.last_checkpoint)))
 
     def status(self):
         s = self.state()
@@ -427,8 +490,8 @@ class TransactionDriver:
                 trades.append(t)
             if len(trades) != len(ids):
                 raise ValueError('missing inserted IDs')
-            w = dict(transactionId=self.token, bindingSha256=digest(self.fence.binding), worker=self.worker, epoch=a['epoch'], trades=trades)
-            c.execute('INSERT INTO comparison_transaction_witness VALUES(%s,%s,%s,%s)', (self.token,digest(self.fence.binding),canonical(w),digest(w)))
+            w = dict(transactionId=self.token, bindingSha256=self.fence.hash(self.fence.binding), worker=self.worker, epoch=a['epoch'], trades=trades)
+            c.execute('INSERT INTO comparison_transaction_witness VALUES(%s,%s,%s,%s)', (self.token,self.fence.hash(self.fence.binding),canonical(w),self.fence.hash(w)))
             c.execute('RELEASE SAVEPOINT comparison_observation')
         except Exception as exc:
             c.execute('ROLLBACK TO SAVEPOINT comparison_observation')
@@ -498,7 +561,15 @@ class FencedDrain(D.FrozenDrain):
                 decisions.sort(key=lambda d: order[d['sourceEventId']])
                 self.last_checkpoint = adapter.last_checkpoint
                 return trades, decisions
-        super().__init__(directory, fence.binding, FixedAdapter(), read_clock=read_clock)
+        super().__init__(directory, fence.binding, FixedAdapter(), read_clock=read_clock, signer=fence.private_key, hash_value=fence.hash, canonical_value=A.canonical if fence.authority is not None else canonical,
+                         record_signer=self._authority_sign if fence.authority is not None else None,
+                         record_verifier=self._authority_verify if fence.authority is not None else None)
+
+    def _authority_sign(self, frame):
+        A.sign(frame, self.binding, self.fence.authority, 'drain', self.signer)
+
+    def _authority_verify(self, frame):
+        A.verify(frame, self.binding, self.fence.authority, 'drain')
 
     def _population_proof(self, source_facts):
         s = self.fence.state()  # replay durable events, not cached flags/certificate
@@ -509,13 +580,14 @@ class FencedDrain(D.FrozenDrain):
     def write_seal_journals(self, directory):
         """File-oriented offline handoff; legacy seal_input is explicitly in-memory.
 
-        Refuse observational mode just as Fence does. This exports synthetic
-        protocol evidence only, never an independently authenticated install seal.
+        Synthetic stays explicit. Observational handoff requires independently
+        pinned installation authority and the signed terminal ARCHIVE commitment.
         """
         s = self.fence.state()
         if s['error'] or self.fence.local_error or not self.frames or self.frames[-1]['state'] != 'COMPLETE' or not self.frames[-1]['comparisonEligible']:
             raise ValueError('pending/error decision drain cannot seal')
         self._validate_terminal()
+        self.fence.authenticate_archive(self.frames[-1])
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=False)
         def write(name, values):
@@ -541,6 +613,7 @@ class FencedDrain(D.FrozenDrain):
         if s['error'] or self.fence.local_error or not self.frames or self.frames[-1]['state'] != 'COMPLETE' or not self.frames[-1]['comparisonEligible']:
             raise ValueError('pending/error decision drain cannot seal')
         self._validate_terminal()
+        self.fence.authenticate_archive(self.frames[-1])
         return dict(binding=self.binding, fenceJournal=list(self.fence.events()), drainJournal=list(self.frames))  # legacy in-memory artifact API
 
     def _validate_terminal(self):
