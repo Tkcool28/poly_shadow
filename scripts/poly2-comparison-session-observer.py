@@ -68,13 +68,13 @@ class SessionObserver:
             if self.token is None or fence.local_error or fence.state()['error']:
                 return
             a = fence.state()['attempts'][self.token]
-            witness = dict(transactionId=self.token,bindingSha256=F.digest(fence.binding),worker=worker,
+            witness = dict(transactionId=self.token,bindingSha256=fence.hash(fence.binding),worker=worker,
                            epoch=a['epoch'],trades=sorted(self.trades.values(),key=lambda t:t['sourceRecordId']))
             connection = s.connection()
             savepoint = connection.begin_nested()
             try:
                 connection.execute(text('INSERT INTO comparison_transaction_witness(transaction_id,binding_sha256,payload,payload_sha256) VALUES(:token,:binding,:payload,:sha)'),
-                    dict(token=self.token,binding=F.digest(fence.binding),payload=F.canonical(witness),sha=F.digest(witness)))
+                    dict(token=self.token,binding=fence.hash(fence.binding),payload=F.canonical(witness),sha=fence.hash(witness)))
                 savepoint.commit()
                 self.intent = True
             except Exception:

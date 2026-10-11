@@ -1,0 +1,3 @@
+# Python producer dependencies for observational v5 only; legacy synthetic is stdlib.
+cryptography==50.0.2
+rfc8785==0.1.4

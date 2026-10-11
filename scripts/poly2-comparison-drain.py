@@ -28,7 +28,9 @@ MISSING = 'AT_END_SOURCE_ADMISSION_BARRIER_UNPROVEN'
 
 
 class FrozenDrain:
-    def __init__(self, directory, binding, adapter, *, read_clock=CHECKPOINT.now, signer=None):
+    def __init__(self, directory, binding, adapter, *, read_clock=CHECKPOINT.now, signer=None, hash_value=digest, canonical_value=canonical, record_signer=None, record_verifier=None):
+        self.hash, self.canonical = hash_value, canonical_value
+        self.record_signer, self.record_verifier = record_signer, record_verifier
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.path = self.directory / 'poly2_drain_receipts.ndjson'
@@ -40,7 +42,7 @@ class FrozenDrain:
         self.index.execute('PRAGMA cache_size=-2048')
         self.index.execute('PRAGMA synchronous=OFF')
         self.index.execute('PRAGMA journal_mode=MEMORY')
-        self.frames = B.JournalSequence(self.index, self.path, canonical)
+        self.frames = B.JournalSequence(self.index, self.path, self.canonical)
         self._validation_cursor = None
         self.binding, self.adapter, self.read_clock, self.signer = binding, adapter, read_clock, signer
         self.latched = False
@@ -62,16 +64,19 @@ class FrozenDrain:
             raise
 
     def _validate(self, frame):
-        if frame['bindingSha256'] != digest(self.binding) or frame['cursor'] != (self._validation_cursor if self._validation_cursor is not None else len(self.frames))+1 or frame['previousSha256'] != (digest(self.frames[-1]) if self.frames else None):
+        if frame['bindingSha256'] != self.hash(self.binding) or frame['cursor'] != (self._validation_cursor if self._validation_cursor is not None else len(self.frames))+1 or frame['previousSha256'] != (self.hash(self.frames[-1]) if self.frames else None):
             raise ValueError('drain binding/chain conflict')
         unsigned = {k: v for k, v in frame.items() if k not in ('signature', 'signedPayload')}
-        if self.signer:
-            if frame['signedPayload'] != canonical(unsigned):
+        if self.record_verifier is not None:
+            # Reuse the same full-record envelope for restart and offline replay.
+            self.record_verifier(frame)
+        elif self.signer:
+            if frame['signedPayload'] != self.canonical(unsigned):
                 raise ValueError('drain signed payload conflict')
             self.signer.public_key().verify(base64.b64decode(frame['signature']), frame['signedPayload'].encode())
         elif frame['signature'] is not None:
             raise ValueError('synthetic drain signature forbidden')
-        if frame['frozenIdsSha256'] != digest(frame['frozenIds']) or frame['sourceFactsSha256'] != digest(frame['sourceFacts']):
+        if frame['frozenIdsSha256'] != self.hash(frame['frozenIds']) or frame['sourceFactsSha256'] != self.hash(frame['sourceFacts']):
             raise ValueError('drain source-fact digest conflict')
         ids = [f['sourceRecordId'] for f in frame['sourceFacts']]
         events = [f['sourceEventId'] for f in frame['sourceFacts']]
@@ -80,7 +85,7 @@ class FrozenDrain:
         if set(frame['perId']) != set(events) or any(v['state'] not in COUNTS for v in frame['perId'].values()):
             raise ValueError('drain exact per-ID map required')
         counts = {s: sum(v['state'] == s for v in frame['perId'].values()) for s in COUNTS}
-        if counts != frame['counts'] or sum(counts.values()) != len(ids) or frame['perIdSha256'] != digest(frame['perId']):
+        if counts != frame['counts'] or sum(counts.values()) != len(ids) or frame['perIdSha256'] != self.hash(frame['perId']):
             raise ValueError('drain completeness equation/digest conflict')
         for event, terminal in frame['perId'].items():
             if terminal['state'] == 'NO_INITIAL_DECISION_EXPECTED':
@@ -111,18 +116,20 @@ class FrozenDrain:
         if error and error != 'SAFETY_TIMEOUT_INCOMPLETE':
             per_id = {k: (dict(state='CAPTURE_ERROR', decision=None) if v['state'] == 'PENDING' else v) for k, v in per_id.items()}
         counts = {s: sum(v['state'] == s for v in per_id.values()) for s in COUNTS}
-        frame = dict(version=1, bindingSha256=digest(self.binding), cursor=len(self.frames)+1,
-                     previousSha256=digest(self.frames[-1]) if self.frames else None,
+        frame = dict(version=1, bindingSha256=self.hash(self.binding), cursor=len(self.frames)+1,
+                     previousSha256=self.hash(self.frames[-1]) if self.frames else None,
                      observedUtc=self.read_clock(), frozenIds=[f['sourceRecordId'] for f in source_facts],
-                     sourceFacts=source_facts, sourceFactsSha256=digest(source_facts),
-                     perId=per_id, perIdSha256=digest(per_id), counts=counts, error=error,
+                     sourceFacts=source_facts, sourceFactsSha256=self.hash(source_facts),
+                     perId=per_id, perIdSha256=self.hash(per_id), counts=counts, error=error,
                      state='FAILED' if error else 'COMPLETE' if counts['PENDING'] == counts['CAPTURE_ERROR'] == 0 else 'DRAINING',
                      query=query, toolSha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                      comparisonEligible=self._population_proof(source_facts)[0] and counts['PENDING'] == counts['CAPTURE_ERROR'] == 0 and not error,
                      incompleteProperty=self._population_proof(source_facts)[1])
-        frame['frozenIdsSha256'] = digest(frame['frozenIds'])
-        if self.signer:
-            frame['signedPayload'] = canonical(frame)
+        frame['frozenIdsSha256'] = self.hash(frame['frozenIds'])
+        if self.record_signer is not None:
+            self.record_signer(frame)
+        elif self.signer:
+            frame['signedPayload'] = self.canonical(frame)
             frame['signature'] = base64.b64encode(self.signer.sign(frame['signedPayload'].encode())).decode()
         else:
             frame['signature'] = None
@@ -130,7 +137,7 @@ class FrozenDrain:
         try:
             fd = os.open(self.path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
             try:
-                data = memoryview((canonical(frame)+'\n').encode())
+                data = memoryview((self.canonical(frame)+'\n').encode())
                 while data:
                     n = os.write(fd, data)
                     if n <= 0:
@@ -159,12 +166,12 @@ class FrozenDrain:
             return dict(state='NOT_STARTED', frozenCount=0, counts={s: 0 for s in COUNTS}, pendingOldestUtc=None, latestQueryUtc=None, comparisonEligible=False, incompleteProperty=MISSING)
         f = self.frames[-1]
         pending = [t['ingestedUtc'] for t in f['sourceFacts'] if f['perId'][t['sourceEventId']]['state'] == 'PENDING']
-        return dict(state=f['state'], frozenCount=len(f['frozenIds']), counts=f['counts'], pendingOldestUtc=min(pending, key=epoch) if pending else None, latestQueryUtc=f['query']['observedUtc'], comparisonEligible=f['comparisonEligible'], incompleteProperty=f['incompleteProperty'], receiptSha256=digest(f), cursor=f['cursor'], error=f['error'], blockingIds=self.pending_ids(limit=100), blockingCount=f['counts']['PENDING']+f['counts']['CAPTURE_ERROR'], blockingIdsTruncated=f['counts']['PENDING']+f['counts']['CAPTURE_ERROR'] > 100)
+        return dict(state=f['state'], frozenCount=len(f['frozenIds']), counts=f['counts'], pendingOldestUtc=min(pending, key=epoch) if pending else None, latestQueryUtc=f['query']['observedUtc'], comparisonEligible=f['comparisonEligible'], incompleteProperty=f['incompleteProperty'], receiptSha256=self.hash(f), cursor=f['cursor'], error=f['error'], blockingIds=self.pending_ids(limit=100), blockingCount=f['counts']['PENDING']+f['counts']['CAPTURE_ERROR'], blockingIdsTruncated=f['counts']['PENDING']+f['counts']['CAPTURE_ERROR'] > 100)
 
     def _publish(self):
         pending = self.health_path.with_suffix('.pending')
         with pending.open('wb') as stream:
-            stream.write(canonical(dict(version=1, binding=self.binding, bindingSha256=digest(self.binding), **self.status())).encode())
+            stream.write(self.canonical(dict(version=1, binding=self.binding, bindingSha256=self.hash(self.binding), **self.status())).encode())
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(pending, self.health_path)
@@ -181,14 +188,14 @@ class FrozenDrain:
         frozen_ids = previous['frozenIds'] if previous else None
         # Query errors are retryable: do not advance a phantom authority cursor.
         trades, decisions = self.adapter.scan(self.binding, frozen_ids=frozen_ids)
-        query = dict(observedUtc=self.read_clock(), bindingSha256=digest(self.binding),
-                     frozenIds=frozen_ids, tradesSha256=digest(trades), decisionsSha256=digest(decisions),
+        query = dict(observedUtc=self.read_clock(), bindingSha256=self.hash(self.binding),
+                     frozenIds=frozen_ids, tradesSha256=self.hash(trades), decisionsSha256=self.hash(decisions),
                      tradeCount=len(trades), decisionCount=len(decisions),
                      isolation='REPEATABLE_READ_READ_ONLY' if self.adapter.dialect == 'postgres' else 'SQLITE_READ_ONLY')
         if getattr(self.adapter, 'last_checkpoint', None):
             query['sourceSQLCheckpoint'] = self.adapter.last_checkpoint
         facts = previous['sourceFacts'] if previous else trades
-        per_id = json.loads(canonical(previous['perId'])) if previous else {t['sourceEventId']: dict(state='PENDING', decision=None) for t in facts}
+        per_id = json.loads(self.canonical(previous['perId'])) if previous else {t['sourceEventId']: dict(state='PENDING', decision=None) for t in facts}
         if previous and trades != facts:
             return self._append(facts, per_id, query, 'SOURCE_INSERTION_RETENTION_OR_IMMUTABILITY_VIOLATED')
         current_decisions = {d['sourceEventId']: d for d in decisions}

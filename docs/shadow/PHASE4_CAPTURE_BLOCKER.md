@@ -1,5 +1,11 @@
 # Phase 4 — fixed-ID drain tested; authoritative population unresolved
 
+> **V5 authority amendment:** the older synthetic-only implementation/refusal
+> descriptions below are historical. The separately authorized observational
+> identity/custody path is specified in [V5_PRODUCTION_AUTHORITY_V1.md](V5_PRODUCTION_AUTHORITY_V1.md).
+> It requires independent operator-approved installation authority and pins; no
+> production installation, observation launch or scientific verdict is claimed.
+
 > **Prospective scope amendment:** the experiment's authorized comparator-writer
 > architecture is the declared `backend` + `bot` service roster, not hypothetical
 > direct-SQL/rogue writers. The `backend` role covers candidate-history ingestion;
