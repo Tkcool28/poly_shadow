@@ -23,7 +23,10 @@ class BudgetTests(unittest.TestCase):
             self.assertEqual(json.loads(out), b.budget(seconds))
         self.assertEqual(len(b.budget()['families']), 8)
     def test_exact_thresholds(self):
-        total = b.budget()['requiredFreeBytes']; reserve = b.plan()['alertReserveBytes']
+        budget = b.budget(); total = budget['requiredFreeBytes']; reserve = b.plan()['alertReserveBytes']
+        self.assertEqual(budget['launchBasis'], 'expected')
+        self.assertEqual(budget['launchBytes'], budget['expectedBytes'])
+        self.assertEqual(total, 27096358240)
         for available, state in ((None,'UNKNOWN'), (reserve-1,'AT_RISK'), (reserve,'DEGRADED'),(total-1,'DEGRADED'),(total,'GREEN')):
             self.assertEqual(b.disk_state(available)['state'], state)
     def test_prelaunch_nearest_parent_and_fail_closed(self):
