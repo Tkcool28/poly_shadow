@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 2,
+  "windowSeconds": 86400,
+  "maximumDrainGraceSeconds": 7200,
+  "telemetryCadenceSeconds": 5,
+  "publisherCadenceSeconds": 60,
+  "alertReserveBytes": 10737418240,
+  "marginRatio": 0.25,
+  "families": {
+    "telemetry": {"expectedBytesPerSecond": 1800, "upperBytesPerSecond": 8192},
+    "lineageRecovery": {"expectedBytesPerSecond": 12000, "upperBytesPerSecond": 131072},
+    "quarantineResolution": {"expectedBytesPerSecond": 2000, "upperBytesPerSecond": 65536},
+    "restReceipts": {"expectedBytesPerSecond": 12000, "upperBytesPerSecond": 65536},
+    "auditSnapshots": {"expectedBytesPerSecond": 20, "upperBytesPerSecond": 128},
+    "chainRawScientific": {"expectedBytesPerSecond": 64000, "upperBytesPerSecond": 262144},
+    "poly2Capture": {"expectedBytesPerSecond": 16000, "upperBytesPerSecond": 131072},
+    "indexes": {"expectedBytesPerSecond": 32000, "upperBytesPerSecond": 262144}
+  }
+}

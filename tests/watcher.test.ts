@@ -5,12 +5,13 @@
  * real ShadowStore in a temp dir — not storage methods in isolation.
  */
 
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ChainWatcher, ReorgSignal } from '../src/shadow/watcher.js';
 import { ShadowStore } from '../src/shadow/storage.js';
+import { OperationalEvidence } from '../src/shadow/operational-evidence.js';
 import type { ShadowConfig } from '../src/shadow/config.js';
 import {
   EXCHANGE_V2_STANDARD,
@@ -290,7 +291,8 @@ describe('bounded provider-lag retries', () => {
       state.mismatch = !provable;
       return rpc<T>(url, method, params);
     };
-    const w = new ChainWatcher(cfg(store.dir), store, clock(), ancestorRpc);
+    const op = new OperationalEvidence(store.dir);
+    const w = new ChainWatcher(cfg(store.dir), store, clock(), ancestorRpc, undefined, op);
     const initial = w.validateCursor().catch((err) => err);
     await vi.advanceTimersByTimeAsync(3100);
     expect(String(await initial)).toContain('after 6 attempts');
@@ -303,6 +305,8 @@ describe('bounded provider-lag retries', () => {
     expect(store.readCursor('https://rpc.test')?.blockNumber).toBe(provable ? 99 : 100);
     expect(store.quarantine()).toHaveLength(1);
     expect(store.quarantine()[0]!.detail['ancestorVerified']).toBe(provable);
+    expect(op.quarantineState()).toMatchObject({unresolved:1,total:1});
+    expect(op.quarantineStateIds()[0]!.state).toBe('UNRESOLVED');
   });
 
   it('live and scan concurrent same identity during null hydration commit exactly once', async () => {
@@ -525,18 +529,53 @@ describe('watcher evidence safety', () => {
     const store = tempStore();
     const blocks: Blocks = new Map([[100, { hash: BLOCK_A, timestamp: 1_791_143_962 }]]);
     const { rpc, state } = mockRpc(blocks);
-    const w = new ChainWatcher(cfg(store.dir), store, () => '2026-01-01T00:00:00.000Z', rpc);
+    const operational=new OperationalEvidence(store.dir);
+    const w = new ChainWatcher(cfg(store.dir), store, () => '2026-01-01T00:00:00.000Z', rpc, undefined, operational);
 
     state.failNext = true; // first blockRef call fails
     await w.handleLog(fillLog(100, BLOCK_A));
     expect(store.observations()).toHaveLength(0); // not committed
     expect(store.quarantine().some((q) => q.kind === 'TRANSIENT_FAILURE')).toBe(true);
+    expect(operational.quarantineState()).toMatchObject({unresolved:1,total:1});
 
     await w.processRetries(); // replay succeeds now
     expect(store.observations()).toHaveLength(1);
     expect(store.observations()[0]!.eventId).toBe(`137:${EXCHANGE_V2_STANDARD}:${TX}:7`);
     // Raw evidence row exists exactly once (no duplicate from the retry).
     expect(store.rawLogs()).toHaveLength(1);
+  });
+
+  it('bounds RPC retry-parent cache while preserving recent lineage and exposing eviction', async () => {
+    const store=tempStore(),operational=new OperationalEvidence(store.dir);
+    let calls=0,healthy=false;
+    const rpc=async <T>(_url:string,_method:string,_params:unknown[]):Promise<T>=>{
+      if(!healthy)throw new Error(`synthetic RPC failure ${++calls}`);
+      return 'ok' as T;
+    };
+    const w=new ChainWatcher(cfg(store.dir),store,clock(),rpc as typeof import('../src/shadow/egress.js').rpcCall,undefined,operational);
+    const internals=w as unknown as {rpcParents:Map<string,string>;rpcObserved<T>(method:string,params:unknown[]):Promise<T>;memoryTelemetry():Record<string,unknown>};
+    const invoke=async(params:unknown[])=>expect(internals.rpcObserved('eth_getLogs',params)).rejects.toThrow('synthetic RPC failure');
+    const base=[{fromBlock:'0x1',toBlock:'0x1'}],key=(params:unknown[])=>`eth_getLogs:${JSON.stringify(params)}`;
+    await invoke(base);await invoke(base);
+    let rows=readFileSync(join(store.dir,'rpc_lineage.ndjson'),'utf8').trim().split('\n').map(x=>JSON.parse(x));
+    expect(rows[1].retryParentRequestId).toBe(rows[0].requestId);
+    let recent:unknown[]=[];
+    for(let i=0;i<256;i++){
+      recent=[{fromBlock:'0x'+(i+2).toString(16),toBlock:'0x'+(i+2).toString(16)}];
+      await invoke(recent);
+    }
+    expect(internals.rpcParents.size).toBeLessThanOrEqual(256);
+    const recentParent=internals.rpcParents.get(key(recent));
+    expect(recentParent).toBeTruthy();await invoke(recent);
+    rows=readFileSync(join(store.dir,'rpc_lineage.ndjson'),'utf8').trim().split('\n').map(x=>JSON.parse(x));
+    expect(rows.at(-1).retryParentRequestId).toBe(recentParent);
+    await invoke(base);
+    rows=readFileSync(join(store.dir,'rpc_lineage.ndjson'),'utf8').trim().split('\n').map(x=>JSON.parse(x));
+    expect(rows.at(-1).retryParentRequestId).toBeNull();
+    expect(internals.rpcParents.size).toBeLessThanOrEqual(256);
+    expect(internals.memoryTelemetry()).toMatchObject({rpcParentLineages:256,rpcParentLineageEvictions:2,rpcParentHistoryTruncated:true});
+    healthy=true;await internals.rpcObserved('eth_getLogs',recent);
+    expect(internals.rpcParents.has(key(recent))).toBe(false);
   });
 
   it('cursor-hash mismatch walks to common ancestor, tombstones above it, rewinds', async () => {
@@ -575,11 +614,20 @@ describe('watcher evidence safety', () => {
     const store = tempStore();
     const blocks: Blocks = new Map([[100, { hash: BLOCK_B, timestamp: 1_791_143_970 }]]); // disagrees with log
     const { rpc } = mockRpc(blocks);
-    const w = new ChainWatcher(cfg(store.dir), store, () => '2026-01-01T00:00:00.000Z', rpc);
+    const operational=new OperationalEvidence(store.dir);
+    const w = new ChainWatcher(cfg(store.dir), store, () => '2026-01-01T00:00:00.000Z', rpc, undefined, operational);
 
     await w.handleLog(fillLog(100, BLOCK_A)); // log claims BLOCK_A
     expect(store.observations()).toHaveLength(0); // no emission under conflict
     expect(store.quarantine().some((q) => q.kind === 'REORG_ANOMALY')).toBe(true);
+    expect(operational.quarantineState()).toMatchObject({terminal:1,total:1});
+  });
+
+  it('malformed chain payload creates terminal structured quarantine evidence', async () => {
+    const store=tempStore();const blocks:Blocks=new Map([[100,{hash:BLOCK_A,timestamp:1}]]);const {rpc}=mockRpc(blocks);const operational=new OperationalEvidence(store.dir);
+    const w=new ChainWatcher(cfg(store.dir),store,clock(),rpc,undefined,operational);
+    await w.handleLog({...fillLog(100,BLOCK_A),data:'0xdeadbeef'});
+    expect(operational.quarantineState()).toMatchObject({terminal:1,total:1});
   });
 
   it('WSS endpoint goes through the egress assertion', () => {

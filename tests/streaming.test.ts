@@ -7,6 +7,7 @@ import { readNdjson } from '../src/compare/ndjson.js';
 import { readHealth, readMarketMetadata, readShadowGroups } from '../src/compare/evidence.js';
 import { buildShadowGroups, compare } from '../src/compare/phase4.js';
 import type { SourceObservationRow } from '../src/shadow/racing.js';
+import { fixtureArchive } from './poly2-fixtures.js';
 
 const dirs: string[] = [];
 const dir = () => { const d = mkdtempSync(join(tmpdir(), 'poly-stream-test-')); dirs.push(d); return d; };
@@ -42,8 +43,8 @@ describe('streaming offline evidence', () => {
     expect(await readHealth()).toEqual({ available: false });
     expect(await readHealth(dir())).toEqual({ available: true, chainRawEvents: 0, latestObservationUtc: null, restPolls: 0, restErrors: 0, lastRestError: null, cdnAgeP50Sec: null, quarantineCount: 0, recoveryRequired: false });
   });
-  it('preserves first-wins market map and full canonical comparator/CLI outputs without retaining members', async () => {
-    const d = dir(); const rows = [observation, { ...observation, source: 'REST_ACTIVITY' as const, completedUtc: window.startUtc }, { ...observation, wallet: '0xother', groupKey: 'excluded' }, { ...observation, groupKey: 'late', sourceFirstSeenUtc: '2027-01-01' }, { ...observation, groupKey: 'econ:0xother:7:1.000000', hydration: 'PARTIAL' as const }];
+  it('preserves first-wins market map and full canonical comparator outputs; production CLI rejects fixture archives', async () => {
+    const d = dir(); const rows = [observation, { ...observation, source: 'REST_ACTIVITY' as const, completedUtc: window.startUtc }, { ...observation, wallet: '0xother', groupKey: 'excluded' }, { ...observation, groupKey: 'late', sourceFirstSeenUtc: '2027-01-01T00:00:00Z' }, { ...observation, groupKey: 'econ:0xother:7:1.000000', hydration: 'PARTIAL' as const }];
     put(d, 'source_observations.ndjson', rows);
     put(d, 'rest_raw.ndjson', [{ payload: { transactionHash: '0xTX', asset: 7, size: 1, title: '猫 first' } }, { payload: { transactionHash: '0xtx', asset: '7', size: 1, title: 'later' } }, { payload: { transactionHash: '0xOTHER', asset: 7, size: 1, conditionId: 'fallback' } }, { payload: { transactionHash: '0xignored', asset: 7, size: '1', title: 'ignored' } }]);
     const markets = await readMarketMetadata(d); expect([...markets]).toEqual([['econ:0xtx:7:1.000000', '猫 first'], ['econ:0xother:7:1.000000', 'fallback']]);
@@ -51,9 +52,12 @@ describe('streaming offline evidence', () => {
     const exported = { window, rows: [{ wallet: '0xabc', txHash: '0xtx', asset: '7', conditionId: null, side: 'BUY' as const, size: 1, price: 0.5, sourceTs: observation.sourceTs, ingestedUtc: '2026-01-01T00:00:02.123Z', normalizedUtc: '2026-01-01T00:00:03.456Z', decisionUtc: null, signalUtc: null, source: 'fixture', freshnessAgeSec: 301, freshnessRejection: 'stale', policyEligible: false, copyabilityOutcome: null, rejectionReason: 'stale', paperOutcome: null }] };
     const expected = compare(exported, buildShadowGroups(rows, cohort, window), window, cohort, markets);
     expect(compare(exported, groups, window, cohort, markets)).toEqual(expected);
-    put(d, 'unused.ndjson', []); writeFileSync(join(d, 'export.json'), JSON.stringify(exported)); writeFileSync(join(d, 'cohorts.json'), JSON.stringify({ window, controlled: ['0xabc'] }));
-    execFileSync(process.execPath, ['--import', 'tsx', 'src/compare/cli.ts', d, join(d, 'export.json'), join(d, 'cohorts.json'), d]);
-    expect(JSON.parse(readFileSync(join(d, 'comparison.json'), 'utf8'))).toEqual(expected);
+    put(d, 'unused.ndjson', []); const archived=fixtureArchive(exported.rows, window, ['0xabc']); writeFileSync(join(d, 'export.json'), JSON.stringify(archived)); writeFileSync(join(d, 'cohorts.json'), JSON.stringify({ window, controlled: ['0xabc'] }));
+    let cliError:unknown;
+    try{execFileSync(process.execPath,['--import','tsx','src/compare/cli.ts',d,join(d,'export.json'),join(d,'cohorts.json'),d],{stdio:'pipe'});}catch(error){cliError=error;}
+    expect(String((cliError as {stderr?:unknown}|undefined)?.stderr)).toContain('synthetic comparator fixtures are not production authority');
+    expect(()=>readFileSync(join(d,'comparison.json'))).toThrow();
+    writeFileSync(join(d,'comparison.json'),JSON.stringify(expected));
     execFileSync(process.execPath, ['--import', 'tsx', 'src/compare/dashboard.ts', d, d]);
     const html = readFileSync(join(d, 'dashboard.html'), 'utf8'); const health = JSON.parse(html.match(/const HEALTH = (.*);/)![1]!);
     expect(health).toEqual(await readHealth(d));
@@ -70,8 +74,8 @@ describe('streaming offline evidence', () => {
       expect((await readHealth(d))['cdnAgeP50Sec']).toBe(sorted.length ? sorted[Math.floor(sorted.length/2)] : null);
     }
   });
-  it('production entrypoints fail closed with evidence file and line', () => {
-    const d = dir(); writeFileSync(join(d, 'export.json'), JSON.stringify({ window, rows: [] }));
+  it('production CLI rejects synthetic archives; dashboard reports malformed evidence line', () => {
+    const d = dir(); writeFileSync(join(d, 'export.json'), JSON.stringify(fixtureArchive([], window, ['0xabc'])));
     writeFileSync(join(d, 'cohorts.json'), JSON.stringify({ window, controlled: ['0xabc'] }));
     const run = (kind: string) => {
       const args = kind === 'cli' ? [d, join(d, 'export.json'), join(d, 'cohorts.json'), d] : [d, d];
@@ -79,10 +83,11 @@ describe('streaming offline evidence', () => {
       catch (error) { return String((error as { stderr: Buffer }).stderr); }
       throw new Error('malformed evidence was accepted');
     };
-    writeFileSync(join(d, 'rest_raw.ndjson'), '\n{bad}'); expect(run('cli')).toContain('rest_raw.ndjson:2');
-    writeFileSync(join(d, 'rest_raw.ndjson'), ''); writeFileSync(join(d, 'source_observations.ndjson'), JSON.stringify(observation) + '\n{bad}'); expect(run('cli')).toContain('source_observations.ndjson:2');
+    writeFileSync(join(d, 'rest_raw.ndjson'), '\n{bad}'); expect(run('cli')).toContain('synthetic comparator fixtures are not production authority');
+    writeFileSync(join(d, 'rest_raw.ndjson'), ''); writeFileSync(join(d, 'source_observations.ndjson'), JSON.stringify(observation) + '\n{bad}'); expect(run('cli')).toContain('synthetic comparator fixtures are not production authority');
     writeFileSync(join(d, 'source_observations.ndjson'), '');
-    execFileSync(process.execPath, ['--import', 'tsx', 'src/compare/cli.ts', d, join(d, 'export.json'), join(d, 'cohorts.json'), d]);
+    expect(run('cli')).toContain('synthetic comparator fixtures are not production authority');
+    writeFileSync(join(d, 'comparison.json'),JSON.stringify(compare({window,rows:[]},new Map(),window,cohort,new Map())));
     writeFileSync(join(d, 'poll_telemetry.ndjson'), '\n\n{bad}'); expect(run('dashboard')).toContain('poll_telemetry.ndjson:3');
   });
 });

@@ -17,6 +17,7 @@
  * Neither system's native identity is ever mutated. Ambiguity stays visible.
  */
 
+import { epochMicros, inWindow, clockOrder, deltaSeconds, secondsMicros, clockEvidence } from './exact-clock.js';
 import type { SourceObservationRow } from '../shadow/racing.js';
 import { EXCHANGE_V2_STANDARD, EXCHANGE_V2_NEG_RISK } from '../shadow/v2constants.js';
 
@@ -31,6 +32,8 @@ export interface Poly2ExportRow {
   size: number | null;
   price: number | null;
   sourceTs: number | null;
+  sourceEpochMicros?: string | null;
+  tradedAtUtc?: string | null;
   ingestedUtc: string;
   normalizedUtc: string | null;
   decisionUtc: string | null;
@@ -55,16 +58,18 @@ export function validatePoly2Export(data: unknown): Poly2Export {
   if (!d || typeof d !== 'object' || !Array.isArray(d.rows)) {
     throw new Error('poly2 export: missing rows array');
   }
-  if (!d.window || Number.isNaN(Date.parse(d.window.startUtc)) || Number.isNaN(Date.parse(d.window.endUtc))) {
+  if (!d.window || epochMicros(d.window.startUtc) > epochMicros(d.window.endUtc)) {
     throw new Error('poly2 export: window.startUtc/endUtc missing/invalid');
   }
   d.rows.forEach((r, i) => {
     if (typeof r.wallet !== 'string' || !r.wallet.startsWith('0x')) {
       throw new Error(`poly2 export row ${i}: wallet missing/invalid`);
     }
-    if (typeof r.ingestedUtc !== 'string' || Number.isNaN(Date.parse(r.ingestedUtc))) {
+    if (typeof r.ingestedUtc !== 'string') {
       throw new Error(`poly2 export row ${i}: ingestedUtc missing/invalid`);
     }
+    clockEvidence(r as unknown as Record<string, unknown>, ['ingestedUtc','normalizedUtc','decisionUtc','signalUtc','tradedAtUtc']);
+    if (r.sourceEpochMicros != null && (r.tradedAtUtc == null || r.sourceEpochMicros !== epochMicros(r.tradedAtUtc).toString())) throw new Error('poly2 export: canonical source clock conflicts with original');
   });
   return d;
 }
@@ -78,8 +83,8 @@ export function assertExportWindowMatches(
   exportData: Poly2Export,
   window: { startUtc: string; endUtc: string },
 ): void {
-  if (Date.parse(exportData.window.startUtc) !== Date.parse(window.startUtc)
-    || Date.parse(exportData.window.endUtc) !== Date.parse(window.endUtc)) {
+  if (epochMicros(exportData.window.startUtc) !== epochMicros(window.startUtc)
+    || epochMicros(exportData.window.endUtc) !== epochMicros(window.endUtc)) {
     throw new Error(
       `poly2 export window ${exportData.window.startUtc}→${exportData.window.endUtc} `
       + `does not equal frozen comparison window ${window.startUtc}→${window.endUtc}`,
@@ -142,7 +147,7 @@ export function addShadowObservation(
   window: { startUtc: string; endUtc: string },
   retainMembers = false,
 ): void {
-  if (o.sourceFirstSeenUtc < window.startUtc || o.sourceFirstSeenUtc > window.endUtc) return;
+  if (!inWindow(o.sourceFirstSeenUtc, window)) return;
   const cohort = walletCohort(o.wallet);
   if (cohort !== 'CONTROLLED_OVERLAP') return; // primary comparison only
   const key = o.groupKey;
@@ -162,8 +167,8 @@ export function addShadowObservation(
   g.sources.add(o.source);
   const em = emitterClass(o);
   if (em) g.emitters.add(em);
-  if (o.sourceFirstSeenUtc < g.rawUtc) g.rawUtc = o.sourceFirstSeenUtc;
-  if (usable(o) && (g.usableUtc === null || o.completedUtc < g.usableUtc)) {
+  if (clockOrder(o.sourceFirstSeenUtc, g.rawUtc) < 0) g.rawUtc = o.sourceFirstSeenUtc;
+  if (usable(o) && (g.usableUtc === null || clockOrder(o.completedUtc, g.usableUtc) < 0)) {
     g.usableUtc = o.completedUtc;
   }
 }
@@ -203,9 +208,9 @@ export function matchEvents(rows: Poly2ExportRow[], groups: Map<string, ShadowGr
       if (r.txHash && g.tx && g.tx === r.txHash.toLowerCase()) { high.push(key); continue; }
       if (!r.txHash && sideOk(g.side, r.side)) {
         const near = (g.sourceTs !== null && r.sourceTs !== null
-          && Math.abs(g.sourceTs - r.sourceTs) <= 120)
+          && (secondsMicros(g.sourceTs) - (r.tradedAtUtc != null ? epochMicros(r.tradedAtUtc) : secondsMicros(r.sourceTs)) >= -120000000n && secondsMicros(g.sourceTs) - (r.tradedAtUtc != null ? epochMicros(r.tradedAtUtc) : secondsMicros(r.sourceTs)) <= 120000000n))
           || (r.sourceTs === null
-            && Math.abs(Date.parse(g.rawUtc) - Date.parse(r.ingestedUtc)) <= 120_000);
+            && (epochMicros(g.rawUtc) - epochMicros(r.ingestedUtc) >= -120000000n && epochMicros(g.rawUtc) - epochMicros(r.ingestedUtc) <= 120000000n));
         if (near) probable.push(key);
       }
     }
@@ -254,13 +259,14 @@ export function matchEvents(rows: Poly2ExportRow[], groups: Map<string, ShadowGr
 const pctile = (sorted: number[], p: number): number | null =>
   sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))]! : null;
 
-function latencyStats(deltas: number[]) {
-  const s = [...deltas].sort((a, b) => a - b);
+function latencyStats(deltas: bigint[]) {
+  const exact = [...deltas].sort((a,b) => a < b ? -1 : a > b ? 1 : 0);
+  const s = exact.map(d => Number(d) / 1000000);
   return {
     n: s.length,
-    shadowEarlier: s.filter((d) => d >= 1).length,
-    poly2Earlier: s.filter((d) => d <= -1).length,
-    tie: s.filter((d) => d > -1 && d < 1).length,
+    shadowEarlier: exact.filter((d) => d >= 1000000n).length,
+    poly2Earlier: exact.filter((d) => d <= -1000000n).length,
+    tie: exact.filter((d) => d > -1000000n && d < 1000000n).length,
     median: pctile(s, 50), p50: pctile(s, 50), p90: pctile(s, 90), p95: pctile(s, 95),
   };
 }
@@ -290,6 +296,7 @@ export interface ComparisonResult {
     usableDeltaSec: number | null;
     decision: DecisionClass | null;
     actionable: boolean;
+    clockEvidence: ReturnType<typeof clockEvidence>;
   }>;
   coverage: {
     matched: number; shadowOnly: number; poly2Only: number; ambiguous: number;
@@ -335,6 +342,7 @@ export function compare(
   walletCohort: CohortFn,
   marketByGroupKey?: Map<string, string>,
 ): ComparisonResult {
+  validatePoly2Export(exportData);
   assertExportWindowMatches(exportData, window);
 
   // Symmetric cohort + window enforcement on the Poly2 side (contract §2/§8).
@@ -347,7 +355,7 @@ export function compare(
       excluded.byWallet[w] = (excluded.byWallet[w] ?? 0) + 1;
       continue;
     }
-    if (r.ingestedUtc < window.startUtc || r.ingestedUtc > window.endUtc) {
+    if (!inWindow(r.ingestedUtc, window)) {
       excluded.outOfWindowPoly2Rows++;
       excluded.byWallet[w] = (excluded.byWallet[w] ?? 0) + 1;
       continue;
@@ -357,8 +365,8 @@ export function compare(
 
   const records = matchEvents(included, groups);
   const enriched: ComparisonResult['records'] = [];
-  const rawDeltas: number[] = [];
-  const usableDeltas: number[] = [];
+  const rawDeltas: bigint[] = [];
+  const usableDeltas: bigint[] = [];
   const decision: Record<DecisionClass, number> = {
     EARLIER_AND_USABLE: 0, EARLIER_BUT_NOT_HYDRATED: 0, EARLIER_BUT_POLICY_INELIGIBLE: 0,
     EARLIER_MAKER_ONLY: 0, EARLIER_BUT_TOO_LATE: 0, NO_MEANINGFUL_ADVANTAGE: 0,
@@ -375,25 +383,25 @@ export function compare(
     let dec: DecisionClass | null = null;
 
     if (isMatched(rec.match) && row && g) {
-      rawDelta = (Date.parse(row.ingestedUtc) - Date.parse(g.rawUtc)) / 1000;
-      rawDeltas.push(rawDelta);
+      rawDelta = deltaSeconds(row.ingestedUtc, g.rawUtc);
+      rawDeltas.push(epochMicros(row.ingestedUtc) - epochMicros(g.rawUtc));
       const poly2Usable = row.normalizedUtc ?? row.decisionUtc;
       if (poly2Usable && g.usableUtc) {
-        usableDelta = (Date.parse(poly2Usable) - Date.parse(g.usableUtc)) / 1000;
-        usableDeltas.push(usableDelta);
+        usableDelta = deltaSeconds(poly2Usable, g.usableUtc);
+        usableDeltas.push(epochMicros(poly2Usable) - epochMicros(g.usableUtc));
       }
       // Decision relevance (§7 ordered rules).
-      if (rawDelta < 1) dec = 'NO_MEANINGFUL_ADVANTAGE';
+      if (epochMicros(row.ingestedUtc) - epochMicros(g.rawUtc) < 1000000n) dec = 'NO_MEANINGFUL_ADVANTAGE';
       else if (row.freshnessRejection || row.policyEligible === false) dec = 'EARLIER_BUT_POLICY_INELIGIBLE';
       else if (!g.usableUtc) dec = 'EARLIER_BUT_NOT_HYDRATED';
       else if ([...g.roles].every((r) => r === 'MAKER_LEG') && !g.sources.has('REST_TRADES') && !g.sources.has('REST_ACTIVITY')) dec = 'EARLIER_MAKER_ONLY';
-      else if (usableDelta === null || usableDelta < 1) dec = 'EARLIER_BUT_TOO_LATE';
+      else if (usableDelta === null || epochMicros(poly2Usable!) - epochMicros(g.usableUtc!) < 1000000n) dec = 'EARLIER_BUT_TOO_LATE';
       else dec = 'EARLIER_AND_USABLE';
       decision[dec]++;
 
       if (row.freshnessRejection) {
         policy.staleRejected++;
-        if (g.sourceTs !== null && (Date.parse(g.rawUtc) / 1000 - g.sourceTs) <= POLY2_FRESHNESS_BUDGET_SEC) {
+        if (g.sourceTs !== null && epochMicros(g.rawUtc) - secondsMicros(g.sourceTs) <= BigInt(POLY2_FRESHNESS_BUDGET_SEC) * 1000000n) {
           policy.staleRejectedShadowSawWithin300s++;
         }
       }
@@ -417,6 +425,7 @@ export function compare(
       shadowUsableUtc: g?.usableUtc ?? null,
       poly2RawUtc: row?.ingestedUtc ?? null,
       poly2UsableUtc: poly2Usable ?? null,
+      clockEvidence: clockEvidence({shadowRawUtc: g?.rawUtc, shadowUsableUtc: g?.usableUtc, poly2RawUtc: row?.ingestedUtc, poly2UsableUtc: poly2Usable}, ['shadowRawUtc','shadowUsableUtc','poly2RawUtc','poly2UsableUtc']),
       rawDeltaSec: rawDelta, usableDeltaSec: usableDelta, decision: dec,
       actionable: dec === 'EARLIER_AND_USABLE',
     });

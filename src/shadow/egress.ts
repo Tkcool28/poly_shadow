@@ -58,9 +58,12 @@ export interface RestGetResult {
   /** Freshness/cache headers when exposed (CDN cache behavior is measured). */
   headers: { age: string | null; cacheControl: string | null; etag: string | null; date: string | null };
   body: unknown;
+  parseError?: string;
+  bodyError?: { outcome: 'TIMEOUT' | 'HTTP_FAILURE'; message: string };
 }
 
 /** Read-only REST GET through the egress boundary (allowlisted hosts only). */
+export const REST_MAX_BODY_BYTES = 16 * 1024 * 1024;
 export async function restGet(url: string, timeoutMs = 15_000): Promise<RestGetResult> {
   assertAllowedUrl(url, []);
   const res = await fetch(url, {
@@ -68,7 +71,20 @@ export async function restGet(url: string, timeoutMs = 15_000): Promise<RestGetR
     headers: { Accept: 'application/json' },
     signal: AbortSignal.timeout(timeoutMs),
   });
-  const body = await res.json().catch(() => null);
+  // Bound transport memory too: page/item validation alone happens too late.
+  const reader=res.body?.getReader();
+  const boundedBody=Buffer.alloc(REST_MAX_BODY_BYTES);let bytes=0,body:unknown=null,parseError:string|undefined;
+  let bodyError:RestGetResult['bodyError'];
+  if(reader){
+    try {
+      while(true){const part=await reader.read();if(part.done)break;bytes+=part.value.byteLength;
+        if(bytes>REST_MAX_BODY_BYTES){parseError='malformed REST response: body byte limit exceeded';await reader.cancel();break;}
+        boundedBody.set(part.value,bytes-part.value.byteLength);
+      }
+      if(!parseError){try{body=JSON.parse(boundedBody.subarray(0,bytes).toString('utf8'));}catch(err){parseError=`malformed REST JSON: ${String(err).slice(0,256)}`;}}
+    }catch(err){const message=String(err).slice(0,512);bodyError={outcome:/timeout|abort/i.test(message)?'TIMEOUT':'HTTP_FAILURE',message};}
+    finally{reader.releaseLock();}
+  }else parseError='malformed REST missing response body';
   return {
     status: res.status,
     headers: {
@@ -78,5 +94,7 @@ export async function restGet(url: string, timeoutMs = 15_000): Promise<RestGetR
       date: res.headers.get('date'),
     },
     body,
+    ...(parseError ? {parseError} : {}),
+    ...(bodyError ? {bodyError} : {}),
   };
 }

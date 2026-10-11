@@ -42,6 +42,7 @@ import { assertAllowedUrl, rpcCall } from './egress.js';
 import type { ShadowConfig } from './config.js';
 import type { Disposition, ShadowStore } from './storage.js';
 import { cgroupMemory } from './memory.js';
+import { OperationalEvidence, rpcRequestId } from './operational-evidence.js';
 
 interface BlockRef { number: number; hash: string; timestamp: number }
 
@@ -57,8 +58,6 @@ export class ReorgSignal extends Error {
 
 /** Provider lag only: six attempts; 100/200/400/800/1600ms (3.1s total). */
 const PROVIDER_LAG_ATTEMPTS = 6;
-const providerLagBackoff = (attempt: number): Promise<void> =>
-  new Promise((resolve) => setTimeout(resolve, 100 * 2 ** attempt));
 class ProviderLagError extends Error {}
 
 /** How far back common-ancestor search may walk (blocks). */
@@ -75,14 +74,18 @@ const FIRST_START_OVERLAP_BLOCKS = 64;
 /** Bounds for in-memory diagnostic maps (Phase 2 bounded-run foundation). */
 const MATCHED_CACHE_MAX = 1024;
 const BLOCK_CACHE_MAX = 512;
+const RPC_PARENT_LINEAGE_MAX = 256;
 
 /** FIFO-bounded Map: oldest entries evicted past `max`. */
 class BoundedMap<K, V> extends Map<K, V> {
-  constructor(private max: number) { super(); }
+  constructor(private max: number, private onEvict: () => void = () => {}) { super(); }
   override set(key: K, value: V): this {
     if (this.has(key)) this.delete(key);
     super.set(key, value);
-    while (this.size > this.max) this.delete(this.keys().next().value as K);
+    while (this.size > this.max) {
+      this.delete(this.keys().next().value as K);
+      this.onEvict();
+    }
     return this;
   }
 }
@@ -94,6 +97,7 @@ export class ChainWatcher {
   private lastMessageAt = 0;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private verifier: ReturnType<typeof setInterval> | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private subscriptionAcked = false;
   private blockCache = new BoundedMap<number, BlockRef>(BLOCK_CACHE_MAX);
   /** OrdersMatched cross-check buffers, keyed by order hash (both arrival
@@ -135,6 +139,8 @@ export class ChainWatcher {
       inflight:this.inflight.size, retryQueue:this.retryQueue.length, exclusiveDepth:this.exclusiveDepth, replayActive:this.replayActive,
       replayRows:this.replayRows, lastProgressUtc:this.lastProgressUtc,
       filteredLogs:this.filteredLogs, recoveryRequired:this.recoveryRequired,
+      rpcParentLineages:this.rpcParents.size,rpcParentLineageCapacity:RPC_PARENT_LINEAGE_MAX,
+      rpcParentLineageEvictions:this.rpcParentLineageEvictions,rpcParentHistoryTruncated:this.rpcParentHistoryTruncated,
       blockCache:this.blockCache.size, matchedCache:this.matchedByHash.size, aggregateCache:this.aggregateByHash.size};
   }
   /** Full valid ABI only. Unknown/malformed events and removals are evidence.
@@ -168,18 +174,69 @@ export class ChainWatcher {
      * tests are unchanged.
      */
     private onObservation: (obs: import('./storage.js').ObservationRow) => void = () => {},
-  ) {}
+    private operational?: OperationalEvidence,
+  ) { this.operational?.onBroken(() => this.halt()); }
+
+  private rpcParentLineageEvictions=0;
+  private rpcParentHistoryTruncated=false;
+  /** Recent exact-request retry links only; eviction is reported in telemetry. */
+  private rpcParents = new BoundedMap<string,string>(RPC_PARENT_LINEAGE_MAX,()=>{
+    this.rpcParentLineageEvictions++;
+    this.rpcParentHistoryTruncated=true;
+  });
+  private async rpcObserved<T>(method: string, params: unknown[], reason: import('./operational-evidence.js').RpcReason = 'other', attempt = 1, retryParentRequestId: string | null = null): Promise<T> {
+    this.operational?.assertUsable();
+    if (!this.operational) return this.rpc<T>(this.cfg.polygonHttpRpcUrl, method, params);
+    const key=`${method}:${JSON.stringify(params)}`;
+    const parent=retryParentRequestId ?? this.rpcParents.get(key) ?? null;
+    try {
+      const value=await this.operational.rpc(() => this.rpc<T>(this.cfg.polygonHttpRpcUrl, method, params), {
+        family: method, method, params, component: 'CHAIN', reason, attempt, retryParentRequestId:parent, timeoutMs: 15_000,
+      });
+      this.rpcParents.delete(key); return value;
+    } catch (err) { const id=rpcRequestId(err); if(id) this.rpcParents.set(key,id); throw err; }
+  }
 
   start(): void {
+    this.operational?.assertUsable();
     this.shouldReconnect = true;
     this.connect();
   }
 
-  stop(): void {
+  private providerLagWaiters = new Set<{timer:ReturnType<typeof setTimeout>;reject:(error:unknown)=>void}>();
+  private waitProviderLag(attempt:number):Promise<void> {
+    this.operational?.assertUsable();
+    return new Promise((resolve,reject)=>{
+      const waiter={timer:setTimeout(()=>{this.providerLagWaiters.delete(waiter);resolve();},100*2**attempt),reject};
+      this.providerLagWaiters.add(waiter);
+    });
+  }
+
+  private halt(): void {
     this.shouldReconnect = false;
+    if(this.operational && !this.operational.isUsable()) {
+      let failure:unknown;
+      try{this.operational.assertUsable();}catch(error){failure=error;}
+      for(const waiter of this.providerLagWaiters){clearTimeout(waiter.timer);waiter.reject(failure);}
+      this.providerLagWaiters.clear();
+    }
     if (this.heartbeat) clearInterval(this.heartbeat);
     if (this.verifier) clearInterval(this.verifier);
+    this.heartbeat=null; this.verifier=null;
+    if(this.reconnectTimer)clearTimeout(this.reconnectTimer);
+    this.reconnectTimer=null;
     this.ws?.close(1000, 'shutdown');
+  }
+
+  stop(): void {
+    this.halt(); // cleanup must precede a possibly failing tail-proof append
+    if (this.operational && !this.operational.isUsable()) return;
+    const cursor=this.store.readCursor(this.cfg.polygonHttpRpcUrl);
+    this.operational?.tailProof({component:'CHAIN',finalObservedHeadBlock:null,finalVerifiedBlock:cursor?.blockNumber ?? null,
+      finalSuccessfulSelectedTopicScanRange:cursor ? {fromBlock:cursor.blockNumber,toBlock:cursor.blockNumber} : null,
+      unresolvedTailRange:this.recoveryRequired ? {fromBlock:(cursor?.blockNumber ?? 0)+1,toBlock:null} : null,
+      finalCursor:cursor ?? null,maximumRetainedRelevantRawBlock:cursor?.blockNumber ?? null,
+      finalVerificationTimestamp:this.nowIso(),recoveryRequired:this.recoveryRequired});
   }
 
   /** Serialize scan/validate/replay/recovery: one transition at a time. */
@@ -194,6 +251,7 @@ export class ChainWatcher {
   }
 
   private connect(): void {
+    if (!this.shouldReconnect || (this.operational && !this.operational.isUsable())) return;
     // The WSS connection goes through the SAME egress assertion as HTTP RPC.
     // The WS host must match the configured HTTP RPC host (or the public
     // allowlist) — passing the WS URL as its own allowance would be
@@ -205,6 +263,7 @@ export class ChainWatcher {
     this.subscriptionAcked = false;
 
     ws.on('open', () => {
+      if (!this.shouldReconnect || (this.operational && !this.operational.isUsable())) { this.halt(); return; }
       this.reconnectDelayMs = 1000;
       ws.send(JSON.stringify({
         jsonrpc: '2.0', id: 1, method: 'eth_subscribe',
@@ -217,9 +276,11 @@ export class ChainWatcher {
     });
 
     ws.on('message', (data: WebSocket.Data) => {
+      if (this.operational && !this.operational.isUsable()) { this.halt(); return; }
       this.lastMessageAt = Date.now();
       try {
         const msg = JSON.parse(data.toString());
+        if (msg.id === 1 && msg.error) { this.recordFailure('subscription-ack', new Error(JSON.stringify(msg.error))); return; }
         if (msg.id === 1 && msg.result) {
           // Subscription acknowledged: live coverage is now active.
           this.subscriptionAcked = true;
@@ -231,23 +292,24 @@ export class ChainWatcher {
           void this.handleLog(msg.params.result as RawLog & { blockHash: string })
             .catch((err) => this.recordFailure('subscription-log', err));
         }
-      } catch { /* malformed message ignored */ }
+      } catch (err) { this.recordFailure('websocket-message', new Error(`malformed websocket message: ${String(err)}`)); }
     });
 
     // Liveness: any sign of life counts — subscription messages AND pongs.
     ws.on('pong', () => { this.lastMessageAt = Date.now(); });
     ws.on('close', () => { this.scheduleReconnect(); });
-    ws.on('error', () => { /* close follows */ });
+    ws.on('error', (err) => { this.recordFailure('websocket-error', err); });
   }
 
   private startHeartbeat(): void {
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.heartbeat = setInterval(() => {
       if (Date.now() - this.lastMessageAt > this.cfg.staleMs) {
+        this.recordFailure('websocket-stale', new Error('websocket heartbeat stale'));
         this.ws?.terminate();
         return;
       }
-      try { this.ws?.ping(); } catch { /* ignore */ }
+      try { this.ws?.ping(); } catch (err) { this.recordFailure('websocket-ping', err); }
     }, this.cfg.heartbeatMs);
   }
 
@@ -255,17 +317,25 @@ export class ChainWatcher {
     if (!this.shouldReconnect) return;
     const delay = this.reconnectDelayMs;
     this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 2, 30_000);
-    setTimeout(() => { if (this.shouldReconnect) this.connect(); }, delay);
+    if(this.reconnectTimer)clearTimeout(this.reconnectTimer);
+    this.reconnectTimer=setTimeout(() => { this.reconnectTimer=null; if (this.shouldReconnect) this.connect(); }, delay);
   }
 
   /** Visible failure record — failures are evidence, never swallowed. */
   private recordFailure(where: string, err: unknown): void {
-    // A fatal cache failure is operational state, not recurring scientific evidence.
+    if (this.operational && !this.operational.isUsable()) { this.halt(); return; }
+    const atUtc=this.nowIso();
+    // Independent operational evidence is attempted first so a ShadowStore index
+    // failure itself remains visible; an unavailable operational index fails closed.
+    try { this.operational?.quarantine({component:'CHAIN',source:'CHAIN',sourceIdentity:null,rawEvidenceRef:null,rpcRequestId:rpcRequestId(err),
+      errorClass:OperationalEvidence.errorClass(err),reason:`${where}: ${String(err).slice(0,256)}`,
+      eventIdentityKnown:false,wallet:null,txHash:null,logIdentity:null,affectedRange:null,scientificImpactPossible:true}); }
+    catch { this.halt(); return; }
     if (err instanceof EvidenceIndexError || this.store.indexTelemetry().indexInvalid) return;
     this.store.appendQuarantine({
       kind: 'TRANSIENT_FAILURE',
       detail: { where, error: String(err) },
-      firstSeenUtc: this.nowIso(),
+      firstSeenUtc: atUtc,
     });
   }
 
@@ -274,6 +344,7 @@ export class ChainWatcher {
     log: RawLog & { blockHash: string },
     disposition: Disposition,
   ): void {
+    this.operational?.assertUsable();
     // PENDING is a durable stage, not a retry-attempt counter.
     const key=`${this.cfg.chainId}:${log.address.toLowerCase()}:${log.transactionHash}:${Number(log.logIndex)}:${log.blockHash.toLowerCase()}`;
     if(disposition==='PENDING' && this.store.identityState(key).disposition==='PENDING') return;
@@ -297,8 +368,10 @@ export class ChainWatcher {
     log: RawLog & { blockHash: string },
     preservedArrivalUtc?: string,
   ): Promise<void> {
-    this.store.assertUsable();
-    if (this.store.indexRebuildPending) await this.store.initializeIndex();
+    this.operational?.assertUsable();
+    try { this.store.assertUsable(); if (this.store.indexRebuildPending) await this.store.initializeIndex(); }
+    catch (err) { this.operational?.quarantine({component:'CHAIN',source:'CHAIN',sourceIdentity:null,rawEvidenceRef:null,rpcRequestId:null,errorClass:'INDEX_ERROR',reason:`chain index preflight: ${String(err).slice(0,256)}`,eventIdentityKnown:false,wallet:null,txHash:null,logIdentity:null,affectedRange:null,scientificImpactPossible:true}); throw err; }
+    this.operational?.assertUsable();
     const logIndex = Number(log.logIndex);
     const emitter = log.address.toLowerCase();
     const removedKey = `${this.cfg.chainId}:${emitter}:${log.transactionHash}:${logIndex}`;
@@ -403,6 +476,8 @@ export class ChainWatcher {
       const canonical = this.store.canonicalObservation(dedupKey);
       if (canonical) {
         this.onObservation(canonical);
+        this.operational?.assertUsable();
+        this.operational?.resolveQuarantinesForRaw(`raw:${dedupKey}`,'RECOVERED',`observation:${canonical.eventId}`,'OBSERVED',false);
         finish('OBSERVED');
         return;
       }
@@ -416,6 +491,10 @@ export class ChainWatcher {
           detail: { txHash: log.transactionHash, logIndex, error: String(err) },
           firstSeenUtc: this.nowIso(),
         });
+        const q=this.operational?.quarantine({component:'CHAIN',source:'CHAIN',sourceIdentity:dedupKey,rawEvidenceRef:`raw:${dedupKey}`,rpcRequestId:rpcRequestId(err),
+          errorClass:'MALFORMED_PAYLOAD',reason:String(err).slice(0,256),eventIdentityKnown:true,wallet:null,txHash:log.transactionHash,logIdentity:dedupKey,
+          affectedRange:{fromBlock:blockNumber,toBlock:blockNumber},scientificImpactPossible:true});
+        if(q) this.operational?.resolveQuarantine(q.quarantineId,'TERMINAL',null,'TERMINAL_QUARANTINE',true);
         finish('TERMINAL_QUARANTINE'); // malformed is terminal, not transient
         return;
       }
@@ -440,6 +519,7 @@ export class ChainWatcher {
 
       // May throw ReorgSignal (hash conflict) or a transient RPC error.
       const block = await this.blockRef(blockNumber, log.blockHash);
+      this.operational?.assertUsable();
 
       // A rewind happened while we were awaiting the RPC: this handler is
       // stale. Leave the identity PENDING; post-rewind replay reprocesses.
@@ -489,14 +569,18 @@ export class ChainWatcher {
       // even a process death between stages must replay this canonical row.
       this.recordDisposition(log, 'PENDING');
       this.store.appendObservation(obsRow);
-      // Phase 3: source racing records this source's first-seen evidence.
       this.onObservation(obsRow);
+      this.operational?.assertUsable();
+      // Recovery is justified only after downstream publication succeeds.
+      this.operational?.resolveQuarantinesForRaw(`raw:${dedupKey}`,'RECOVERED',`observation:${eventId}`,'OBSERVED',false);
 
       // 4) Only now is the event fully committed.
       finish('OBSERVED');
     } catch (err) {
+      if (this.operational && !this.operational.isUsable()) this.operational.assertUsable();
       if (err instanceof EvidenceIndexError) {
         // Shared-source failure also stops canonical recovery/cursor writes.
+        this.operational?.quarantine({component:'CHAIN',source:'CHAIN',sourceIdentity:dedupKey,rawEvidenceRef:`raw:${dedupKey}`,rpcRequestId:null,errorClass:'INDEX_ERROR',reason:`chain index failure: ${String(err).slice(0,256)}`,eventIdentityKnown:true,wallet:null,txHash:log.transactionHash,logIdentity:dedupKey,affectedRange:{fromBlock:blockNumber,toBlock:blockNumber},scientificImpactPossible:true});
         this.store.invalidateIndex();
         throw err;
       }
@@ -514,6 +598,10 @@ export class ChainWatcher {
           detail: { blockNumber, logBlockHash: log.blockHash, error: String(err) },
           firstSeenUtc: this.nowIso(),
         });
+        const q=this.operational?.quarantine({component:'CHAIN',source:'CHAIN',sourceIdentity:dedupKey,rawEvidenceRef:`raw:${dedupKey}`,rpcRequestId:rpcRequestId(err),
+          errorClass:'RPC_ERROR',reason:String(err).slice(0,256),eventIdentityKnown:true,wallet:null,txHash:log.transactionHash,logIdentity:dedupKey,
+          affectedRange:{fromBlock:blockNumber,toBlock:blockNumber},scientificImpactPossible:true});
+        if(q) this.operational?.resolveQuarantine(q.quarantineId,'TERMINAL',null,'TERMINAL_QUARANTINE',true);
         finish('TERMINAL_QUARANTINE');
         void this.runExclusive(() => this.recoverFromReorg())
           .catch((e) => this.recordFailure('reorg-recovery', e));
@@ -522,6 +610,7 @@ export class ChainWatcher {
       // Transient: record visibly, mark PENDING durably, queue in-memory
       // replay. If the process dies first, startup replay recovers it.
       this.recordFailure(`handleLog:${log.transactionHash}:${logIndex}`, err);
+      this.operational?.assertUsable();
       this.recordDisposition(log, 'PENDING');
       if(this.retryQueue.length < 256) this.retryQueue.push({ log, arrivedUtc });
       // Overflow is still durably PENDING; processRetries replays the store.
@@ -540,11 +629,13 @@ export class ChainWatcher {
         detail: { txHash: agg.txHash, logIndex: agg.logIndex, errs },
         firstSeenUtc: this.nowIso(),
       });
+      this.operational?.quarantine({component:'CHAIN',source:'CHAIN',sourceIdentity:`crosscheck:${agg.txHash}:${agg.logIndex}`,rawEvidenceRef:null,rpcRequestId:null,errorClass:'OTHER',reason:`OrdersMatched mismatch: ${errs.join('; ').slice(0,220)}`,eventIdentityKnown:true,wallet:null,txHash:agg.txHash,logIdentity:`${agg.txHash}:${agg.logIndex}`,affectedRange:null,scientificImpactPossible:true});
     }
   }
 
   /** Replay logs that failed transiently (called by the verifier tick). */
   async processRetries(): Promise<void> {
+    this.operational?.assertUsable();
     this.retryQueue = [];
     await this.replayIncompleteFromStore();
   }
@@ -552,12 +643,12 @@ export class ChainWatcher {
   /** Null is an unavailable block, never proof of a hash conflict. */
   private async providerBlock(blockNumber: number): Promise<{ hash: string; timestamp: string }> {
     for (let attempt = 0; attempt < PROVIDER_LAG_ATTEMPTS; attempt++) {
-      const block = await this.rpc<{ hash: string; timestamp: string } | null>(
-        this.cfg.polygonHttpRpcUrl, 'eth_getBlockByNumber',
-        ['0x' + blockNumber.toString(16), false],
+      const block = await this.rpcObserved<{ hash: string; timestamp: string } | null>(
+        'eth_getBlockByNumber', ['0x' + blockNumber.toString(16), false], 'block_metadata_lookup', attempt + 1,
       );
+      this.operational?.assertUsable();
       if (block) return block;
-      if (attempt + 1 < PROVIDER_LAG_ATTEMPTS) await providerLagBackoff(attempt);
+      if (attempt + 1 < PROVIDER_LAG_ATTEMPTS) await this.waitProviderLag(attempt);
     }
     throw new ProviderLagError(`block ${blockNumber} not yet available from provider after ${PROVIDER_LAG_ATTEMPTS} attempts`);
   }
@@ -566,6 +657,7 @@ export class ChainWatcher {
     const cached = this.blockCache.get(blockNumber);
     if (cached && cached.hash.toLowerCase() === blockHash.toLowerCase()) return cached;
     const b = await this.providerBlock(blockNumber);
+    this.operational?.assertUsable();
     if (b.hash.toLowerCase() !== blockHash.toLowerCase()) {
       throw new ReorgSignal(blockNumber); // caller records + recovers
     }
@@ -588,9 +680,11 @@ export class ChainWatcher {
    * rewind target. A bounded manual recovery is a later operator action.
    */
   async validateCursor(): Promise<void> {
+    this.operational?.assertUsable();
     const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
     if (!cursor) return;
     const head = await this.providerBlock(cursor.blockNumber);
+    this.operational?.assertUsable();
     if (head.hash.toLowerCase() === cursor.blockHash.toLowerCase()) return;
 
     const stored = this.store.latestBlockHashes(cursor.blockNumber - REORG_LOOKBACK, cursor.blockNumber);
@@ -599,6 +693,7 @@ export class ChainWatcher {
       const known = stored.get(n);
       if (!known) continue;
       const b = await this.providerBlock(n);
+      this.operational?.assertUsable();
       if (b.hash.toLowerCase() === known.toLowerCase()) { ancestor = n; break; }
     }
 
@@ -616,11 +711,13 @@ export class ChainWatcher {
         },
         firstSeenUtc: this.nowIso(),
       });
+      this.operational?.quarantine({component:'CHAIN',source:'CHAIN',sourceIdentity:`cursor:${cursor.blockNumber}`,rawEvidenceRef:null,rpcRequestId:null,errorClass:'RPC_ERROR',reason:'reorg recovery has no provable common ancestor',eventIdentityKnown:false,wallet:null,txHash:null,logIdentity:null,affectedRange:{fromBlock:Math.max(0,cursor.blockNumber-REORG_LOOKBACK),toBlock:cursor.blockNumber},scientificImpactPossible:true});
       return;
     }
 
     const target = ancestor;
     const targetBlock = await this.providerBlock(target);
+    this.operational?.assertUsable();
     this.store.appendQuarantine({
       kind: 'REORG_ANOMALY',
       detail: {
@@ -630,6 +727,7 @@ export class ChainWatcher {
       },
       firstSeenUtc: this.nowIso(),
     });
+    this.operational?.quarantine({component:'CHAIN',source:'CHAIN',sourceIdentity:`cursor:${cursor.blockNumber}:rewind:${target}`,rawEvidenceRef:null,rpcRequestId:null,errorClass:'RPC_ERROR',reason:'cursor reorg rewound to proved ancestor',eventIdentityKnown:false,wallet:null,txHash:null,logIdentity:null,affectedRange:{fromBlock:target+1,toBlock:cursor.blockNumber},scientificImpactPossible:true});
     this.store.tombstoneAboveBlock(this.cfg.chainId, target, this.nowIso());
     this.store.advanceCursor({
       provider: this.cfg.polygonHttpRpcUrl,
@@ -651,7 +749,7 @@ export class ChainWatcher {
     await this.replayIncompleteFromStore();
     const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
     if (!cursor) return;
-    const latestHex = await this.rpc<string>(this.cfg.polygonHttpRpcUrl, 'eth_blockNumber', []);
+    const latestHex = await this.rpcObserved<string>('eth_blockNumber', [], 'verifier');
     await this.scanRange(cursor.blockNumber + 1, parseInt(latestHex, 16));
   }
 
@@ -664,6 +762,7 @@ export class ChainWatcher {
    * partial observations are reused without inferring clocks or FIRST order.
    */
   async replayIncompleteFromStore(): Promise<number> {
+    this.operational?.assertUsable();
     let replayed=0, examined=0;
     this.replayActive=true;
     try {
@@ -700,7 +799,7 @@ export class ChainWatcher {
     if (this.recoveryRequired) return; // fail-closed: no automatic resume
     await this.replayIncompleteFromStore();
     const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
-    const latestHex = await this.rpc<string>(this.cfg.polygonHttpRpcUrl, 'eth_blockNumber', []);
+    const latestHex = await this.rpcObserved<string>('eth_blockNumber', [], 'verifier');
     const latest = parseInt(latestHex, 16);
     // First start (no cursor): overlap a bounded window so events from the
     // subscribe-handshake gap are captured; native dedup absorbs any
@@ -709,10 +808,12 @@ export class ChainWatcher {
       ? cursor.blockNumber + 1
       : Math.max(0, latest - FIRST_START_OVERLAP_BLOCKS);
     await this.scanRange(from, latest);
+    this.operational?.assertUsable();
     this.startVerifier();
   }
 
   private startVerifier(retryStartup = false): void {
+    this.operational?.assertUsable();
     if (this.verifier) clearInterval(this.verifier);
     this.verifier = setInterval(() => {
       void this.runExclusive(async () => {
@@ -724,7 +825,7 @@ export class ChainWatcher {
         if (this.recoveryRequired) return; // fail-closed: no automatic resume
         await this.processRetries();
         const cursor = this.store.readCursor(this.cfg.polygonHttpRpcUrl);
-        const latestHex = await this.rpc<string>(this.cfg.polygonHttpRpcUrl, 'eth_blockNumber', []);
+        const latestHex = await this.rpcObserved<string>('eth_blockNumber', [], 'verifier');
         const latest = parseInt(latestHex, 16);
         // Initial lag may leave no committed cursor. Retry the same bounded
         // first-start overlap policy rather than making every tick a no-op.
@@ -735,6 +836,7 @@ export class ChainWatcher {
 
   /** Scan [from, to] with eth_getLogs; cursor advances only after commit. */
   async scanRange(from: number, to: number): Promise<void> {
+    this.operational?.assertUsable();
     try {
       await this.scanChunks(from, to);
     } catch (err) {
@@ -758,20 +860,20 @@ export class ChainWatcher {
       let logs: Array<RawLog & { blockHash: string }> = [];
       for (let attempt = 0; attempt < PROVIDER_LAG_ATTEMPTS; attempt++) {
         try {
-          logs = await this.rpc(this.cfg.polygonHttpRpcUrl, 'eth_getLogs', params(end));
+          logs = await this.rpcObserved<Array<RawLog & { blockHash: string }>>('eth_getLogs', params(end), 'backfill', attempt + 1);
           break;
         } catch (err) {
           if (!/invalid block range/i.test(String(err))) throw err;
           // A different backend may answer the head request. Clamp on every
           // rejected range, never expand the current chunk during retries.
-          const latestHex = await this.rpc<string>(this.cfg.polygonHttpRpcUrl, 'eth_blockNumber', []);
+          const latestHex = await this.rpcObserved<string>('eth_blockNumber', [], 'verifier');
           const latest = parseInt(latestHex, 16);
           if (latest < start) return; // no safe work yet; last cursor stays
           end = Math.min(end, latest);
           if (attempt + 1 === PROVIDER_LAG_ATTEMPTS) {
             throw new ProviderLagError(`eth_getLogs exhausted ${PROVIDER_LAG_ATTEMPTS} attempts: ${String(err)}`);
           }
-          await providerLagBackoff(attempt);
+          await this.waitProviderLag(attempt);
         }
       }
       for (const log of logs) {
@@ -790,12 +892,14 @@ export class ChainWatcher {
       // shallow reorg can always be PROVED (never silently unverified).
       for (let n = start; n < end; n += CHECKPOINT_SPACING) {
         const cp = await this.providerBlock(n);
+        this.operational?.assertUsable();
         this.store.appendBlockHash({
           chainId: this.cfg.chainId, blockNumber: n, blockHash: cp.hash,
           firstSeenUtc: this.nowIso(),
         });
       }
       const head = await this.providerBlock(end);
+      this.operational?.assertUsable();
       // Append-only block-hash evidence for common-ancestor detection.
       this.store.appendBlockHash({
         chainId: this.cfg.chainId, blockNumber: end, blockHash: head.hash,

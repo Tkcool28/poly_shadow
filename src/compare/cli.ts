@@ -14,6 +14,10 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { compare, validatePoly2Export } from './phase4.js';
+import { validatePoly2Archive } from './poly2-archive.js';
+import { validateFencedArchiveFile } from './poly2-fenced-archive.js';
+import { archiveSchemaVersion } from './json-cursor.js';
+import { ProspectiveCapture, type Binding } from './poly2-prospective.js';
 import { readMarketMetadata, readShadowGroups } from './evidence.js';
 
 const [, , dataDir, exportPath, cohortsPath, outDir] = process.argv;
@@ -26,6 +30,7 @@ const cohorts = JSON.parse(readFileSync(cohortsPath, 'utf8')) as {
   window: { startUtc: string; endUtc: string };
   controlled: string[];
   exploratory?: string[];
+  poly2CaptureBinding?: Binding;
 };
 const controlled = new Set(cohorts.controlled.map((w) => w.toLowerCase()));
 const exploratory = new Set((cohorts.exploratory ?? []).map((w) => w.toLowerCase()));
@@ -33,7 +38,20 @@ const cohortOf = (w: string) =>
   controlled.has(w.toLowerCase()) ? 'CONTROLLED_OVERLAP' as const
     : exploratory.has(w.toLowerCase()) ? 'SHADOW_EXPLORATORY' as const : null;
 
-const exportData = validatePoly2Export(JSON.parse(readFileSync(exportPath, 'utf8')));
+const schemaVersion = archiveSchemaVersion(exportPath);
+const legacyArchive: unknown = schemaVersion === 3 ? JSON.parse(readFileSync(exportPath, 'utf8')) : undefined;
+if (schemaVersion === 3) {
+  const archive = legacyArchive as {manifest?: {evidenceKind?: unknown}; evidence?: {snapshot?: {kind?: unknown}}};
+  if (archive?.manifest?.evidenceKind !== 'historical-table-copy'
+      || archive?.evidence?.snapshot?.kind !== 'historical-table-copy') {
+    throw new Error('CLI: synthetic comparator fixtures are not production authority');
+  }
+}
+const exportData = validatePoly2Export(schemaVersion === 5
+  ? validateFencedArchiveFile(exportPath, cohorts.controlled, cohorts.window)
+  : schemaVersion === 4
+  ? ProspectiveCapture.validateFile(exportPath, cohorts.controlled, cohorts.window, false, cohorts.poly2CaptureBinding)
+  : validatePoly2Archive(legacyArchive, cohorts.controlled, cohorts.window));
 const marketByGroupKey = await readMarketMetadata(dataDir);
 const groups = await readShadowGroups(dataDir, cohortOf, cohorts.window);
 
