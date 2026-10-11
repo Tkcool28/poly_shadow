@@ -1,15 +1,16 @@
 import { readFileSync, statfsSync, lstatSync, opendirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 export const storagePlan = JSON.parse(readFileSync(new URL('../../docs/shadow/storage-budget-v2.json',import.meta.url),'utf8')) as {
- windowSeconds:number;maximumDrainGraceSeconds:number;telemetryCadenceSeconds:number;publisherCadenceSeconds:number;alertReserveBytes:number;marginRatio:number;families:Record<string,{expectedBytesPerSecond:number;upperBytesPerSecond:number}>;
+ windowSeconds:number;maximumDrainGraceSeconds:number;telemetryCadenceSeconds:number;publisherCadenceSeconds:number;alertReserveBytes:number;marginRatio:number;launchBasis:'expected';families:Record<string,{expectedBytesPerSecond:number;upperBytesPerSecond:number}>;
 };
 /** Explicit engineering envelope, not a forecast or an upstream volume proof. */
 export function storageBudget(seconds=storagePlan.windowSeconds+storagePlan.maximumDrainGraceSeconds){
  if(!Number.isSafeInteger(seconds)||seconds<0)throw Error('invalid storage horizon');
  const families=Object.fromEntries(Object.entries(storagePlan.families).map(([k,r])=>[k,{expectedBytes:Math.ceil(r.expectedBytesPerSecond*seconds),upperBytes:Math.ceil(r.upperBytesPerSecond*seconds)}]));
  const expectedBytes=Object.values(families).reduce((n,r)=>n+r.expectedBytes,0),upperBytes=Object.values(families).reduce((n,r)=>n+r.upperBytes,0);
- const marginBytes=Math.ceil(upperBytes*storagePlan.marginRatio);
- return {seconds,families,expectedBytes,upperBytes,marginBytes,reserveBytes:storagePlan.alertReserveBytes,requiredFreeBytes:upperBytes+marginBytes+storagePlan.alertReserveBytes};
+ const launchBytes=storagePlan.launchBasis==='expected'?expectedBytes:upperBytes;
+ const marginBytes=Math.ceil(launchBytes*storagePlan.marginRatio);
+ return {seconds,families,expectedBytes,upperBytes,launchBasis:storagePlan.launchBasis,launchBytes,marginBytes,reserveBytes:storagePlan.alertReserveBytes,requiredFreeBytes:launchBytes+marginBytes+storagePlan.alertReserveBytes};
 }
 export function diskState(availableBytes:number|null,remainingSeconds:number,capacityBytes:number|null=null){
  const budget=storageBudget(remainingSeconds);
