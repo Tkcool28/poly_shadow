@@ -108,7 +108,7 @@ it.each(['runtime_telemetry.ndjson','audit_snapshots.ndjson','chain_tail_proofs.
  closers.pop();e.close();const rebuilt=new OperationalEvidence(d,()=>now);closers.push(()=>rebuilt.close());expect(rebuilt.operationalSnapshot().streams[name]).toBe(2);expect(readFileSync(join(d,name),'utf8')).toBe(retained);
  rebuilt.close();const again=new OperationalEvidence(d,()=>now);closers.pop();closers.push(()=>again.close());expect(again.operationalSnapshot().streams[name]).toBe(2);expect(readFileSync(join(d,name),'utf8')).toBe(retained);
 });
-it.each([null,119058826239,10737418239,119058826240] as const)('actual observer entrypoint startup gates available=%s before scientific stores or sources',async available=>{
+it.each([null,27096358239,10737418239,27096358240] as const)('actual observer entrypoint startup gates available=%s before scientific stores or sources',async available=>{
  const d=mkdtempSync(join(tmpdir(),'observer-startup-gate-'));dirs.push(d);
  const calls:string[]=[];const errors:unknown[][]=[];const processStub={exitCode:0};
  const sentinel=Error('test stop after admitted startup gate');
@@ -122,9 +122,9 @@ it.each([null,119058826239,10737418239,119058826240] as const)('actual observer 
  };
  runInNewContext(compiled,{exports:{},require:(name:string)=>modules[name]??new Proxy({},{get:()=>()=>{calls.push('unexpected-side-effect');throw Error('startup collaborator reached');}}),process:processStub,console:{error:(...args:unknown[])=>errors.push(args)},Date});
  await Promise.resolve();await Promise.resolve();
- expect(storageBudget().requiredFreeBytes).toBe(119058826240);
+ expect(storageBudget().requiredFreeBytes).toBe(27096358240);
  expect(processStub.exitCode).toBe(1);expect(errors).toHaveLength(1);
- if(available===119058826240){expect(calls).toEqual(['operational','gate','scientific-store']);expect(errors[0]![1]).toBe(sentinel);}
+ if(available===27096358240){expect(calls).toEqual(['operational','gate','scientific-store']);expect(errors[0]![1]).toBe(sentinel);}
  else{expect(calls).toEqual(['operational','gate','close']);expect(String(errors[0]![1])).toContain(available===null?'stat unavailable':'PRELAUNCH_DISK_GATE');}
 });
 it('shutdown snapshot failure makes one bounded attempt and retires cadence without retry',async()=>{
