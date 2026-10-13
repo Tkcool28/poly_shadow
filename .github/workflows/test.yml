@@ -23,7 +23,8 @@ jobs:
           python-version: "3.12"
       - run: npm ci --ignore-scripts
       - name: Install Python authority dependencies for Vitest fixtures
-        run: "${{ steps.py312.outputs.python-path }}" -m pip install -r scripts/requirements-comparison-authority.txt
+        run: |
+          "${{ steps.py312.outputs.python-path }}" -m pip install -r scripts/requirements-comparison-authority.txt
       - run: npx tsc --noEmit
       - run: npx vitest run
       - uses: actions/setup-python@v5
@@ -31,7 +32,8 @@ jobs:
         with:
           python-version: "3.14"
       - name: Install Python authority dependencies for Python 3.14 regressions
-        run: "${{ steps.py314.outputs.python-path }}" -m pip install -r scripts/requirements-comparison-authority.txt
+        run: |
+          "${{ steps.py314.outputs.python-path }}" -m pip install -r scripts/requirements-comparison-authority.txt
       - name: synthetic operational readiness and status regressions
         env:
           TMPDIR: ${{ runner.temp }}
