@@ -44,9 +44,9 @@ class BudgetTests(unittest.TestCase):
             if cmd[1:3] == ['rev-parse','HEAD'] or cmd[1:3] == ['rev-parse','origin/main']: return 'a'*40
             if cmd[1] == 'rev-list': return '0 0'
             return ''
-        with tempfile.TemporaryDirectory() as d, patch.object(r,'call',side_effect=lookup), patch.object(r,'classify_untracked',return_value={}), patch.object(r,'credentials'), patch.object(r,'prelaunch_disk',side_effect=r.Blocked('PREFLIGHT_FAILED','disk')), patch.object(r,'production_snapshot') as prod, patch.object(r,'orphans') as orphan:
+        with tempfile.TemporaryDirectory() as d, patch.object(r,'call',side_effect=lookup), patch.object(r,'classify_untracked',return_value={}), patch.object(r,'credentials'), patch.object(r,'load_launch_authority',return_value={}), patch.object(r,'prelaunch_disk',side_effect=r.Blocked('PREFLIGHT_FAILED','disk')) as disk, patch.object(r,'production_snapshot') as prod, patch.object(r,'orphans') as orphan:
             with self.assertRaises(r.Blocked): r.preflight(Path(d),'a'*40,Path(d)/'runs/x')
-            prod.assert_not_called(); orphan.assert_not_called()
+            prod.assert_not_called(); orphan.assert_not_called(); disk.assert_called_once()
     def test_missing_budget_source_fails_as_blocked(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(r.Blocked): r.prelaunch_disk(Path(d),Path(d)/'target')

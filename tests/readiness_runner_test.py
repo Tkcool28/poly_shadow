@@ -37,9 +37,18 @@ class Readiness(unittest.TestCase):
         subprocess.run(['git', '-C', str(self.repo), 'add', 'scripts/phase4-runner.py'], check=True)
         self.target = self.repo / 'runs/phase4-synthetic'
         self.production = mock.Mock(return_value={'synthetic': True})
+        self.approved = {'path': '/disposable/operator-input.json', 'sha256': 'c' * 64,
+                         'binding': {'poly2CodeSha': 'b' * 40}}
+        authority = mock.patch.object(runner, 'load_launch_authority', side_effect=lambda *a, **k: self.approved)
+        authority.start(); self.addCleanup(authority.stop)
         self.real_call = runner.call
         disk = mock.patch.object(runner, 'prelaunch_disk', return_value={'state': 'GREEN', 'synthetic': True})
         disk.start(); self.addCleanup(disk.stop)
+
+    def seal_checks(self, start):
+        self.approved['binding']['window'] = {'startUtc': runner.utc(start), 'endUtc': runner.utc(start+86400)}
+        return {'shadowSha': SHA, 'poly2': {'synthetic': True, 'sha': 'b' * 40},
+                'productionAuthority': self.approved}
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -223,13 +232,13 @@ class Readiness(unittest.TestCase):
                 start = time.time()+100
                 events = []
                 with mock.patch.object(runner, '__file__', str(helper)):
-                    runner.seal_files(self.repo, self.target, start, start+86400, {'shadowSha': SHA, 'poly2': {'synthetic': True}})
-                def validate(*a):
+                    runner.seal_files(self.repo, self.target, start, start+86400, self.seal_checks(start))
+                def validate(*a, **kw):
                     events.append('validate')
                     if case == 'seal-invalid':
                         raise runner.Blocked('SEAL_INVALID','synthetic invalid seal')
-                    return actual_validate(*a)
-                def preflight(*a):
+                    return actual_validate(*a, **kw)
+                def preflight(*a, **kw):
                     events.extend(['revision', 'protected'])
                     if case in ('revision-failed', 'protected-failed'):
                         raise runner.Blocked('PREFLIGHT_FAILED','synthetic gate failure')
@@ -267,7 +276,7 @@ class Readiness(unittest.TestCase):
         start = time.time() + 100
         with mock.patch.object(runner, '__file__', str(helper)):
             runner.seal_files(self.repo, self.target, start, start + 86400,
-                              {'shadowSha': SHA, 'poly2': {'synthetic': True}})
+                              self.seal_checks(start))
         pointer = self.root / 'current-run.json'
         future = {'schemaVersion': 1, 'runDirectory': str(self.target),
                   'runId': self.target.name, 'approvedShadowSha': SHA,
