@@ -37,7 +37,6 @@ import uuid
 
 WINDOW_SECONDS = 86400
 BRANCH = 'main'
-POLY2_SHA = 'bd61efc90a4ff8bfc17b8a31abc4a40dd655f81f'
 WALLETS = ['0x82cf2b31d18fca19830e216b98cffa5dbc6c0998',
            '0x924379a79c64b77ad5816ad362122a5f6228658e',
            '0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029',
@@ -300,7 +299,44 @@ def call(cmd, cwd=None, input=None):
     except (OSError, subprocess.SubprocessError):
         raise Blocked('PREFLIGHT_FAILED', 'Read-only preflight adapter failed') from None
 
-def production_snapshot():
+def load_launch_authority(repo, target, expected_sha, authority_path, authority_pin):
+    """Independent operator input only; never discover trust from run/producer data."""
+    try:
+        require(authority_path is not None and Path(authority_path).is_absolute(),
+                'PREFLIGHT_FAILED', 'Explicit absolute production authority required')
+        path = no_symlinks(authority_path)
+        require(repo not in path.parents and path != repo and path.is_file(),
+                'PREFLIGHT_FAILED', 'Authority must be an external operator-controlled file')
+        def pairs(items):
+            value = {}
+            for key, item in items:
+                require(key not in value, 'PREFLIGHT_FAILED', 'Duplicate authority key')
+                value[key] = item
+            return value
+        def constant(_):
+            raise ValueError('Nonfinite authority JSON')
+        with path.open('rb') as stream:
+            raw = stream.read(128 * 1024 + 1)
+        require(len(raw) <= 128 * 1024, 'PREFLIGHT_FAILED', 'Authority oversized')
+        authority = json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+        # Reuse the merged V5 validator, executing reviewed source, not stale bytecode.
+        helper = repo / 'scripts/production_authority.py'
+        module = types.ModuleType('launcher_production_authority')
+        module.__file__ = str(helper)
+        exec(compile(helper.read_bytes(), str(helper), 'exec', dont_inherit=True), module.__dict__)
+        binding = authority['binding']
+        module.validate(authority, authority_pin, binding)
+        require(binding['shadowCodeSha'] == expected_sha and binding['shadowRunId'] == target.name
+                and binding['cohort'] == WALLETS,
+                'PREFLIGHT_FAILED', 'Authority Shadow revision/run/fixed cohort mismatch')
+        return {'path': str(path), 'sha256': authority_pin, 'binding': binding}
+    except Blocked as error:
+        raise Blocked('PREFLIGHT_FAILED', str(error)) from error
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, ImportError, OverflowError) as error:
+        raise Blocked('PREFLIGHT_FAILED', 'Missing/malformed/unpinned production authority') from error
+
+
+def production_snapshot(approved):
     config = json.loads(call(['docker', 'exec', 'poly2-bot-1', 'python', '-c',
         "import json;from polycopy.config import get_settings;s=get_settings();print(json.dumps({k:getattr(s,k) for k in ['environment','paper_mode','allow_live_trading','order_kill_switch','max_order_size_usd','max_exposure_per_market_usd','max_exposure_global_usd','review_delay_seconds','max_signal_execution_age_seconds','signal_detection_batch_size','execution_batch_size','max_copy_price','ingestion_batch_size','ingestion_max_concurrent_requests','ingestion_poll_interval_seconds','catch_up_pages_per_cycle','settlement_max_checks_per_cycle','candidate_scoring_interval_seconds']}))"]))
     sql = "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY; SELECT json_build_object('readOnly',current_setting('transaction_read_only'),'wallets',(SELECT json_agg(address ORDER BY address) FROM wallets WHERE approval_state='approved'),'heartbeats',(SELECT json_agg(row_to_json(h)) FROM (SELECT service,max(seen_at) AS last_seen FROM service_heartbeats WHERE service IN ('bot_alive','bot_success') GROUP BY service) h)); ROLLBACK;"
@@ -310,7 +346,7 @@ def production_snapshot():
     result = {'sha': call(['git', '-C', '/opt/poly2', 'rev-parse', 'HEAD']), 'config': config,
               'db': state, 'container': {k: container[k] for k in ('Status', 'Running', 'Restarting', 'StartedAt')},
               'envFileSha256': digest('/opt/poly2/.env'), 'capturedUtc': utc()}
-    require(result['sha'] == POLY2_SHA and config['paper_mode'] is True and config['allow_live_trading'] is False,
+    require(result['sha'] == approved['binding']['poly2CodeSha'] and config['paper_mode'] is True and config['allow_live_trading'] is False,
             'PREFLIGHT_FAILED', 'Poly2 SHA/PAPER gate failed')
     require(state['readOnly'] == 'on' and sorted(state['wallets'] or []) == sorted(WALLETS),
             'PREFLIGHT_FAILED', 'Read-only/fixed-five-wallet gate failed')
@@ -387,8 +423,9 @@ def prelaunch_disk(repo, target):
         raise Blocked('PREFLIGHT_FAILED', str(error)) from error
 
 
-def preflight(repo, expected_sha, target, baseline=None):
+def preflight(repo, expected_sha, target, baseline=None, *, authority_path=None, authority_pin=None):
     credentials(os.environ)
+    approved = load_launch_authority(repo, target, expected_sha, authority_path, authority_pin)
     require(re.fullmatch('[0-9a-f]{40}', expected_sha) is not None, 'PREFLIGHT_FAILED', 'Explicit full expected Shadow SHA required')
     require(call(['git', 'branch', '--show-current'], repo) == BRANCH and
             call(['git', 'rev-parse', 'HEAD'], repo) == expected_sha, 'PREFLIGHT_FAILED', 'Shadow branch/SHA mismatch')
@@ -402,11 +439,12 @@ def preflight(repo, expected_sha, target, baseline=None):
     # from this checkout; no sealed scientific helper or comparator changes.
     disk_budget = prelaunch_disk(repo, target)
     orphans(repo, target)
-    snapshot = production_snapshot()
+    snapshot = production_snapshot(approved)
     if baseline:
         require(all(snapshot[k] == baseline[k] for k in ('sha', 'config', 'envFileSha256', 'container')),
                 'PREFLIGHT_FAILED', 'Protected Poly2 baseline changed')
     return {'shadowSha': expected_sha, 'branch': BRANCH, 'poly2': snapshot,
+            'productionAuthority': approved,
             'untrackedClassification': classification, 'diskBudget': disk_budget, 'capturedUtc': utc()}
 
 def rename_new(source, target):
@@ -419,6 +457,10 @@ def seal_files(repo, target, start, end, checks, duration=WINDOW_SECONDS, origin
     """Core writer; production CLI fixes duration; tests call on isolated repos."""
     target = experiment_path(repo, target)
     window = original_window or {'startUtc': utc(start), 'endUtc': utc(end)}
+    approved = checks['productionAuthority']
+    require(approved['binding']['window'] == window and
+            checks['poly2']['sha'] == approved['binding']['poly2CodeSha'],
+            'PREFLIGHT_FAILED', 'Authority window/Poly2 revision mismatch')
     require(math.isfinite(start) and math.isfinite(end) and epoch_micros(window['endUtc']) - epoch_micros(window['startUtc']) == duration * 1000000 and epoch_micros(window['startUtc']) > epoch_micros(utc()),
             'SEAL_INVALID', 'Fresh future exact fixed window required')
     require(not target.exists(), 'SEAL_INVALID', 'Never overwrite an experiment')
@@ -435,7 +477,8 @@ def seal_files(repo, target, start, end, checks, duration=WINDOW_SECONDS, origin
         with (stage / 'exact_clock.py').open('xb') as f:
             f.write(Path(__file__).with_name('exact_clock.py').read_bytes()); f.flush(); os.fsync(f.fileno())
         manifest = {'state': 'SEALED_NOT_STARTED', 'experimentDirectory': str(target), 'window': cohort['window'],
-                    'controlled': WALLETS, 'exploratory': [], 'shadowSha': checks['shadowSha'], 'poly2Sha': POLY2_SHA,
+                    'controlled': WALLETS, 'exploratory': [], 'shadowSha': checks['shadowSha'], 'poly2Sha': approved['binding']['poly2CodeSha'],
+                    'productionAuthority': approved,
                     'helperSha256': digest(stage / 'runner.py'), 'timestampParserSha256': digest(stage / 'exact_clock.py'), 'cohortsSha256': digest(stage / 'cohorts.json'),
                     'preflightSha256': digest(stage / 'preflight.json'), 'sealedUtc': utc(), 'durationSeconds': duration}
         write_new(stage / 'run-manifest.json', manifest)
@@ -463,15 +506,19 @@ def seal_files(repo, target, start, end, checks, duration=WINDOW_SECONDS, origin
         # A missing manifest, leftover stage or INVALID is never runnable.
         raise
 
-def validate(repo, target, expected_sha, duration=WINDOW_SECONDS):
+def validate(repo, target, expected_sha, duration=WINDOW_SECONDS, *, authority_path=None, authority_pin=None):
     target = experiment_path(repo, target)
+    approved = load_launch_authority(repo, target, expected_sha, authority_path, authority_pin)
     require(target.is_dir() and not (target / 'INVALID').exists(), 'SEAL_INVALID', 'Missing/invalid seal')
     for name in ('cohorts.json', 'preflight.json', 'runner.py', 'exact_clock.py', 'run-manifest.json', 'shadow-data'):
         no_symlinks(target / name)
     m = json.loads((target / 'run-manifest.json').read_text())
     c = json.loads((target / 'cohorts.json').read_text())
+    checks = json.loads((target / 'preflight.json').read_text())
     require(m['state'] == 'SEALED_NOT_STARTED' and m['experimentDirectory'] == str(target) and
-            m['shadowSha'] == expected_sha and m['poly2Sha'] == POLY2_SHA and
+            m['shadowSha'] == expected_sha and m['poly2Sha'] == approved['binding']['poly2CodeSha'] and
+            m.get('productionAuthority') == approved and checks.get('productionAuthority') == approved and
+            checks['poly2']['sha'] == m['poly2Sha'] and m['window'] == approved['binding']['window'] and
             m['helperSha256'] == digest(__file__) == digest(target / 'runner.py') and
             m['timestampParserSha256'] == digest(Path(__file__).with_name('exact_clock.py')) == digest(target / 'exact_clock.py') and
             m['cohortsSha256'] == digest(target / 'cohorts.json') and
@@ -862,6 +909,8 @@ def main():
     parser.add_argument('--end-utc')
     parser.add_argument('--approve-seal', action='store_true')
     parser.add_argument('--current-run-pointer')
+    parser.add_argument('--production-authority')
+    parser.add_argument('--authority-sha256')
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[1]
     target = None
@@ -870,24 +919,26 @@ def main():
     try:
         target = experiment_path(repo, args.experiment)
         credentials(os.environ)
+        authority_args = {'authority_path': args.production_authority, 'authority_pin': args.authority_sha256}
+        load_launch_authority(repo, target, args.expected_shadow_sha, **authority_args)
         if args.operation == 'run':
             current_pointer_path(repo, args.current_run_pointer)
         # Preflight BEFORE any experiment creation. Lock serializes seal/run only.
         if args.operation == 'preflight':
-            print(json.dumps(preflight(repo, args.expected_shadow_sha, target)))
+            print(json.dumps(preflight(repo, args.expected_shadow_sha, target, **authority_args)))
             return 0
         fd = owner_lock(repo)
         if args.operation == 'seal':
             require(args.approve_seal and args.start_utc and args.end_utc, 'SEAL_INVALID', 'Explicit operator approval/start/end required')
             require(not target.exists(), 'SEAL_INVALID', 'Existing run cannot be sealed')
-            checks = preflight(repo, args.expected_shadow_sha, target)
+            checks = preflight(repo, args.expected_shadow_sha, target, **authority_args)
             seal_files(repo, target, epoch(args.start_utc), epoch(args.end_utc), checks, original_window={'startUtc': args.start_utc, 'endUtc': args.end_utc})
             return 0
-        m = validate(repo, target, args.expected_shadow_sha)
+        m = validate(repo, target, args.expected_shadow_sha, **authority_args)
         validated = True
         require(epoch_micros(utc()) < epoch_micros(m['window']['startUtc']), 'MISSED_START', 'Runner not ready before frozen start')
         baseline = json.loads((target / 'preflight.json').read_text())['poly2']
-        preflight(repo, args.expected_shadow_sha, target, baseline)
+        preflight(repo, args.expected_shadow_sha, target, baseline, **authority_args)
         # Fail before creating HOME/start marker if seal has missed its start.
         require(epoch_micros(utc()) < epoch_micros(m['window']['startUtc']), 'MISSED_START', 'Runner not ready before frozen start')
         env = runtime_env(target)

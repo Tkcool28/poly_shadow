@@ -22,6 +22,16 @@ runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 SELF = str(Path(__file__).resolve())
 SHA = 'a' * 40
+POLY2_FIXTURE_SHA = 'b' * 40
+
+
+def fixture_checks(start, end):
+    # Short-window lifecycle tests explicitly fake only independent approval.
+    approved = {'path': '/disposable/operator-input.json', 'sha256': 'c' * 64,
+                'binding': {'poly2CodeSha': POLY2_FIXTURE_SHA,
+                            'window': {'startUtc': runner.utc(start), 'endUtc': runner.utc(end)}}}
+    return {'shadowSha': SHA, 'poly2': {'synthetic': True, 'sha': POLY2_FIXTURE_SHA},
+            'productionAuthority': approved}
 SCRATCH = Path(os.environ.get('TMPDIR', str(Path.home() / '.hermes/cache/scratch')))
 
 
@@ -29,7 +39,9 @@ def fixture_run(repo, target, duration, mode):
     repo, target = Path(repo), Path(target)
     fd = runner.owner_lock(repo)
     try:
-        m = runner.validate(repo, target, SHA, float(duration))
+        approved = json.loads((target / 'preflight.json').read_text())['productionAuthority']
+        with mock.patch.object(runner, 'load_launch_authority', return_value=approved):
+            m = runner.validate(repo, target, SHA, float(duration))
         command = [sys.executable, SELF, '--dummy', mode]
         if mode == 'launchfail':
             command = [str(repo / 'missing-harmless-fixture')]
@@ -153,6 +165,9 @@ class Lifecycle(unittest.TestCase):
         (self.repo / 'runs').mkdir()
         self.target = self.repo / 'runs/phase4-synthetic'
         self.children = []
+        self.approved = fixture_checks(0, 1)['productionAuthority']
+        authority = mock.patch.object(runner, 'load_launch_authority', side_effect=lambda *a, **k: self.approved)
+        authority.start(); self.addCleanup(authority.stop)
         disk = mock.patch.object(runner, 'prelaunch_disk', return_value={'state': 'GREEN', 'synthetic': True})
         disk.start(); self.addCleanup(disk.stop)
 
@@ -176,7 +191,8 @@ class Lifecycle(unittest.TestCase):
 
     def seal(self, duration=1, lead=.3):
         start = time.time() + lead
-        checks = {'shadowSha': SHA, 'poly2': {'synthetic': True}}
+        checks = fixture_checks(start, start + duration)
+        self.approved = checks['productionAuthority']
         return runner.seal_files(self.repo, self.target, start, start + duration, checks, duration)
 
     def launch(self, mode='normal', duration=1):
@@ -696,7 +712,7 @@ class Lifecycle(unittest.TestCase):
 
     def test_preflight_readonly_adapter_gates_before_creation(self):
         commands = []
-        snapshot = {'sha': runner.POLY2_SHA, 'config': {}, 'envFileSha256': 'synthetic', 'container': {}}
+        snapshot = {'sha': POLY2_FIXTURE_SHA, 'config': {}, 'envFileSha256': 'synthetic', 'container': {}}
         def lookup(cmd, cwd=None):
             commands.append(cmd)
             if cmd[1:] == ['branch', '--show-current']:
@@ -725,7 +741,7 @@ class Lifecycle(unittest.TestCase):
             {'service': k, 'last_seen': runner.utc()} for k in ('bot_alive', 'bot_success')]}
         container = {'Status': 'running', 'Running': True, 'Restarting': False, 'StartedAt': 'synthetic'}
         for mutate in (None, 'paper', 'wallet', 'sha', 'readonly'):
-            c, d, sha = dict(config), dict(db), runner.POLY2_SHA
+            c, d, sha = dict(config), dict(db), POLY2_FIXTURE_SHA
             if mutate == 'paper':
                 c['paper_mode'] = False
             if mutate == 'wallet':
@@ -736,10 +752,10 @@ class Lifecycle(unittest.TestCase):
                 d['readOnly'] = 'off'
             with mock.patch.object(runner, 'call', side_effect=[json.dumps(c), json.dumps(d), json.dumps(container), sha]) as calls, mock.patch.object(runner, 'digest', return_value='synthetic'):
                 if mutate is None:
-                    self.assertEqual(runner.production_snapshot()['sha'], runner.POLY2_SHA)
+                    self.assertEqual(runner.production_snapshot(self.approved)['sha'], POLY2_FIXTURE_SHA)
                 else:
                     with self.assertRaises(runner.Blocked):
-                        runner.production_snapshot()
+                        runner.production_snapshot(self.approved)
                 query = calls.call_args_list[1]
                 self.assertIn('READ ONLY', query.kwargs['input'])
                 self.assertIn('ROLLBACK', query.kwargs['input'])
@@ -757,7 +773,7 @@ class Lifecycle(unittest.TestCase):
     def test_past_or_wrong_window_creates_nothing(self):
         for start, end in ((time.time() - 2, time.time() - 1), (time.time() + 10, time.time() + 30)):
             with self.assertRaises(runner.Blocked):
-                runner.seal_files(self.repo, self.target, start, end, {'shadowSha': SHA}, 1)
+                runner.seal_files(self.repo, self.target, start, end, fixture_checks(start, end), 1)
             self.assertFalse(self.target.exists())
 
 
