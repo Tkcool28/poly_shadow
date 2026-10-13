@@ -200,6 +200,7 @@ class LauncherAuthority(unittest.TestCase):
         self.prepare_cli(); self.assertEqual(self.cli('seal')[0], 0)
         path = self.target / 'run-manifest.json'
         original = json.loads(path.read_text())
+        path.chmod(0o600)
         for field in ('poly2Sha', 'productionAuthority'):
             changed = copy.deepcopy(original)
             if field == 'poly2Sha': changed[field] = STALE
@@ -224,10 +225,12 @@ class LauncherAuthority(unittest.TestCase):
         path = self.target / 'preflight.json'
         checks = json.loads(path.read_text())
         checks['productionAuthority']['sha256'] = '0' * 64
+        path.chmod(0o600)
         path.write_text(json.dumps(checks))
         manifest_path = self.target / 'run-manifest.json'
         manifest = json.loads(manifest_path.read_text())
         manifest['preflightSha256'] = r.digest(path)
+        manifest_path.chmod(0o600)
         manifest_path.write_text(json.dumps(manifest))
         with self.assertRaises(r.Blocked) as caught:
             r.validate(self.repo, self.target, SHADOW, authority_path=self.path, authority_pin=self.pin)
