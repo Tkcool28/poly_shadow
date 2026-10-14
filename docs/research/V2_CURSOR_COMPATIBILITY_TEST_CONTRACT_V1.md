@@ -57,3 +57,10 @@ implementation. The following clarifications do not alter frozen comparison rule
   age. A future separately authorized live CHAIN-correlated test is required.
 - Explicit identical start/end bounds pin this sample's event-time query, not a
   provider indexing snapshot. No whole-history scan is authorized.
+
+- Superseding clock gate: response arrival and normalization completion are distinct
+  events even when wall-clock resolution gives equal values. The initial campaign
+  did not separately measure completion and therefore does not pass the point-in-time
+  compatibility gate. Evidence version2 records normalization clocks independently;
+  replay rejects version1 timing and never backfills it. A new public test requires
+  separate authorization. See V2_CLOCK_COMPATIBILITY_REVIEW_V1.md.

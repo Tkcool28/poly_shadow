@@ -69,7 +69,8 @@ frozen-function preservation, not complete equivalence of provider populations.
 | type | type | require explicit activity type; existing uppercase identity | TRADE versus other activity retained | C12 PASS |
 | title | title | rename unchanged string | existing hydration with conditionId | C12 PASS |
 | no row role | no row role | UNKNOWN unchanged; request both trade roles | no manufactured observed role | C12 PASS |
-| source response arrival | source response arrival | persist actual responseUtc; immutable on replay | point-in-time evidence | C7/C10/C12 PASS |
+| source response arrival | source response arrival | persist actual responseUtc; immutable on replay | raw arrival preserved | C7/C10 PASS |
+| normalization completion | separately measured normalizationUtc (evidence v2) | persist actual clock; never copy arrival | historical campaign clock was not measured | BLOCKED; corrected offline C12 PASS |
 | economic candidate | economic candidate | existing tx+asset+size6 function, never storage key | coarse hypothesis only | C12 PASS |
 | no exposed sequence_id | no exposed sequence_id | no invented tie-breaker | total tie-order verification | C8 UNKNOWN |
 | unspecified default size floor | default 0.01 shares | no silent filter replacement | full population parity | UNKNOWN |
@@ -79,3 +80,14 @@ Explicit empty nontrade asset/condition/side strings are retained, not fabricate
 normalization preserves ungrouped evidence where applicable. Enrichment-only
 profile fields are retained in raw bytes and are not invented identity inputs.
 No frozen identity, comparator, CHAIN decoder or eligibility function is modified.
+
+## Superseding clock review
+
+Overall gate: **BLOCKED_EVIDENCE_REPRODUCIBILITY**. The first campaign adapter
+copied responseUtc into completedUtc instead of measuring normalization time.
+Frozen comparison uses completedUtc as usable discovery. The original raw arrivals
+and identity fields remain valid, but point-in-time usability was not demonstrated.
+[Clock finding and narrow correction](V2_CLOCK_COMPATIBILITY_REVIEW_V1.md) supersedes
+any earlier full-compatibility PASS. The original artifact is immutable; new v2
+evidence clocks pass offline tests but have not been validated by another public
+campaign. No rerun is authorized or performed.

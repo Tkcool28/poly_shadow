@@ -1,7 +1,13 @@
 # V2 bounded evidence test V1 — results
 
-**Repository-side verdict: PASS. GO for a separately authorized short CHAIN-correlated
-validation only. No production source switch or new 24-hour comparison.**
+**BLOCKED_EVIDENCE_REPRODUCIBILITY. NO_GO for the next VPS milestone.**
+
+A final clock review superseded the earlier PASS: the original campaign copied
+response arrival into normalization completion, which the frozen contract uses
+as usable discovery. Historical normalization completion was not independently
+measured and cannot be reconstructed. Acquisition identity/yield/cursor/resource
+results below remain valid partial findings. The original artifact is preserved.
+See [superseding clock review](V2_CLOCK_COMPATIBILITY_REVIEW_V1.md).
 
 ## Source and execution identity
 
@@ -34,7 +40,10 @@ node --max-old-space-size=128 --import tsx research/v2-cursor-v1/replay.mts /abs
 ```
 
 Replay checks every raw hash, all published rows against frozen normalization,
-all manifest files and the exact deterministic summary. It makes no network calls.
+all manifest files and the exact deterministic summary **for correctly versioned
+evidence2 only**. The original campaign version1 is now explicitly rejected as
+TIMING_UNVERIFIED; its previous byte/identity replay did not prove normalization
+clock correctness. No replay/current clock may backfill the missing measurement. It makes no network calls.
 Do not point replay or acquisition at production evidence.
 
 ## Reviewed provider and identity contract
@@ -146,7 +155,7 @@ UNKNOWN CHAIN corroboration; receipt success alone was not counted as a trade.
 
 ## Offline, CI and independent review
 
-Final focused suite:50 tests coverC1–C15, including terminal/empty/multipage,
+Final focused suite:53 tests coverC1–C15, including terminal/empty/multipage,
 loops/invalid cursors, malformed/partial responses, duplicates/population movement,
 publication rollback, checkpoint mutation/crash/replay, real mocked transport
 limits/cancellation/early wake, bounded disk/memory, frozen identities, UNKNOWN
@@ -165,13 +174,17 @@ Independent agent review inspected implementation and actual raw evidence. It
 independently verified all49 manifest files,43 response hashes,10fixed-filter
 cursor chains,3,000normalized rows,1,000actual version pairs,CHAIN proof and
 resource measurements. Blocking findings were corrected before acquisition;
-the timing follow-up has a passing offline test. Verdict:PASS/no blocking findings,
-subject to final CI. This is independent agent review; human PR approval remains
-outstanding. No production access or additional public probes occurred in review.
+the timing follow-up has a passing offline test. The initial PASS was superseded by a material clock finding. Final verdict:
+BLOCKED_EVIDENCE_REPRODUCIBILITY for original point-in-time evidence. The
+separately measured version2 clock correction passes offline regressions; corrected
+live evidence is still absent. This is independent agent review; human PR approval
+remains outstanding. No production access or additional public probes occurred in review.
 
 ## Recommendation and next scientific milestone
 
-**GO only for a separately authorized short CHAIN-correlated validation**, with
+**NO_GO for VPS validation until a separately authorized corrected repository-side
+public campaign proves distinct persisted normalization clocks.** After that gate,
+consider a short CHAIN-correlated validation with
 same wallets/identities, explicit duration/request/disk ceilings and honest
 UNKNOWN_UNPROVEN. Measure real-time first arrival, delayed observations, CHAIN
 matching, restart/checkpoints, quarantine classification, memory, disk and hashes.
@@ -186,8 +199,7 @@ reviewed slower schedule. Never expand queues or request budgets automatically.
 
 Before a production migration or new24h decision, resolve the v2size-floor
 population question, unexposed tie order/indexing/cache limitations and operational
-restart/disk behavior under a short test. No repository-side execution blocker
-remains after green CI; scientific completeness and production suitability remain
-unproved. No VPS was accessed; no Poly2, production collector, trading control,
+restart/disk behavior under a short test. The repository-side evidence timing gate remains blocked even after green CI.
+Scientific completeness and production suitability remain unproved. No VPS was accessed; no Poly2, production collector, trading control,
 authority, wallet approval, frozen protocol, schema or comparison rule changed.
 Nothing was merged, deployed, restarted or launched as a24hcomparison.

@@ -1,0 +1,14 @@
+{
+  "classification": "BLOCKED_EVIDENCE_REPRODUCIBILITY",
+  "reason": "Original campaign copied response arrival into normalization completion; usable-discovery timing was not separately measured.",
+  "originalManifestSha256": "caca65cb03524f2cb68f26cd62a16d1391ec47ca3ac24e30039a45bd89261f95",
+  "originalArtifactPreserved": true,
+  "originalNormalizationTiming": "UNVERIFIED",
+  "validPartialFindings": {"additionalSourceIdentities": 2000, "newCoarseCandidates": 1000, "knownGroupsGainingSupport": 56, "chainSupportedCandidates": 1},
+  "correctedEvidenceVersion": 2,
+  "correctedClockOfflineTested": true,
+  "correctedLiveCampaignExecuted": false,
+  "publicCampaignsExecuted": 1,
+  "nextVpsValidation": "NO_GO",
+  "smallestRemainingStep": "Separately authorize one corrected bounded GitHub Actions public campaign after independent review; do not backfill historical clocks."
+}
