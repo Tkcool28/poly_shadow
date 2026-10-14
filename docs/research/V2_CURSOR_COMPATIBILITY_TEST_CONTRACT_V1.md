@@ -32,3 +32,35 @@ Only after review of this separate contract/implementation should an authorized 
 
 ## Required PR outputs
 Separate draft implementation PR and offline/CI probe evidence; source identity fixtures and hashes; negative tests for cursor anomalies and mutation/race conditions; explicit proof of baseline invariants; independent code review; and a recommendation for the next *short* validation stage.
+
+## Implementation review addendum (2026-10-14)
+
+The draft at `e677e665512b2544a7d1a427ab7d8ef78c80bed6` governs the isolated
+implementation. The following clarifications do not alter frozen comparison rules:
+
+- “Authenticated termination” means a valid HTTPS provider response with mutually
+  consistent `has_more=false` and explicit `next_cursor=null`. This public client
+  has no provider cursor signing key and cannot independently verify its signature.
+  Scientific completeness remains `UNKNOWN_UNPROVEN` on every exit.
+- The documented feed order is `(block_timestamp, sequence_id)`. Response schemas
+  expose `timestamp`, but not `sequence_id`. The adapter can reject timestamp
+  inversions; equal-time ordering and delayed-indexing completeness remain UNKNOWN.
+  It does not invent a tie-breaker or change chronological comparison ordering.
+- v2 TRADES documents a default 0.01-share floor (zero means the same floor).
+  The legacy default floor is unspecified. Field identity compatibility is testable;
+  total population equivalence, including sub-centishare fills, is not established.
+  The research evidence cannot authorize a production source replacement. A proved
+  incompatible required identity stops publication; population uncertainty remains
+  explicit and must be resolved before a governed collector migration.
+- “First-arrival latency” cannot be measured by a one-time historical API sample.
+  The campaign records actual response arrival, HTTP latency and event timestamp
+  age. A future separately authorized live CHAIN-correlated test is required.
+- Explicit identical start/end bounds pin this sample's event-time query, not a
+  provider indexing snapshot. No whole-history scan is authorized.
+
+- Superseding clock gate: response arrival and normalization completion are distinct
+  events even when wall-clock resolution gives equal values. The initial campaign
+  did not separately measure completion and therefore does not pass the point-in-time
+  compatibility gate. Evidence version2 records normalization clocks independently;
+  replay rejects version1 timing and never backfills it. A new public test requires
+  separate authorization. See V2_CLOCK_COMPATIBILITY_REVIEW_V1.md.

@@ -7,8 +7,15 @@
     "noUncheckedIndexedAccess": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "types": ["node"],
+    "types": [
+      "node"
+    ],
     "outDir": "dist"
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts"]
+  "include": [
+    "src/**/*.ts",
+    "tests/**/*.ts",
+    "research/v2-cursor-v1/**/*.ts",
+    "research/v2-cursor-v1/**/*.mts"
+  ]
 }

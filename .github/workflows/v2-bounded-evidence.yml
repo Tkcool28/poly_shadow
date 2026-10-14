@@ -1,0 +1,36 @@
+name: v2-bounded-evidence-once
+on:
+  pull_request:
+    branches: [main]
+    paths: ['research/v2-cursor-v1/**', 'tests/v2-cursor-research.test.ts', '.github/workflows/v2-bounded-evidence.yml']
+permissions:
+  contents: read
+jobs:
+  sample:
+    if: github.event.action == 'opened'
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --ignore-scripts
+      - name: Offline gates before any public request
+        run: |
+          npm run build
+          node node_modules/vitest/vitest.mjs run tests/v2-cursor-research.test.ts
+          npm run safety
+      - name: One bounded public campaign (no credentials, no production state)
+        env:
+          GITHUB_EVENT_ACTION: ${{ github.event.action }}
+        run: node --max-old-space-size=128 --import tsx research/v2-cursor-v1/campaign.mts
+      - name: Offline raw-evidence replay and manifest verification
+        run: node --max-old-space-size=128 --import tsx research/v2-cursor-v1/replay.mts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: v2-bounded-evidence-v1
+          path: research/v2-cursor-v1/evidence
+          retention-days: 30
+          if-no-files-found: error

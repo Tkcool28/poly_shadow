@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "scope": "one current-time bounded public sample; no production capture",
+  "sha": "05ad9ba19c9fdb637471d09b4165620c3fbd77cb",
+  "wallets": [
+    "0x82cf2b31d18fca19830e216b98cffa5dbc6c0998",
+    "0x924379a79c64b77ad5816ad362122a5f6228658e",
+    "0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029",
+    "0xf5286079ada8dcfeaa44f7f1c87e1ec37c127e5b",
+    "0xfea31bc088000ff909be1dfd8d0e3f2c7ef2d227"
+  ],
+  "limits": {
+    "pages": 3,
+    "records": 100,
+    "body": 1048576,
+    "requestMs": 3000,
+    "traversalMs": 8000,
+    "requests": 60,
+    "minuteMs": 60000,
+    "spacingMs": 500,
+    "dailyBytes": 8589934592,
+    "campaignBytes": 67108864,
+    "memoryBytes": 268435456
+  },
+  "startedUtc": "2026-10-14T20:22:54.409Z",
+  "completedUtc": "2026-10-14T20:23:17.060Z",
+  "end": 1792009374,
+  "elapsedMs": 22808,
+  "restRequests": 42,
+  "requests": 42,
+  "peakRss": 166776832,
+  "disk": {
+    "state": "GREEN",
+    "availableBytes": 91264249856,
+    "capacityBytes": 154894188544,
+    "usePercent": 41.07961653443504,
+    "seconds": 93600,
+    "families": {
+      "telemetry": {
+        "expectedBytes": 168480000,
+        "upperBytes": 766771200
+      },
+      "lineageRecovery": {
+        "expectedBytes": 1123200000,
+        "upperBytes": 12268339200
+      },
+      "quarantineResolution": {
+        "expectedBytes": 187200000,
+        "upperBytes": 6134169600
+      },
+      "restReceipts": {
+        "expectedBytes": 1123200000,
+        "upperBytes": 6134169600
+      },
+      "auditSnapshots": {
+        "expectedBytes": 1872000,
+        "upperBytes": 11980800
+      },
+      "chainRawScientific": {
+        "expectedBytes": 5990400000,
+        "upperBytes": 24536678400
+      },
+      "poly2Capture": {
+        "expectedBytes": 1497600000,
+        "upperBytes": 12268339200
+      },
+      "indexes": {
+        "expectedBytes": 2995200000,
+        "upperBytes": 24536678400
+      }
+    },
+    "expectedBytes": 13087152000,
+    "upperBytes": 86657126400,
+    "launchBasis": "expected",
+    "launchBytes": 13087152000,
+    "marginBytes": 3271788000,
+    "reserveBytes": 10737418240,
+    "requiredFreeBytes": 27096358240
+  },
+  "failure": null,
+  "completeness": "UNKNOWN_UNPROVEN",
+  "chainMaxRequests": 1
+}
