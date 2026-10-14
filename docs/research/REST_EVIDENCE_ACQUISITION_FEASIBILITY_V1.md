@@ -135,7 +135,7 @@ initial engineering limits for the next independently reviewed implementation:
 |---|---|
 | Cohort | Exact existing five wallets |
 | Fast polls | Keep 10s TRADES / 30s ACTIVITY pending cache-latency evidence |
-| Traversal | At most 3 pages × 100 records per wallet/source; at most 300 returned / 296 unique with two-row overlap for legacy diagnostics |
+| Traversal | At most 3 pages × 100 records per wallet/source; at most 300 returned / 300 distinct hard cap; at most 296 distinct only when both two-row overlap boundaries match |
 | Tail refresh | At most two extra pages per wallet/source per minute, not on every fast poll |
 | Shared REST budget | 60 requests/minute total, 2 requests/second, burst 2; no hidden retry expansion |
 | Concurrency | One active request globally initially; one in-flight poll per wallet/source |
@@ -193,3 +193,8 @@ Remaining unknowns: CHAIN corroboration (403), v2 live cursor/identity behavior,
 longer-duration saturation and source delay, stopped-run gap attribution and true
 provider completeness. These prevent a recommendation to launch another full-day
 comparison now. They do not prevent reviewing the accounting correction.
+
+Independent offline review: PASS, no blocking counting/scientific flaws. The
+reviewer independently recomputed all incremental identity/candidate counts and
+verified all 42 original manifest hashes. The 296-versus-300 identity-bound
+wording was corrected before final delivery. CHAIN corroboration stays unknown.
