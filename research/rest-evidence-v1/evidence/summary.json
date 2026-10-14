@@ -1,0 +1,298 @@
+{
+  "scope": "public current-time sample, not stopped-experiment reconstruction",
+  "completeness": "UNKNOWN_UNPROVEN",
+  "rows": [
+    {
+      "source": "trades",
+      "wallet": "0x82cf2b31d18fca19830e216b98cffa5dbc6c0998",
+      "requests": 4,
+      "successfulPages": 4,
+      "firstPageSize": 100,
+      "saturated": true,
+      "beyondRecords": 200,
+      "beyondDistinct": 196,
+      "beyondWalletRelevant": 196,
+      "beyondEconomicCandidates": 196,
+      "beyondOtherActivity": 0,
+      "duplicateRows": 4,
+      "orderViolations": 0,
+      "boundaries": [
+        {
+          "offset": 98,
+          "overlapMatches": true
+        },
+        {
+          "offset": 196,
+          "overlapMatches": true
+        }
+      ],
+      "repeatFirstEqual": true,
+      "oldestBeyondAgeSeconds": 5790485.878000021
+    },
+    {
+      "source": "trades",
+      "wallet": "0x924379a79c64b77ad5816ad362122a5f6228658e",
+      "requests": 4,
+      "successfulPages": 4,
+      "firstPageSize": 100,
+      "saturated": true,
+      "beyondRecords": 200,
+      "beyondDistinct": 196,
+      "beyondWalletRelevant": 196,
+      "beyondEconomicCandidates": 196,
+      "beyondOtherActivity": 0,
+      "duplicateRows": 4,
+      "orderViolations": 0,
+      "boundaries": [
+        {
+          "offset": 98,
+          "overlapMatches": true
+        },
+        {
+          "offset": 196,
+          "overlapMatches": true
+        }
+      ],
+      "repeatFirstEqual": true,
+      "oldestBeyondAgeSeconds": 20986.854000091553
+    },
+    {
+      "source": "trades",
+      "wallet": "0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029",
+      "requests": 4,
+      "successfulPages": 4,
+      "firstPageSize": 100,
+      "saturated": true,
+      "beyondRecords": 200,
+      "beyondDistinct": 196,
+      "beyondWalletRelevant": 196,
+      "beyondEconomicCandidates": 196,
+      "beyondOtherActivity": 0,
+      "duplicateRows": 4,
+      "orderViolations": 0,
+      "boundaries": [
+        {
+          "offset": 98,
+          "overlapMatches": true
+        },
+        {
+          "offset": 196,
+          "overlapMatches": true
+        }
+      ],
+      "repeatFirstEqual": true,
+      "oldestBeyondAgeSeconds": 229827.78699994087
+    },
+    {
+      "source": "trades",
+      "wallet": "0xf5286079ada8dcfeaa44f7f1c87e1ec37c127e5b",
+      "requests": 4,
+      "successfulPages": 4,
+      "firstPageSize": 100,
+      "saturated": true,
+      "beyondRecords": 200,
+      "beyondDistinct": 195,
+      "beyondWalletRelevant": 195,
+      "beyondEconomicCandidates": 195,
+      "beyondOtherActivity": 0,
+      "duplicateRows": 5,
+      "orderViolations": 0,
+      "boundaries": [
+        {
+          "offset": 98,
+          "overlapMatches": false
+        },
+        {
+          "offset": 196,
+          "overlapMatches": true
+        }
+      ],
+      "repeatFirstEqual": true,
+      "oldestBeyondAgeSeconds": 37924.111000061035
+    },
+    {
+      "source": "trades",
+      "wallet": "0xfea31bc088000ff909be1dfd8d0e3f2c7ef2d227",
+      "requests": 4,
+      "successfulPages": 4,
+      "firstPageSize": 100,
+      "saturated": true,
+      "beyondRecords": 200,
+      "beyondDistinct": 196,
+      "beyondWalletRelevant": 196,
+      "beyondEconomicCandidates": 196,
+      "beyondOtherActivity": 0,
+      "duplicateRows": 4,
+      "orderViolations": 0,
+      "boundaries": [
+        {
+          "offset": 98,
+          "overlapMatches": true
+        },
+        {
+          "offset": 196,
+          "overlapMatches": true
+        }
+      ],
+      "repeatFirstEqual": true,
+      "oldestBeyondAgeSeconds": 87796.11199998856
+    },
+    {
+      "source": "activity",
+      "wallet": "0x82cf2b31d18fca19830e216b98cffa5dbc6c0998",
+      "requests": 4,
+      "successfulPages": 4,
+      "firstPageSize": 100,
+      "saturated": true,
+      "beyondRecords": 200,
+      "beyondDistinct": 193,
+      "beyondWalletRelevant": 193,
+      "beyondEconomicCandidates": 149,
+      "beyondOtherActivity": 44,
+      "duplicateRows": 7,
+      "orderViolations": 0,
+      "boundaries": [
+        {
+          "offset": 98,
+          "overlapMatches": true
+        },
+        {
+          "offset": 196,
+          "overlapMatches": true
+        }
+      ],
+      "repeatFirstEqual": true,
+      "oldestBeyondAgeSeconds": 4332183.190999985
+    },
+    {
+      "source": "activity",
+      "wallet": "0x924379a79c64b77ad5816ad362122a5f6228658e",
+      "requests": 4,
+      "successfulPages": 4,
+      "firstPageSize": 100,
+      "saturated": true,
+      "beyondRecords": 200,
+      "beyondDistinct": 196,
+      "beyondWalletRelevant": 196,
+      "beyondEconomicCandidates": 196,
+      "beyondOtherActivity": 0,
+      "duplicateRows": 4,
+      "orderViolations": 0,
+      "boundaries": [
+        {
+          "offset": 98,
+          "overlapMatches": true
+        },
+        {
+          "offset": 196,
+          "overlapMatches": true
+        }
+      ],
+      "repeatFirstEqual": true,
+      "oldestBeyondAgeSeconds": 20995.237999916077
+    },
+    {
+      "source": "activity",
+      "wallet": "0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029",
+      "requests": 4,
+      "successfulPages": 4,
+      "firstPageSize": 100,
+      "saturated": true,
+      "beyondRecords": 200,
+      "beyondDistinct": 196,
+      "beyondWalletRelevant": 196,
+      "beyondEconomicCandidates": 174,
+      "beyondOtherActivity": 22,
+      "duplicateRows": 4,
+      "orderViolations": 0,
+      "boundaries": [
+        {
+          "offset": 98,
+          "overlapMatches": true
+        },
+        {
+          "offset": 196,
+          "overlapMatches": true
+        }
+      ],
+      "repeatFirstEqual": true,
+      "oldestBeyondAgeSeconds": 229664.31500005722
+    },
+    {
+      "source": "activity",
+      "wallet": "0xf5286079ada8dcfeaa44f7f1c87e1ec37c127e5b",
+      "requests": 4,
+      "successfulPages": 4,
+      "firstPageSize": 100,
+      "saturated": true,
+      "beyondRecords": 200,
+      "beyondDistinct": 196,
+      "beyondWalletRelevant": 196,
+      "beyondEconomicCandidates": 196,
+      "beyondOtherActivity": 0,
+      "duplicateRows": 4,
+      "orderViolations": 0,
+      "boundaries": [
+        {
+          "offset": 98,
+          "overlapMatches": true
+        },
+        {
+          "offset": 196,
+          "overlapMatches": true
+        }
+      ],
+      "repeatFirstEqual": true,
+      "oldestBeyondAgeSeconds": 37934.50500011444
+    },
+    {
+      "source": "activity",
+      "wallet": "0xfea31bc088000ff909be1dfd8d0e3f2c7ef2d227",
+      "requests": 4,
+      "successfulPages": 4,
+      "firstPageSize": 100,
+      "saturated": true,
+      "beyondRecords": 200,
+      "beyondDistinct": 196,
+      "beyondWalletRelevant": 196,
+      "beyondEconomicCandidates": 190,
+      "beyondOtherActivity": 6,
+      "duplicateRows": 4,
+      "orderViolations": 0,
+      "boundaries": [
+        {
+          "offset": 98,
+          "overlapMatches": true
+        },
+        {
+          "offset": 196,
+          "overlapMatches": true
+        }
+      ],
+      "repeatFirstEqual": true,
+      "oldestBeyondAgeSeconds": 87806.55599999428
+    }
+  ],
+  "chain": [
+    {
+      "tx": "0xd1b68d53d907542afd7170043cecc15cfeaf83ff0a645ad434ef54c68b60e38d",
+      "status": 403,
+      "receiptValid": false,
+      "eligibleDecodedFills": 0,
+      "decodeErrors": 0
+    }
+  ],
+  "totals": {
+    "requests": 41,
+    "successfulRestRequests": 40,
+    "beyondDistinct": 1956,
+    "beyondWalletRelevant": 1956,
+    "uniqueBeyondTradeCandidateGroups": 1036,
+    "beyondChainCorroboratedIdentities": 0
+  },
+  "limitations": [
+    "Current public sample cannot reconstruct stopped-run coverage or measure source discovery latency.",
+    "Coarse economic candidate grouping is frozen repo logic, not proof of unique economic events.",
+    "Only at most six receipts sampled; all other chain matches unknown."
+  ]
+}
