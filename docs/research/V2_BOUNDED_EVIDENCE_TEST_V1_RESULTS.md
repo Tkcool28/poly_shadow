@@ -140,7 +140,7 @@ Transaction:
 `0x00387edfa28aa2ace8c67ae4e354e3bd76f15f518454eab468f73b2af08b38df`.
 The successful receipt's26logs had matching transaction/block linkage. Frozen
 allowed-emitter decoder/role classification yielded one approved-wallet MAKER_LEG,
-7.843138shares, matching both second-page TRADES and ACTIVITY evidence for
+7.843138shares, matching both third-page (zero-based page 2) TRADES and ACTIVITY evidence for
 walletfea31bc…. This supports one candidate only. All unsampled candidates have
 UNKNOWN CHAIN corroboration; receipt success alone was not counted as a trade.
 
