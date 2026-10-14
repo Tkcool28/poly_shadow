@@ -259,10 +259,10 @@ describe('phase 3 source racing', () => {
     await expect(p.pollWallet(WATCHED)).rejects.toThrow(/malformed REST item/);expect(op.quarantineState()).toMatchObject({unresolved:1,total:1});
   });
 
-  it('15. capped REST page creates an explicit completeness quarantine', async () => {
+  it('15. capped successful REST page retains explicit completeness limitation', async () => {
     const store=tempRacing();const op=new OperationalEvidence((store as unknown as {dir:string}).dir);
     const rows=Array.from({length:100},(_,i)=>trade({transactionHash:`0x${String(i).padStart(64,'0')}`}));
     const p=new RestPoller({source:'REST_TRADES',endpoint:'trades',baseUrl:'https://data-api.test',wallets:new Set([WATCHED]),intervalMs:1000},store,new Reconciler(store),clock(),restOk(rows),op);
-    await p.pollAll();expect(op.quarantineState()).toMatchObject({unresolved:1,total:1});
+    await p.pollAll();expect(op.quarantineState()).toMatchObject({unresolved:0,total:0});expect(op.coverageLimitations()).toMatchObject({occurrences:1,state:'UNKNOWN_UNPROVEN'});
   });
 });

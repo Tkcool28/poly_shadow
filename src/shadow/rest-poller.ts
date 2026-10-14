@@ -232,7 +232,8 @@ export class RestPoller {
         const offsetCap=this.opts.endpoint==='trades'?10000:5000;
         stopReason=error?'FAILURE':overlapState==='MISSING_OR_MOVED'?'UNSTABLE_OVERLAP':!capped?'SHORT_PAGE':!paging?'PAGINATION_DISABLED':page+1>=budget?'REQUEST_BUDGET_EXHAUSTED':proposedOffset>offsetCap?'OFFSET_CAP_EXHAUSTED':'CONTINUE';
         const nextOffset=stopReason==='CONTINUE'?proposedOffset:null;
-        if(capped||stopReason==='UNSTABLE_OVERLAP')recordQuarantine(null,'OTHER',`REST completeness UNPROVEN: ${stopReason}; limit ${limit}`,pollId);
+        // Coverage limitations are aggregated from successful page receipts, not operational failures.
+        // Failures above still quarantine; every page/poll remains UNKNOWN_UNPROVEN.
         lastReceipt={recordType:'REST_PAGE',pollId,pageIndex:page,source:this.opts.source,wallet,
           requestUrl,requestParams,offset,limit,requestStartUtc,responseUtc,httpStatus:status,cacheHeaders:headers,
           outcome:pageOutcome,error,itemCount:items.length,atApiLimit:capped,orderingEvidence:'Returned order only; no snapshot or cross-poll watermark proof',

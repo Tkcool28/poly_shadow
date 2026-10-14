@@ -32,6 +32,18 @@ class InstrumentationTests(unittest.TestCase):
             db.execute('CREATE TABLE events(seq INTEGER PRIMARY KEY, body TEXT)')
             for i,w in enumerate(self.fence['expectedWorkers']):
                 db.execute('INSERT INTO events VALUES(?,?)',(i,json.dumps(dict(kind='ENROLL',bindingSha256=digest(self.binding),payload=dict(worker=w)))))
+    def test_coverage_limitations_and_operational_failures_are_separate(self):
+        self.save(self.data/'runtime-memory.json', dict(atUtc=END, operationalSinkBroken=False,
+            dataQuality=dict(state='DEGRADED', rules=['REST pagination completeness unproven']),
+            operationalEvidence=dict(quarantine=dict(total=10, unresolved=0, recovered=0, coverageWarnings=10),
+                coverageLimitations=dict(state='UNKNOWN_UNPROVEN', periods=1, occurrences=10, firstUtc=START, lastUtc=END))))
+        result=c.operational_status(self.target,c.epoch(END)+1)
+        self.assertEqual(result['quarantine']['unresolved'],0)
+        self.assertEqual(result['quarantine']['coverageWarnings'],10)
+        self.assertEqual(result['coverageLimitations']['occurrences'],10)
+        self.assertEqual(result['coverageLimitations']['state'],'UNKNOWN_UNPROVEN')
+        self.assertEqual(result['quality']['state'],'DEGRADED')
+
     def save(self,path,value): path.write_text(json.dumps(value))
     def save_health(self):
         self.save(self.capture/'poly2_fence_health.json',self.fence); self.save(self.capture/'poly2_drain_health.json',self.drain)

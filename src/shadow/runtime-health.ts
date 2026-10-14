@@ -10,7 +10,7 @@ export function runtimeHealthSnapshot(
 ) {
   const evidence=operational.isUsable()?operational.operationalSnapshot():null;
   const snapshot = { ...watcher.memoryTelemetry(), ...racing.indexTelemetry(), operationalEvidence:evidence,
-    ...(operational.isUsable() ? { unresolvedQuarantine: operational.unresolvedQuarantineCount(), ...operational.restQuality(), restCompleteness: operational.restCompletenessState() }
+    ...(operational.isUsable() ? { unresolvedQuarantine: operational.unresolvedQuarantineCount(), ...operational.restQuality(), restCompleteness: operational.restCompletenessState(), coverageLimitations: operational.coverageLimitations() }
       : { unresolvedQuarantine: null, restCompleteness: null }),
     operationalSinkBroken: !operational.isUsable(), operationalSink: operational.failureStatus(), token: token() };
   const failureClass=snapshot.operationalSinkBroken?'EVIDENCE_SINK_FAILURE'
