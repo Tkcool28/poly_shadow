@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 /**
  * Chain watcher — observation-only Polygon log subscriber.
  *
@@ -184,7 +185,7 @@ export class ChainWatcher {
     this.rpcParentLineageEvictions++;
     this.rpcParentHistoryTruncated=true;
   });
-  private async rpcObserved<T>(method: string, params: unknown[], reason: import('./operational-evidence.js').RpcReason = 'other', attempt = 1, retryParentRequestId: string | null = null): Promise<T> {
+  private async rpcObserved<T>(method: string, params: unknown[], reason: import('./operational-evidence.js').RpcReason = 'other', attempt = 1, retryParentRequestId: string | null = null, onSuccess?: (requestId:string)=>void): Promise<T> {
     this.operational?.assertUsable();
     if (!this.operational) return this.rpc<T>(this.cfg.polygonHttpRpcUrl, method, params);
     const key=`${method}:${JSON.stringify(params)}`;
@@ -192,7 +193,7 @@ export class ChainWatcher {
     try {
       const value=await this.operational.rpc(() => this.rpc<T>(this.cfg.polygonHttpRpcUrl, method, params), {
         family: method, method, params, component: 'CHAIN', reason, attempt, retryParentRequestId:parent, timeoutMs: 15_000,
-      });
+      }, onSuccess);
       this.rpcParents.delete(key); return value;
     } catch (err) { const id=rpcRequestId(err); if(id) this.rpcParents.set(key,id); throw err; }
   }
@@ -858,9 +859,10 @@ export class ChainWatcher {
         toBlock: '0x' + e.toString(16),
       }];
       let logs: Array<RawLog & { blockHash: string }> = [];
+      let requestId: string | null = null;
       for (let attempt = 0; attempt < PROVIDER_LAG_ATTEMPTS; attempt++) {
         try {
-          logs = await this.rpcObserved<Array<RawLog & { blockHash: string }>>('eth_getLogs', params(end), 'backfill', attempt + 1);
+          logs = await this.rpcObserved<Array<RawLog & { blockHash: string }>>('eth_getLogs', params(end), 'backfill', attempt + 1, null, id=>{requestId=id;});
           break;
         } catch (err) {
           if (!/invalid block range/i.test(String(err))) throw err;
@@ -876,6 +878,11 @@ export class ChainWatcher {
           await this.waitProviderLag(attempt);
         }
       }
+      if(!Array.isArray(logs)||logs.some(log=>!log||!Number.isSafeInteger(Number(log.blockNumber))||Number(log.blockNumber)<start||Number(log.blockNumber)>end))throw Error('malformed getLogs range response');
+      let rangePublishable=logs.every(log=>typeof log.address==='string'&&V2_EXCHANGES.has(log.address.toLowerCase())
+        &&Array.isArray(log.topics)&&V2_SUBSCRIBE_TOPICS.includes((log.topics[0]??'').toLowerCase())
+        &&/^0x[0-9a-f]{64}$/i.test(log.transactionHash)&&/^0x[0-9a-f]{64}$/i.test(log.blockHash)
+        &&Number.isSafeInteger(Number(log.logIndex))&&Number(log.logIndex)>=0&&!log.removed);
       for (const log of logs) {
         await this.handleLog(log);
         const key = `${this.cfg.chainId}:${log.address.toLowerCase()}:` +
@@ -885,6 +892,8 @@ export class ChainWatcher {
         // emitting a duplicate failure or advancing past unavailable evidence.
         // Tombstoned/conflicting evidence must not advance the cursor before
         // queued reorg recovery validates the old cursor and proves ancestry.
+        const disposition=this.store.identityState(key).disposition;
+        if(disposition==='TERMINAL_QUARANTINE'||disposition==='REMOVED_INVALID')rangePublishable=false;
         if ((!this.committed(key) && !this.irrelevant(log)) || this.removed(key)) return;
       }
       // Dense rolling checkpoints: spacing < REORG_LOOKBACK guarantees a
@@ -912,6 +921,7 @@ export class ChainWatcher {
         blockHash: head.hash,
         updatedAtUtc: this.nowIso(),
       });
+      if(requestId&&rangePublishable&&!this.recoveryRequired)this.operational?.confirmRpcPublication(requestId,{fromBlock:start,toBlock:end},head.hash,createHash('sha256').update(JSON.stringify(logs)).digest('hex'));
       // Clamping may shorten a chunk: continue at its actual committed end.
       start = end + 1;
     }

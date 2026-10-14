@@ -478,9 +478,10 @@ def operational_status(run, now, terminal_report=None):
         out.update({k: value.get(k)[:128] if isinstance(value.get(k), str) else None for k in labels})
         return out
     q = evidence.get('quarantine', {})
-    result['quarantine'] = reduced(q, ('total','unresolved','recovered','terminal','ambiguous','additions5m','additions1h','oldestUnresolvedAgeSeconds'),
+    result['quarantine'] = reduced(q, ('total','unresolved','recovered','terminal','ambiguous','coverageWarnings','additions5m','additions1h','oldestUnresolvedAgeSeconds'),
                                    ('oldestUnresolvedUtc','latestTimestampUtc'), labels=('latestSource','latestClass'))
     result['quarantine']['classBreakdown'] = reduced(q.get('classBreakdown') if isinstance(q, dict) else {}, ('timeout','503','429','malformed','verifier','backfill','publication','index','reorg','other'))
+    result['coverageLimitations'] = reduced(evidence.get('coverageLimitations'), ('periods','occurrences'), ('firstUtc','lastUtc'), labels=('state','scope'))
     chain = evidence.get('chain', {})
     result['chain'] = reduced(chain, ('requests','failures','retries','unresolved','unresolvedQuarantine','oldestFailureAgeSeconds'), ('lastRequestUtc','lastSuccessUtc','oldestFailureUtc'))
     result['chain'].update(recoveryRequired=row.get('recoveryRequired') if type(row.get('recoveryRequired')) is bool else None,

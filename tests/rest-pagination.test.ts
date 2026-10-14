@@ -38,7 +38,7 @@ for(const source of ['REST_TRADES','REST_ACTIVITY'] as const)it(`${source}: capp
  if(source==='REST_TRADES')expect(pages[0].identityVectorSha256).toBe(createHash('sha256').update(data.slice(0,100).map(tradesIdentity).join('\n')).digest('hex'));
  expect(f.store.restRaw()).toHaveLength(105);expect(urls.every(u=>!u.includes('/v2/'))).toBe(true);
  expect(f.op.restQuality()).toEqual({restAtPageLimit:true,restCompletenessUnproven:true});
- const q=rows(f.dir,'quarantine_v2.ndjson')[0];expect(pages[0].quarantineIds).toContain(q.quarantineId);expect(q.pollId).toBe(poll.pollId);
+ expect(rows(f.dir,'quarantine_v2.ndjson')).toHaveLength(0);expect(f.op.coverageLimitations()).toMatchObject({occurrences:1,state:'UNKNOWN_UNPROVEN'});
  const snap=runtimeHealthSnapshot({memoryTelemetry:()=>({})},{indexTelemetry:()=>({})},f.op,()=>null);expect(snap.restCompleteness).toMatchObject({pages:2,polls:1,state:'UNKNOWN_UNPROVEN'});
 });
 it('default wiring keeps acquisition one-page and reports cap, not complete',async()=>{
@@ -50,7 +50,7 @@ for(const kind of ['missing','moving','empty'] as const)it(`${kind} overlap stop
  let n=0;const fetch=vi.fn(async()=>response(n++===0?[item(0),item(1),item(2)]:kind==='empty'?[]:kind==='missing'?[item(4),item(5),item(6)]:[item(1),item(2),item(3)]));
  const f=await fixture(fetch,{limit:3,pagination:{maxPages:4,overlap:1}});await f.poller.pollWallet('wallet');
  expect(fetch).toHaveBeenCalledTimes(2);expect(rows(f.dir)[1]).toMatchObject({overlap:'MISSING_OR_MOVED',stopReason:'UNSTABLE_OVERLAP',nextOffset:null,pagination:'UNKNOWN_UNPROVEN'});
- expect(f.op.restCompletenessState()).toMatchObject({unstablePages:1});expect(f.op.unresolvedQuarantineCount()).toBeGreaterThan(0);
+ expect(f.op.restCompletenessState()).toMatchObject({unstablePages:1});expect(f.op.unresolvedQuarantineCount()).toBe(0);expect(f.op.coverageLimitations().occurrences).toBeGreaterThan(0);
 });
 it('request budget exhaustion is durable and never cleared by later empty pages or restart',async()=>{
  let empty=false;const fetch=vi.fn(async(url:string)=>{const offset=Number(new URL(url).searchParams.get('offset'));return response(empty?[]:Array.from({length:3},(_,i)=>item(offset+i)));});
@@ -180,4 +180,41 @@ it('body-read timeout retains status/cache metadata in actual poll receipts',asy
 it('rejects invalid page budgets and endpoint substitution',async()=>{
  const f=await fixture(async()=>response([]));for(const pagination of [{maxPages:17,overlap:1},{maxPages:1,overlap:100},{maxPages:1,overlap:0}])expect(()=>new RestPoller({...f.opts,pagination},f.store,new Reconciler(f.store))).toThrow('budget');
  expect(()=>new RestPoller({...f.opts,endpoint:'activity'},f.store,new Reconciler(f.store))).toThrow('endpoint mismatch');
+});
+
+it('A1/A9: ten identical capped successes retain ten polls, 100 identities and ten coverage occurrences, not failures',async()=>{
+ const data=Array.from({length:100},(_,i)=>item(i));
+ const f=await fixture(async()=>response(data));
+ for(let i=0;i<10;i++)await f.poller.pollWallet('wallet');
+ expect(rows(f.dir).filter(r=>r.recordType==='REST_POLL')).toHaveLength(10);
+ expect(rows(f.dir).filter(r=>r.recordType==='REST_PAGE')).toHaveLength(10);
+ expect(f.store.restRaw()).toHaveLength(100);
+ expect(f.op.unresolvedQuarantineCount()).toBe(0);
+ expect(f.op.coverageLimitations()).toMatchObject({periods:1,occurrences:10,state:'UNKNOWN_UNPROVEN'});
+ const h=runtimeHealthSnapshot({memoryTelemetry:()=>({lastProgressUtc:new Date().toISOString()})},{indexTelemetry:()=>({})},f.op,()=>null);
+ expect(h.dataQuality.state).toBe('DEGRADED');expect(h.failureClass).toBe(null);
+ expect(h.restCompleteness?.state).toBe('UNKNOWN_UNPROVEN');
+});
+it('A2/A8: coverage source, wallet, condition and UTC-hour periods remain distinguishable across rebuild',async()=>{
+ const f=await fixture(async()=>response(Array.from({length:100},(_,i)=>item(i))));
+ await f.poller.pollWallet('wallet');
+ const page=rows(f.dir)[0];
+ for(const change of [{source:'REST_ACTIVITY'},{wallet:'other'},{stopReason:'REQUEST_BUDGET_EXHAUSTED'},{responseUtc:'2030-01-01T00:00:00Z'}])f.op.restReceipt({...page,receiptId:JSON.stringify(change),...change});
+ expect(f.op.coverageLimitations()).toMatchObject({periods:5,occurrences:5});
+ const expected=f.op.coveragePeriods();f.closeOperational();rmSync(join(f.dir,'operational-index.sqlite'));
+ const rebuilt=new OperationalEvidence(f.dir);expect(rebuilt.coveragePeriods()).toEqual(expected);
+ expect(()=>rebuilt.coveragePeriods(101)).toThrow('bounded');rebuilt.close();
+});
+it('historical coverage warnings need an exact successful publication receipt; original journals remain intact',async()=>{
+ const f=await fixture(async()=>response([]));
+ const q=f.op.quarantine({component:'REST_TRADES',source:'REST_TRADES',sourceIdentity:null,rawEvidenceRef:null,rpcRequestId:null,errorClass:'OTHER',reason:'poll old: REST completeness UNPROVEN: PAGINATION_DISABLED; limit 100',eventIdentityKnown:false,wallet:'wallet',txHash:null,logIdentity:null,affectedRange:null,scientificImpactPossible:true,pollId:'old'});
+ const before=readFileSync(join(f.dir,'quarantine_v2.ndjson'),'utf8');
+ const receipt={recordType:'REST_PAGE',pollId:'old',source:'REST_TRADES',wallet:'wallet',responseUtc:new Date().toISOString(),httpStatus:200,outcome:'SUCCESS_NONEMPTY',publication:'FAILURE',atApiLimit:true,limit:100,identityVectorComplete:true,stopReason:'PAGINATION_DISABLED',quarantineIds:[q.quarantineId]};
+ f.op.restReceipt(receipt);expect(f.op.unresolvedQuarantineCount()).toBe(1);
+ f.op.restReceipt({...receipt,publication:'SUCCESS',quarantineIds:['wrong']});expect(f.op.unresolvedQuarantineCount()).toBe(1);
+ f.op.restReceipt({...receipt,publication:'SUCCESS'});expect(f.op.unresolvedQuarantineCount()).toBe(0);
+ expect(f.op.quarantineState()).toMatchObject({coverageWarnings:1,total:1,recovered:0,ambiguous:1});
+ expect(readFileSync(join(f.dir,'quarantine_v2.ndjson'),'utf8')).toBe(before);
+ f.closeOperational();rmSync(join(f.dir,'operational-index.sqlite'));const rebuilt=new OperationalEvidence(f.dir);
+ expect(rebuilt.quarantineState()).toMatchObject({coverageWarnings:1,unresolved:0});rebuilt.close();
 });

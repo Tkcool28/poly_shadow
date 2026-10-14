@@ -40,7 +40,7 @@ it('whole-run operational projection retains old unresolved failures behind larg
  quarantine(e,'pre-terminal','INDEX_ERROR',now,'fixture');e.resolveQuarantine('pre-terminal','TERMINAL',null,'EXCLUDED',false);
  const s=e.operationalSnapshot(now);expect(s.quarantine).toMatchObject({total:1604,unresolved:1,recovered:1601,terminal:2,ambiguous:2,oldestUnresolvedAgeSeconds:10800,additions5m:1603,additions1h:1603});
  expect(s.quarantine.classBreakdown.timeout).toBe(1602);expect(s.quarantine.latestClass).toBe('503');
- e.close();unlinkSync(join(d,'operational-index.sqlite'));e=new OperationalEvidence(d,()=>now);expect(e.operationalSnapshot(now)).toEqual({...s,operationalIndex:{indexed:true,rebuildReason:'MISSING',schemaVersion:6}});e.close();
+ e.close();unlinkSync(join(d,'operational-index.sqlite'));e=new OperationalEvidence(d,()=>now);expect(e.operationalSnapshot(now)).toEqual({...s,operationalIndex:{indexed:true,rebuildReason:'MISSING',schemaVersion:7}});e.close();
 });
 it.each([['TIMEOUT','timeout'],['HTTP_503','503'],['HTTP_429','429'],['MALFORMED_PAYLOAD','malformed'],['PUBLICATION_ERROR','publication'],['INDEX_ERROR','index'],['OTHER','verifier'],['OTHER','backfill'],['OTHER','reorg'],['OTHER','other']])('quarantine primary classification %s / %s', (errorClass,expected)=>{
  expect(quarantineClass({errorClass:errorClass!,component:'CHAIN',reason:expected!})).toBe(expected);
