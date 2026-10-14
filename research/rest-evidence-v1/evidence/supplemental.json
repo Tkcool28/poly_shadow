@@ -1,0 +1,358 @@
+{
+  "scope": "offline bounded sample enrichment; frozen repository JS identities and candidate grouping",
+  "totals": {
+    "distinctBeyondSourceIdentities": 1956,
+    "beyondTradeIdentities": 1884,
+    "beyondOtherActivity": 72,
+    "beyondTradeCandidateGroups": 1036,
+    "candidatesAbsentFromAllSampledFirstPages": 979,
+    "candidatesAlreadySupportedOnSampledFirstPages": 57,
+    "beyondTradeIdentitiesSupportingFirstPageCandidates": 57,
+    "beyondWithin30Seconds": 0,
+    "beyondWithin300Seconds": 0
+  },
+  "pageAgeAndByteCosts": [
+    {
+      "source": "trades",
+      "wallet": "0x82cf2b31d18fca19830e216b98cffa5dbc6c0998",
+      "page": 0,
+      "offset": 0,
+      "newestAgeSeconds": 197425.76099991798,
+      "oldestAgeSeconds": 3629913.760999918,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 74282
+    },
+    {
+      "source": "trades",
+      "wallet": "0x82cf2b31d18fca19830e216b98cffa5dbc6c0998",
+      "page": 1,
+      "offset": 98,
+      "newestAgeSeconds": 3629890.3190000057,
+      "oldestAgeSeconds": 4332118.319000006,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 74952
+    },
+    {
+      "source": "trades",
+      "wallet": "0x82cf2b31d18fca19830e216b98cffa5dbc6c0998",
+      "page": 2,
+      "offset": 196,
+      "newestAgeSeconds": 4332118.878000021,
+      "oldestAgeSeconds": 5790485.878000021,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 76418
+    },
+    {
+      "source": "trades",
+      "wallet": "0x924379a79c64b77ad5816ad362122a5f6228658e",
+      "page": 0,
+      "offset": 0,
+      "newestAgeSeconds": 12015.726999998093,
+      "oldestAgeSeconds": 20935.726999998093,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 75396
+    },
+    {
+      "source": "trades",
+      "wallet": "0x924379a79c64b77ad5816ad362122a5f6228658e",
+      "page": 1,
+      "offset": 98,
+      "newestAgeSeconds": 20936.289999961853,
+      "oldestAgeSeconds": 20954.289999961853,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 75206
+    },
+    {
+      "source": "trades",
+      "wallet": "0x924379a79c64b77ad5816ad362122a5f6228658e",
+      "page": 2,
+      "offset": 196,
+      "newestAgeSeconds": 20954.854000091553,
+      "oldestAgeSeconds": 20986.854000091553,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 75201
+    },
+    {
+      "source": "trades",
+      "wallet": "0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029",
+      "page": 0,
+      "offset": 0,
+      "newestAgeSeconds": 57306.64800000191,
+      "oldestAgeSeconds": 148865.6480000019,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 73347
+    },
+    {
+      "source": "trades",
+      "wallet": "0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029",
+      "page": 1,
+      "offset": 98,
+      "newestAgeSeconds": 148335.21099996567,
+      "oldestAgeSeconds": 229288.21099996567,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 69829
+    },
+    {
+      "source": "trades",
+      "wallet": "0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029",
+      "page": 2,
+      "offset": 196,
+      "newestAgeSeconds": 229288.78699994087,
+      "oldestAgeSeconds": 229827.78699994087,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 70571
+    },
+    {
+      "source": "trades",
+      "wallet": "0xf5286079ada8dcfeaa44f7f1c87e1ec37c127e5b",
+      "page": 0,
+      "offset": 0,
+      "newestAgeSeconds": 189.96099996566772,
+      "oldestAgeSeconds": 13435.960999965668,
+      "within30Seconds": 0,
+      "within300Seconds": 2,
+      "bytes": 79907
+    },
+    {
+      "source": "trades",
+      "wallet": "0xf5286079ada8dcfeaa44f7f1c87e1ec37c127e5b",
+      "page": 1,
+      "offset": 98,
+      "newestAgeSeconds": 13352.528000116348,
+      "oldestAgeSeconds": 23339.52800011635,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 80491
+    },
+    {
+      "source": "trades",
+      "wallet": "0xf5286079ada8dcfeaa44f7f1c87e1ec37c127e5b",
+      "page": 2,
+      "offset": 196,
+      "newestAgeSeconds": 23337.111000061035,
+      "oldestAgeSeconds": 37924.111000061035,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 81754
+    },
+    {
+      "source": "trades",
+      "wallet": "0xfea31bc088000ff909be1dfd8d0e3f2c7ef2d227",
+      "page": 0,
+      "offset": 0,
+      "newestAgeSeconds": 1349.9189999103546,
+      "oldestAgeSeconds": 1578.9189999103546,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 74811
+    },
+    {
+      "source": "trades",
+      "wallet": "0xfea31bc088000ff909be1dfd8d0e3f2c7ef2d227",
+      "page": 1,
+      "offset": 98,
+      "newestAgeSeconds": 1578.4939999580383,
+      "oldestAgeSeconds": 1807.4939999580383,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 74549
+    },
+    {
+      "source": "trades",
+      "wallet": "0xfea31bc088000ff909be1dfd8d0e3f2c7ef2d227",
+      "page": 2,
+      "offset": 196,
+      "newestAgeSeconds": 1808.111999988556,
+      "oldestAgeSeconds": 87796.11199998856,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 76668
+    },
+    {
+      "source": "activity",
+      "wallet": "0x82cf2b31d18fca19830e216b98cffa5dbc6c0998",
+      "page": 0,
+      "offset": 0,
+      "newestAgeSeconds": 153444.92899990082,
+      "oldestAgeSeconds": 3628523.928999901,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 74663
+    },
+    {
+      "source": "activity",
+      "wallet": "0x82cf2b31d18fca19830e216b98cffa5dbc6c0998",
+      "page": 1,
+      "offset": 98,
+      "newestAgeSeconds": 3628511.5620000362,
+      "oldestAgeSeconds": 3632555.5620000362,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 78065
+    },
+    {
+      "source": "activity",
+      "wallet": "0x82cf2b31d18fca19830e216b98cffa5dbc6c0998",
+      "page": 2,
+      "offset": 196,
+      "newestAgeSeconds": 3632221.1909999847,
+      "oldestAgeSeconds": 4332183.190999985,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 79329
+    },
+    {
+      "source": "activity",
+      "wallet": "0x924379a79c64b77ad5816ad362122a5f6228658e",
+      "page": 0,
+      "offset": 0,
+      "newestAgeSeconds": 1417.986999988556,
+      "oldestAgeSeconds": 20945.986999988556,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 78472
+    },
+    {
+      "source": "activity",
+      "wallet": "0x924379a79c64b77ad5816ad362122a5f6228658e",
+      "page": 1,
+      "offset": 98,
+      "newestAgeSeconds": 20945.59100008011,
+      "oldestAgeSeconds": 20964.59100008011,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 78306
+    },
+    {
+      "source": "activity",
+      "wallet": "0x924379a79c64b77ad5816ad362122a5f6228658e",
+      "page": 2,
+      "offset": 196,
+      "newestAgeSeconds": 20965.237999916077,
+      "oldestAgeSeconds": 20995.237999916077,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 78301
+    },
+    {
+      "source": "activity",
+      "wallet": "0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029",
+      "page": 0,
+      "offset": 0,
+      "newestAgeSeconds": 56306.03999996185,
+      "oldestAgeSeconds": 143773.03999996185,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 74625
+    },
+    {
+      "source": "activity",
+      "wallet": "0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029",
+      "page": 1,
+      "offset": 98,
+      "newestAgeSeconds": 143735.6740000248,
+      "oldestAgeSeconds": 227875.6740000248,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 71677
+    },
+    {
+      "source": "activity",
+      "wallet": "0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029",
+      "page": 2,
+      "offset": 196,
+      "newestAgeSeconds": 227846.31500005722,
+      "oldestAgeSeconds": 229664.31500005722,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 72746
+    },
+    {
+      "source": "activity",
+      "wallet": "0xf5286079ada8dcfeaa44f7f1c87e1ec37c127e5b",
+      "page": 0,
+      "offset": 0,
+      "newestAgeSeconds": 24.200000047683716,
+      "oldestAgeSeconds": 13392.200000047684,
+      "within30Seconds": 1,
+      "within300Seconds": 3,
+      "bytes": 83148
+    },
+    {
+      "source": "activity",
+      "wallet": "0xf5286079ada8dcfeaa44f7f1c87e1ec37c127e5b",
+      "page": 1,
+      "offset": 98,
+      "newestAgeSeconds": 13362.84500002861,
+      "oldestAgeSeconds": 23349.84500002861,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 83659
+    },
+    {
+      "source": "activity",
+      "wallet": "0xf5286079ada8dcfeaa44f7f1c87e1ec37c127e5b",
+      "page": 2,
+      "offset": 196,
+      "newestAgeSeconds": 23347.50500011444,
+      "oldestAgeSeconds": 37934.50500011444,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 84932
+    },
+    {
+      "source": "activity",
+      "wallet": "0xfea31bc088000ff909be1dfd8d0e3f2c7ef2d227",
+      "page": 0,
+      "offset": 0,
+      "newestAgeSeconds": 1360.2990000247955,
+      "oldestAgeSeconds": 1589.2990000247955,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 78304
+    },
+    {
+      "source": "activity",
+      "wallet": "0xfea31bc088000ff909be1dfd8d0e3f2c7ef2d227",
+      "page": 1,
+      "offset": 98,
+      "newestAgeSeconds": 1588.9219999313354,
+      "oldestAgeSeconds": 1817.9219999313354,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 77992
+    },
+    {
+      "source": "activity",
+      "wallet": "0xfea31bc088000ff909be1dfd8d0e3f2c7ef2d227",
+      "page": 2,
+      "offset": 196,
+      "newestAgeSeconds": 1818.555999994278,
+      "oldestAgeSeconds": 87806.55599999428,
+      "within30Seconds": 0,
+      "within300Seconds": 0,
+      "bytes": 78784
+    }
+  ],
+  "totalResponseBytes": 3073492,
+  "maxResponseBytes": 84932,
+  "cacheControls": {
+    "public, max-age=300": 20,
+    "public, max-age=15": 20
+  },
+  "chainReconciliation": {
+    "state": "BLOCKED_HTTP_403",
+    "confirmed": 0,
+    "notMatched": null,
+    "unknown": 1884
+  }
+}

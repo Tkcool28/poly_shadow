@@ -1,0 +1,12 @@
+{
+  "artifactId": 11923025619,
+  "artifactZipSha256": "bf3ebdc62fdf6fa5bf61e96473556c0dd25808c724fd34cbfec3f83a7c1fdebb",
+  "files": {
+    "manifest.json": "e684b213d55d2149888a420ca33b4e218ca3b31b50fbec865a2b8dd2926b136d",
+    "requests.ndjson": "949c348d65240910717b2fe6653039fad47e6e442a005b8b5faa858a5aa478eb",
+    "summary.json": "f2e0fc8b62671c56faf77943804dfa80547be6fe819214062d5ad0d7488e6b0f",
+    "supplemental.json": "9b00e25a4ce593f0e4c820005828c9554ca8d69e0c34f4c05c86a8486e82d2a4"
+  },
+  "sampleRun": 38623083221,
+  "sourceSha": "061a3a8a394bbf0c837e3afed9d86752c4bfc558"
+}

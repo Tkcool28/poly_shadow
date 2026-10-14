@@ -7,6 +7,7 @@ permissions:
   contents: read
 jobs:
   sample:
+    if: github.event.action == 'opened'
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
