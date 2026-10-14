@@ -1,0 +1,572 @@
+{
+  "version": 1,
+  "scope": "one current-time bounded public sample; no production capture",
+  "rows": [
+    {
+      "wallet": "0x82cf2b31d18fca19830e216b98cffa5dbc6c0998",
+      "source": "trades",
+      "firstPageRecords": 100,
+      "additionalPages": 2,
+      "additionalRawRecords": 200,
+      "additionalDistinctIdentities": 200,
+      "distinctIdentities": 300,
+      "duplicateIdentities": 0,
+      "newCandidateGroups": 200,
+      "knownCandidateGroupsGainingSupport": 0,
+      "nonTradeAdditionalIdentities": 0,
+      "matchedLegacyIdentities": 100,
+      "legacyRecords": 100,
+      "cursorStop": "PAGE_BUDGET",
+      "anomalies": [],
+      "orderAnomalies": 0,
+      "latencyMs": [
+        214,
+        220,
+        207
+      ],
+      "sourceAgeSeconds": {
+        "newest": 201059.13000011444,
+        "oldest": 5794158.122999907
+      },
+      "freshness": {
+        "legacyNewest": 1791808317,
+        "v2Newest": 1791808317
+      },
+      "responseHeaders": [
+        {
+          "date": "Wed, 14 Oct 2026 20:22:56 GMT",
+          "cache-control": "public, max-age=300",
+          "x-trace-id": "ef50fa489a92441abf571f6fc2c7fc96",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:22:56 GMT",
+          "cache-control": "public, max-age=300",
+          "x-trace-id": "4dd4e76f2bf94b08b37d28d2d2f5869a",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:22:57 GMT",
+          "cache-control": "public, max-age=300",
+          "x-trace-id": "0acc5aa9d9c74d4e8ef3bc9945730baf",
+          "content-type": "application/json"
+        }
+      ],
+      "requestBudget": 3,
+      "bodyBytes": 222741,
+      "completeness": "UNKNOWN_UNPROVEN"
+    },
+    {
+      "wallet": "0x924379a79c64b77ad5816ad362122a5f6228658e",
+      "source": "trades",
+      "firstPageRecords": 100,
+      "additionalPages": 2,
+      "additionalRawRecords": 200,
+      "additionalDistinctIdentities": 200,
+      "distinctIdentities": 300,
+      "duplicateIdentities": 0,
+      "newCandidateGroups": 200,
+      "knownCandidateGroupsGainingSupport": 0,
+      "nonTradeAdditionalIdentities": 0,
+      "matchedLegacyIdentities": 100,
+      "legacyRecords": 100,
+      "cursorStop": "PAGE_BUDGET",
+      "anomalies": [],
+      "orderAnomalies": 0,
+      "latencyMs": [
+        212,
+        203,
+        213
+      ],
+      "sourceAgeSeconds": {
+        "newest": 15649.34200000763,
+        "oldest": 24620.34299993515
+      },
+      "freshness": {
+        "legacyNewest": 1791993729,
+        "v2Newest": 1791993729
+      },
+      "responseHeaders": [
+        {
+          "date": "Wed, 14 Oct 2026 20:22:58 GMT",
+          "cache-control": "public, max-age=300",
+          "x-trace-id": "f9e527b861de41cfa3e51df97b471300",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:22:58 GMT",
+          "cache-control": "public, max-age=300",
+          "x-trace-id": "f8363a154be64d4c88b86ee563f16cf6",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:22:59 GMT",
+          "cache-control": "public, max-age=300",
+          "x-trace-id": "94aa26bfff284c6292870d45d364d8a1",
+          "content-type": "application/json"
+        }
+      ],
+      "requestBudget": 3,
+      "bodyBytes": 230449,
+      "completeness": "UNKNOWN_UNPROVEN"
+    },
+    {
+      "wallet": "0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029",
+      "source": "trades",
+      "firstPageRecords": 100,
+      "additionalPages": 2,
+      "additionalRawRecords": 200,
+      "additionalDistinctIdentities": 200,
+      "distinctIdentities": 300,
+      "duplicateIdentities": 0,
+      "newCandidateGroups": 200,
+      "knownCandidateGroupsGainingSupport": 0,
+      "nonTradeAdditionalIdentities": 0,
+      "matchedLegacyIdentities": 100,
+      "legacyRecords": 100,
+      "cursorStop": "PAGE_BUDGET",
+      "anomalies": [],
+      "orderAnomalies": 0,
+      "latencyMs": [
+        202,
+        197,
+        256
+      ],
+      "sourceAgeSeconds": {
+        "newest": 60940.331000089645,
+        "oldest": 233461.38499999046
+      },
+      "freshness": {
+        "legacyNewest": 1791948440,
+        "v2Newest": 1791948440
+      },
+      "responseHeaders": [
+        {
+          "date": "Wed, 14 Oct 2026 20:23:00 GMT",
+          "cache-control": "public, max-age=300",
+          "x-trace-id": "47ac0b22bfba438c862884aa5d08f3c0",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:00 GMT",
+          "cache-control": "public, max-age=300",
+          "x-trace-id": "18007b460803450dbd41c5216a4fae4c",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:01 GMT",
+          "cache-control": "public, max-age=300",
+          "x-trace-id": "78ce7f741d4d4b9d9bb8f4473f8264ff",
+          "content-type": "application/json"
+        }
+      ],
+      "requestBudget": 3,
+      "bodyBytes": 218147,
+      "completeness": "UNKNOWN_UNPROVEN"
+    },
+    {
+      "wallet": "0xf5286079ada8dcfeaa44f7f1c87e1ec37c127e5b",
+      "source": "trades",
+      "firstPageRecords": 100,
+      "additionalPages": 2,
+      "additionalRawRecords": 200,
+      "additionalDistinctIdentities": 200,
+      "distinctIdentities": 300,
+      "duplicateIdentities": 0,
+      "newCandidateGroups": 200,
+      "knownCandidateGroupsGainingSupport": 0,
+      "nonTradeAdditionalIdentities": 0,
+      "matchedLegacyIdentities": 100,
+      "legacyRecords": 100,
+      "cursorStop": "PAGE_BUDGET",
+      "anomalies": [],
+      "orderAnomalies": 0,
+      "latencyMs": [
+        221,
+        229,
+        241
+      ],
+      "sourceAgeSeconds": {
+        "newest": 23.3510000705719,
+        "oldest": 36424.3710000515
+      },
+      "freshness": {
+        "legacyNewest": 1792009359,
+        "v2Newest": 1792009359
+      },
+      "responseHeaders": [
+        {
+          "date": "Wed, 14 Oct 2026 20:23:02 GMT",
+          "cache-control": "public, max-age=300",
+          "x-trace-id": "ae605c12d2bb4d489f3f1e68b664b58c",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:02 GMT",
+          "cache-control": "public, max-age=300",
+          "x-trace-id": "a825c20d011f4208a0ae91e53c61bc0f",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:03 GMT",
+          "cache-control": "public, max-age=300",
+          "x-trace-id": "c5845a2eb8214e50a227b19f0de71d4c",
+          "content-type": "application/json"
+        }
+      ],
+      "requestBudget": 3,
+      "bodyBytes": 241486,
+      "completeness": "UNKNOWN_UNPROVEN"
+    },
+    {
+      "wallet": "0xfea31bc088000ff909be1dfd8d0e3f2c7ef2d227",
+      "source": "trades",
+      "firstPageRecords": 100,
+      "additionalPages": 2,
+      "additionalRawRecords": 200,
+      "additionalDistinctIdentities": 200,
+      "distinctIdentities": 300,
+      "duplicateIdentities": 0,
+      "newCandidateGroups": 200,
+      "knownCandidateGroupsGainingSupport": 0,
+      "nonTradeAdditionalIdentities": 0,
+      "matchedLegacyIdentities": 100,
+      "legacyRecords": 100,
+      "cursorStop": "PAGE_BUDGET",
+      "anomalies": [],
+      "orderAnomalies": 0,
+      "latencyMs": [
+        203,
+        210,
+        199
+      ],
+      "sourceAgeSeconds": {
+        "newest": 1515.332999944687,
+        "oldest": 91429.32899999619
+      },
+      "freshness": {
+        "legacyNewest": 1792007869,
+        "v2Newest": 1792007869
+      },
+      "responseHeaders": [
+        {
+          "date": "Wed, 14 Oct 2026 20:23:04 GMT",
+          "cache-control": "public, max-age=300",
+          "x-trace-id": "0b3e82b036a64bd287cd41fbf1abc8cb",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:04 GMT",
+          "cache-control": "public, max-age=300",
+          "x-trace-id": "63abd3fc65604b5a8fd4488334bde685",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:05 GMT",
+          "cache-control": "public, max-age=300",
+          "x-trace-id": "1a9d3740fec1429789c634a2da796013",
+          "content-type": "application/json"
+        }
+      ],
+      "requestBudget": 3,
+      "bodyBytes": 228695,
+      "completeness": "UNKNOWN_UNPROVEN"
+    },
+    {
+      "wallet": "0x82cf2b31d18fca19830e216b98cffa5dbc6c0998",
+      "source": "activity",
+      "firstPageRecords": 100,
+      "additionalPages": 2,
+      "additionalRawRecords": 200,
+      "additionalDistinctIdentities": 200,
+      "distinctIdentities": 300,
+      "duplicateIdentities": 0,
+      "newCandidateGroups": 154,
+      "knownCandidateGroupsGainingSupport": 0,
+      "nonTradeAdditionalIdentities": 46,
+      "matchedLegacyIdentities": 100,
+      "legacyRecords": 100,
+      "cursorStop": "PAGE_BUDGET",
+      "anomalies": [],
+      "orderAnomalies": 0,
+      "latencyMs": [
+        277,
+        276,
+        301
+      ],
+      "sourceAgeSeconds": {
+        "newest": 157078.4059998989,
+        "oldest": 4430346.430999994
+      },
+      "freshness": {
+        "legacyNewest": 1791852308,
+        "v2Newest": 1791852308
+      },
+      "responseHeaders": [
+        {
+          "date": "Wed, 14 Oct 2026 20:23:06 GMT",
+          "cache-control": "public, max-age=15",
+          "x-trace-id": "9fe3b4084dd54469a7611e55c37b9240",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:06 GMT",
+          "cache-control": "public, max-age=15",
+          "x-trace-id": "7131676c505b432d8a0e5f1f84b27561",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:07 GMT",
+          "cache-control": "public, max-age=15",
+          "x-trace-id": "ef8dd688842d48bcbe09e6b615208f9a",
+          "content-type": "application/json"
+        }
+      ],
+      "requestBudget": 3,
+      "bodyBytes": 236851,
+      "completeness": "UNKNOWN_UNPROVEN"
+    },
+    {
+      "wallet": "0x924379a79c64b77ad5816ad362122a5f6228658e",
+      "source": "activity",
+      "firstPageRecords": 100,
+      "additionalPages": 2,
+      "additionalRawRecords": 200,
+      "additionalDistinctIdentities": 200,
+      "distinctIdentities": 300,
+      "duplicateIdentities": 0,
+      "newCandidateGroups": 200,
+      "knownCandidateGroupsGainingSupport": 0,
+      "nonTradeAdditionalIdentities": 0,
+      "matchedLegacyIdentities": 100,
+      "legacyRecords": 100,
+      "cursorStop": "PAGE_BUDGET",
+      "anomalies": [],
+      "orderAnomalies": 0,
+      "latencyMs": [
+        327,
+        294,
+        284
+      ],
+      "sourceAgeSeconds": {
+        "newest": 5051.457999944687,
+        "oldest": 24630.414999961853
+      },
+      "freshness": {
+        "legacyNewest": 1792004337,
+        "v2Newest": 1792004337
+      },
+      "responseHeaders": [
+        {
+          "date": "Wed, 14 Oct 2026 20:23:08 GMT",
+          "cache-control": "public, max-age=15",
+          "x-trace-id": "4be55ac5494342fdbae6b4e36f097bb1",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:08 GMT",
+          "cache-control": "public, max-age=15",
+          "x-trace-id": "df6ca4db4557482dbc420dcd58ebbf0c",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:09 GMT",
+          "cache-control": "public, max-age=15",
+          "x-trace-id": "b7ffc829656040cca8f505e0dc1f1286",
+          "content-type": "application/json"
+        }
+      ],
+      "requestBudget": 3,
+      "bodyBytes": 240037,
+      "completeness": "UNKNOWN_UNPROVEN"
+    },
+    {
+      "wallet": "0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029",
+      "source": "activity",
+      "firstPageRecords": 100,
+      "additionalPages": 2,
+      "additionalRawRecords": 200,
+      "additionalDistinctIdentities": 200,
+      "distinctIdentities": 300,
+      "duplicateIdentities": 0,
+      "newCandidateGroups": 178,
+      "knownCandidateGroupsGainingSupport": 0,
+      "nonTradeAdditionalIdentities": 22,
+      "matchedLegacyIdentities": 100,
+      "legacyRecords": 100,
+      "cursorStop": "PAGE_BUDGET",
+      "anomalies": [],
+      "orderAnomalies": 0,
+      "latencyMs": [
+        269,
+        285,
+        289
+      ],
+      "sourceAgeSeconds": {
+        "newest": 59939.39899992943,
+        "oldest": 233297.41899991035
+      },
+      "freshness": {
+        "legacyNewest": 1791949451,
+        "v2Newest": 1791949451
+      },
+      "responseHeaders": [
+        {
+          "date": "Wed, 14 Oct 2026 20:23:10 GMT",
+          "cache-control": "public, max-age=15",
+          "x-trace-id": "62983f0e35614904a18aca54cb921ec2",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:10 GMT",
+          "cache-control": "public, max-age=15",
+          "x-trace-id": "c595e287478c4817a2467994100e4a43",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:11 GMT",
+          "cache-control": "public, max-age=15",
+          "x-trace-id": "e535c3411a7945b1a09262af4f1d366f",
+          "content-type": "application/json"
+        }
+      ],
+      "requestBudget": 3,
+      "bodyBytes": 224065,
+      "completeness": "UNKNOWN_UNPROVEN"
+    },
+    {
+      "wallet": "0xf5286079ada8dcfeaa44f7f1c87e1ec37c127e5b",
+      "source": "activity",
+      "firstPageRecords": 100,
+      "additionalPages": 2,
+      "additionalRawRecords": 200,
+      "additionalDistinctIdentities": 200,
+      "distinctIdentities": 300,
+      "duplicateIdentities": 0,
+      "newCandidateGroups": 200,
+      "knownCandidateGroupsGainingSupport": 0,
+      "nonTradeAdditionalIdentities": 0,
+      "matchedLegacyIdentities": 100,
+      "legacyRecords": 100,
+      "cursorStop": "PAGE_BUDGET",
+      "anomalies": [],
+      "orderAnomalies": 0,
+      "latencyMs": [
+        296,
+        365,
+        298
+      ],
+      "sourceAgeSeconds": {
+        "newest": 33.426000118255615,
+        "oldest": 36434.42899990082
+      },
+      "freshness": {
+        "legacyNewest": 1792009359,
+        "v2Newest": 1792009359
+      },
+      "responseHeaders": [
+        {
+          "date": "Wed, 14 Oct 2026 20:23:12 GMT",
+          "cache-control": "public, max-age=15",
+          "x-trace-id": "30466c7d880d4ec8aeff42818055c9ac",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:12 GMT",
+          "cache-control": "public, max-age=15",
+          "x-trace-id": "d2430ba794474abfbfb3510324aa8d32",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:13 GMT",
+          "cache-control": "public, max-age=15",
+          "x-trace-id": "3d4f12d435d744cca1906328f1751ac1",
+          "content-type": "application/json"
+        }
+      ],
+      "requestBudget": 3,
+      "bodyBytes": 256276,
+      "completeness": "UNKNOWN_UNPROVEN"
+    },
+    {
+      "wallet": "0xfea31bc088000ff909be1dfd8d0e3f2c7ef2d227",
+      "source": "activity",
+      "firstPageRecords": 100,
+      "additionalPages": 2,
+      "additionalRawRecords": 200,
+      "additionalDistinctIdentities": 200,
+      "distinctIdentities": 300,
+      "duplicateIdentities": 0,
+      "newCandidateGroups": 195,
+      "knownCandidateGroupsGainingSupport": 0,
+      "nonTradeAdditionalIdentities": 5,
+      "matchedLegacyIdentities": 100,
+      "legacyRecords": 100,
+      "cursorStop": "PAGE_BUDGET",
+      "anomalies": [],
+      "orderAnomalies": 0,
+      "latencyMs": [
+        283,
+        336,
+        323
+      ],
+      "sourceAgeSeconds": {
+        "newest": 1525.414999961853,
+        "oldest": 91439.4549999237
+      },
+      "freshness": {
+        "legacyNewest": 1792007869,
+        "v2Newest": 1792007869
+      },
+      "responseHeaders": [
+        {
+          "date": "Wed, 14 Oct 2026 20:23:14 GMT",
+          "cache-control": "public, max-age=15",
+          "x-trace-id": "9361636a4d494f26bc3cec73a77b57ca",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:14 GMT",
+          "cache-control": "public, max-age=15",
+          "x-trace-id": "58d85bfe2dc54b80b95400ed36c24af9",
+          "content-type": "application/json"
+        },
+        {
+          "date": "Wed, 14 Oct 2026 20:23:15 GMT",
+          "cache-control": "public, max-age=15",
+          "x-trace-id": "76d7ff6a51284cbc9ebe9487f9270687",
+          "content-type": "application/json"
+        }
+      ],
+      "requestBudget": 3,
+      "bodyBytes": 240150,
+      "completeness": "UNKNOWN_UNPROVEN"
+    }
+  ],
+  "totals": {
+    "additionalDistinctIdentities": 2000,
+    "newCandidateGroups": 1000,
+    "knownCandidateGroupsGainingSupport": 56,
+    "actualCompatibilityPairs": 1000,
+    "identityMismatch": 0,
+    "normalizationMismatch": 0,
+    "chainCorroboratedCandidateGroups": 1
+  },
+  "chain": [
+    {
+      "status": 200,
+      "valid": true,
+      "decoded": 1,
+      "error": null,
+      "state": "RECEIPT_VALIDATED"
+    }
+  ],
+  "completeness": "UNKNOWN_UNPROVEN",
+  "populationParity": "UNKNOWN: v2 documented 0.01-share default floor; v1 default floor not specified. API fields map; full population equivalence is not proven.",
+  "latencyLimit": "Source timestamp age and HTTP latency only; historical sample cannot measure true first-discovery or event-to-arrival latency.",
+  "replay": {
+    "responsesHashVerified": 43,
+    "publishedRowsVerified": 3000,
+    "publicationDigest": "222a3218723c015bbfc8652792df77afd947839730d339ca601b74e61a66da23"
+  }
+}

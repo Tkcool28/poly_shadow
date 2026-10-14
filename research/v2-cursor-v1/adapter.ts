@@ -55,8 +55,7 @@ export class PublicTransport implements Transport {
   if(this.busy||this.denied)throw Error(this.denied?'HOST_STOPPED':'CONCURRENCY_LIMIT');
   this.busy=true;let requestUtc=new Date().toISOString();let body=Buffer.alloc(0);let status=0;const headers:Record<string,string>={};const began=Date.now();let error:string|undefined;
   try{
-   const wait=Math.max(0,this.last+LIMITS.spacingMs-Date.now());if(Date.now()+wait+LIMITS.requestMs>deadline)throw Error('TIME_BUDGET');
-   if(wait)await new Promise(r=>setTimeout(r,wait));
+   let wait=Math.max(0,this.last+LIMITS.spacingMs-Date.now());while(wait){if(Date.now()+wait+LIMITS.requestMs>deadline)throw Error('TIME_BUDGET');await new Promise(r=>setTimeout(r,wait));wait=Math.max(0,this.last+LIMITS.spacingMs-Date.now())}if(Date.now()+LIMITS.requestMs>deadline)throw Error('TIME_BUDGET');
    const now=Date.now();this.requests=this.requests.filter(t=>now-t<LIMITS.minuteMs);
    if(this.requests.length>=LIMITS.requests||this.count>=60)throw Error('REQUEST_BUDGET');
    this.requests.push(now);this.last=now;this.count++;requestUtc=new Date(now).toISOString();
