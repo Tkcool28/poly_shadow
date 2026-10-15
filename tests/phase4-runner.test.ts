@@ -10,7 +10,7 @@ it('Phase4 isolated real-process lifecycle and fail-closed safety', () => {
   const output = execFileSync('python3', [join(root, 'tests/phase4_runner_lifecycle.py')], {
     cwd: root,
     encoding: 'utf8',
-    timeout: 60_000,
+    timeout: 70_000,
     env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -23,4 +23,4 @@ it('Phase4 isolated real-process lifecycle and fail-closed safety', () => {
   expect(output).toContain('PROOF identity capture failure:');
   expect(output).toContain('PROOF SIGTERM:');
   expect(output).toContain('PROOF SIGKILL runner:');
-}, 65_000);
+}, 75_000);

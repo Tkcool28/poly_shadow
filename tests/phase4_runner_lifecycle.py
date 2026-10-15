@@ -214,8 +214,8 @@ class Lifecycle(unittest.TestCase):
             time.sleep(.02)
         self.fail('Missing complete fixture artifact ' + name)
 
-    def receipt(self, p):
-        out, err = p.communicate(timeout=6)
+    def receipt(self, p, timeout=6):
+        out, err = p.communicate(timeout=timeout)
         r = self.wait_file('execution-receipt.json')
         self.assertEqual(err, b'', err.decode())
         self.assertEqual(r['observerGroupGone'], True)
@@ -228,13 +228,42 @@ class Lifecycle(unittest.TestCase):
         for mode in ('sink-broken-alive', 'sink-exit-no-diagnostic', 'sink-at-end-control'):
             with self.subTest(mode=mode):
                 self.target = self.repo / ('runs/phase4-' + mode)
-                self.seal()
+                # Sealing copies, hashes and fsyncs real files before the start.
+                # This scenario tests sink failure, not a 300ms setup deadline.
+                self.seal(lead=2)
                 p = self.launch(mode)
-                receipt = self.receipt(p)
+                receipt = self.receipt(p, timeout=10)
                 self.assertNotEqual(p.returncode, 0)
                 self.assertEqual(receipt['classification'], 'EVIDENCE_SINK_FAILURE')
                 self.assertEqual(receipt['observationPhase'], 'FAILED')
                 self.assertNotEqual(receipt['classification'], 'END_WINDOW_COMPLETE')
+
+    def test_start_expiring_during_seal_is_missed_and_unpublished(self):
+        start = time.time() + 10
+        checks = fixture_checks(start, start + 1)
+        real_utc = runner.utc
+        clock_reads = []
+
+        def seal_clock(t=None):
+            if t is not None:
+                return real_utc(t)
+            # Initial validation and sealedUtc are before start; the final
+            # pre-publication check sees an expired start, without sleeping.
+            now = start - 1 if len(clock_reads) < 2 else start + 1
+            clock_reads.append(now)
+            return real_utc(now)
+
+        with mock.patch.object(runner, 'utc', side_effect=seal_clock):
+            with self.assertRaises(runner.Blocked) as error:
+                runner.seal_files(self.repo, self.target, start, start + 1, checks, 1)
+        self.assertEqual(error.exception.code, 'MISSED_START')
+        self.assertGreaterEqual(len(clock_reads), 3)
+        self.assertFalse(self.target.exists())
+        stages = list((self.repo / 'runs').glob('.phase4-stage-*'))
+        self.assertEqual(len(stages), 1)
+        self.assertTrue((stages[0] / 'INVALID').exists())
+        self.assertFalse((stages[0] / 'execution-receipt.json').exists())
+        self.assertFalse((stages[0] / 'observer.log').exists())
 
     def test_tracked_runs_dirty_rejected_before_production_adapter(self):
         def lookup(cmd, cwd=None):
