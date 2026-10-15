@@ -16,6 +16,8 @@
     "src/**/*.ts",
     "tests/**/*.ts",
     "research/v2-cursor-v1/**/*.ts",
-    "research/v2-cursor-v1/**/*.mts"
+    "research/v2-cursor-v1/**/*.mts",
+    "research/v2-corrected-v1-1/**/*.ts",
+    "research/v2-corrected-v1-1/**/*.mts"
   ]
 }

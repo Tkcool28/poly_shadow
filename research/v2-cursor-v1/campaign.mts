@@ -5,8 +5,8 @@ import {execFileSync} from 'node:child_process';
 import {Evidence,PublicTransport,WALLETS,LIMITS,traverse,hash,fileHash,type Reply} from './adapter.js';
 import {assertPrelaunchDisk} from '../../src/shadow/storage-budget.js';
 import {analyze} from './replay.js';
-const dir='research/v2-cursor-v1/evidence';
-if(process.env.GITHUB_ACTIONS!=='true'||process.env.GITHUB_EVENT_NAME!=='pull_request'||process.env.GITHUB_EVENT_ACTION!=='opened'||process.env.GITHUB_RUN_ATTEMPT!=='1')throw Error('ONE_SHOT_ACTIONS_ONLY');
+import {authorize,CAMPAIGN,BASE} from '../v2-corrected-v1-1/authorization.js';
+const dir=authorize(process.env);
 if(existsSync(dir))throw Error('CAMPAIGN_ALREADY_EXISTS');mkdirSync(dir,{recursive:true});
 const started=Date.now(),end=Math.floor(started/1000),t=new PublicTransport();let failure:string|null=null;let disk:unknown;let e:Evidence|undefined;let peakRss=process.memoryUsage().rss;let requests=0;
 const sampleMemory=setInterval(()=>{peakRss=Math.max(peakRss,process.memoryUsage().rss)},10);
@@ -37,7 +37,7 @@ try{
  for(const r of e.db.prepare('SELECT source,identity,traversal,page,row FROM observations ORDER BY source,identity').iterate() as Iterable<{source:string;identity:string;traversal:string;page:number;row:string}>){e.charge(Buffer.byteLength(r.row)+1024);appendFileSync(join(dir,'observations.ndjson'),JSON.stringify({...r,row:JSON.parse(r.row)})+'\n')}
  for(const c of e.db.prepare('SELECT id,row FROM checkpoints ORDER BY id').iterate() as Iterable<{id:string;row:string}>){e.charge(Buffer.byteLength(c.row)+1024);appendFileSync(join(dir,'checkpoints.ndjson'),JSON.stringify({id:c.id,...JSON.parse(c.row)})+'\n')}
  e.close();}
- writeFileSync(join(dir,'campaign.json'),JSON.stringify({version:1,scope:'one current-time bounded public sample; no production capture',sha:execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),wallets:WALLETS,limits:LIMITS,startedUtc:new Date(started).toISOString(),completedUtc:new Date().toISOString(),end,elapsedMs:Date.now()-started,restRequests:t.count,requests,peakRss,disk,failure,completeness:'UNKNOWN_UNPROVEN',chainMaxRequests:1},null,2)+'\n');
+ writeFileSync(join(dir,'campaign.json'),JSON.stringify({version:2,evidenceVersion:2,campaignId:CAMPAIGN,adapterBaseline:BASE,scope:'one current-time bounded public sample; no production capture',sha:execFileSync('git',['rev-parse','HEAD'],{encoding:'utf8'}).trim(),wallets:WALLETS,limits:LIMITS,startedUtc:new Date(started).toISOString(),completedUtc:new Date().toISOString(),end,elapsedMs:Date.now()-started,restRequests:t.count,requests,peakRss,disk,failure,completeness:'UNKNOWN_UNPROVEN',chainMaxRequests:1},null,2)+'\n');
  try{analyze(dir)}catch(error){failure??=String(error);writeFileSync(join(dir,'analysis-error.txt'),String(error)+'\n')}
  peakRss=Math.max(peakRss,process.memoryUsage().rss,process.resourceUsage().maxRSS*1024);const finalCampaign=JSON.parse(readFileSync(join(dir,'campaign.json'),'utf8'));writeFileSync(join(dir,'campaign.json'),JSON.stringify({...finalCampaign,peakRss,elapsedMs:Date.now()-started},null,2)+'\n');clearInterval(sampleMemory);
  const files=Object.fromEntries(readdirSync(dir).sort().filter(n=>statSync(join(dir,n)).isFile()&&n!=='manifest.json').map(n=>[n,{bytes:statSync(join(dir,n)).size,sha256:fileHash(join(dir,n))}]));
