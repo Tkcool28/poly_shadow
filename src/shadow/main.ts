@@ -112,13 +112,16 @@ async function main(): Promise<void> {
     if(cfg.v2Cursor){
       // A single sequential supplemental cohort cycle bounds both sources together. Each
       // wallet/source retains an independent <=3-page, <=8-second traversal.
-      let busy=false,stopped=false;
+      let busy=false,stopped=false,offset=0,tradesFirst=true;
       const cycle=async()=>{
         if(busy||stopped)return;
         busy=true;
-        try{await v2Trades!.pollAll();if(!stopped)await v2Activity!.pollAll();}
+        try{
+          const first=tradesFirst?v2Trades!:v2Activity!,second=tradesFirst?v2Activity!:v2Trades!;
+          await first.pollAll(offset);if(!stopped)await second.pollAll(offset);
+        }
         catch{stopRest();}
-        finally{busy=false;}
+        finally{busy=false;offset=(offset+1)%cfg.watchedWallets.size;tradesFirst=!tradesFirst;}
       };
       const timer=setInterval(()=>void cycle(),60000);
       stopRest=()=>{stopped=true;clearInterval(timer);trades?.stop();activity?.stop();v2Trades?.stop();v2Activity?.stop();};

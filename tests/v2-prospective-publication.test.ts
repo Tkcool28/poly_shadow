@@ -124,3 +124,10 @@ it('a scheduling skip cannot become a failed provider poll or recover a quaranti
  expect(journal(f.dir)[0]).toMatchObject({recordType:'REST_POLL',outcome:'SKIPPED',stopReason:'REQUEST_BUDGET',pageCount:0,publication:'NOT_ATTEMPTED',pagination:'UNKNOWN_UNPROVEN'});
  expect(f.op.unresolvedQuarantineCount()).toBe(0);expect(f.store.restRaw()).toHaveLength(0);
 });
+it('bounded supplemental traversal rotates over the same frozen cohort without changing membership',async()=>{
+ const f=await fixture(async()=>reply(envelope([])));
+ const order:string[]=[];
+ const p=new RestPoller({...f.opts,wallets:new Set(WALLETS)},f.store,new Reconciler(f.store),undefined,async url=>{order.push(new URL(url).searchParams.get('user')!);return reply(envelope([]));},f.op);
+ await p.pollAll(3);
+ expect(order).toEqual([...WALLETS.slice(3),...WALLETS.slice(0,3)]);
+});

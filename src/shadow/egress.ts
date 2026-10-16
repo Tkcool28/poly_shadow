@@ -73,6 +73,7 @@ export async function restGet(url: string, timeoutMs = 15_000, maxBodyBytes = RE
   const requestStartUtc = new Date().toISOString();
   const res = await fetch(url, {
     method: 'GET',
+    redirect: 'error',
     headers: { Accept: 'application/json' },
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -134,6 +135,7 @@ export function pacedV2RestGet() {
       if(starts.length>=60 || v2&&starts.filter(t=>t.v2).length>=20)throw new RestRequestSkipped('REQUEST_BUDGET');
       starts.push({at:now,v2});last=now;
       const reply=await restGet(url,timeoutMs,maxBodyBytes);
+      if(reply.requestStartUtc){last=Date.parse(reply.requestStartUtc);starts[starts.length-1]!.at=last;}
       if([403,429,503].includes(reply.status))stopped=true;
       return reply;
     }finally{if(timer)clearTimeout(timer);release();}

@@ -16,7 +16,9 @@ environment. Configuration refuses any cohort except the exact existing five
 wallets. Ordinary startup defaults to the existing legacy-only behavior.
 CHAIN and the existing 10s trades / 30s activity schedules remain. Two supplemental
 v2 pollers run a sequential cohort cycle every 60s; overlapping supplemental cycles
-are skipped. All four REST pollers share the same request scheduler. Scheduling,
+are skipped. Supplemental cycles rotate the starting wallet and alternate the
+first endpoint, so a persistent quota cap cannot permanently starve the same
+wallets/source. Frozen cohort membership is unchanged. All four REST pollers share the same request scheduler. Scheduling,
 queue deadline and quota skips are durable REST_POLL receipts, not quarantines or
 successful empty responses. Cadences are scheduling targets; actual request and
 response clocks are recorded, including queue effects and missed opportunities.
@@ -108,6 +110,11 @@ Verify in the actual installation, under separate operational authorization:
 These are deployment/preflight requirements, not observed production facts.
 Poly2 #26's exact head `ffaae394884a72e7375ab2f3da7acb5ee476a3d9` has successful
 CI run 38361005165, including native PostgreSQL capture/official comparator ABI.
+Exact local reviewed-source identity digests (not installed production proof):
+`protocolDigest=ff58bd29b67c20d249d7b4ef9ad130fcd33a14aa975c122d8b9c75ff5f742360`;
+`componentSha256=689b23be96b48a4091f1aa24d979eb7b0e870dfcbeb7f2cb04ad7e8fc2faa597`.
+All eight vendored scripts are byte-identical to current Shadow scripts. Recompute
+in each actual installation; never substitute these local digests for attestation.
 Local/current-consumer checks and this PR's CI are reported separately in the PR.
 
 ## Exact separately authorized execution sequence

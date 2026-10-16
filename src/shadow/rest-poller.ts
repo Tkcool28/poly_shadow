@@ -109,7 +109,7 @@ export class RestPoller {
     return this.opts.pagination ? `${legacy}&offset=${offset}` : legacy;
   }
 
-  async pollAll(): Promise<void> {
+  async pollAll(startAt=0): Promise<void> {
     this.operational?.assertUsable();
     if (this.polling) {
       for(const wallet of this.opts.wallets)this.skipped(wallet.toLowerCase(), 'SOURCE_POLL_IN_FLIGHT');
@@ -117,7 +117,10 @@ export class RestPoller {
     } // never overlap polls of the same source
     this.polling = true;
     try {
-      for (const wallet of this.opts.wallets) {
+      const wallets=[...this.opts.wallets];
+      if(!Number.isInteger(startAt)||startAt<0||startAt>=wallets.length)throw Error('invalid REST cohort rotation');
+      for (let i=0;i<wallets.length;i++) {
+        const wallet=wallets[(i+startAt)%wallets.length]!;
         try { await this.pollWallet(wallet.toLowerCase()); }
         catch (err) {
           // Rejection arrives only after the page and final-poll receipts have
@@ -238,6 +241,7 @@ export class RestPoller {
           for(let i=0;i<items.length;i++){
             const item=items[i] as Record<string,unknown>,identity=ids[i]!;
             try {
+              if(this.opts.v2 && Date.now()>deadline)throw Error('TIME_BUDGET');
               if(this.store.hasRestPublication(this.opts.source,identity))dupCount++;
               else {
                 this.commit(wallet,identity,item,typeof item.timestamp==='number'?item.timestamp:null,
