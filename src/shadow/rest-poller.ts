@@ -13,7 +13,11 @@
  * - Polling cadence is independently chosen (config), never Poly2's.
  */
 
-import { restGet } from './egress.js';
+import {page as decodeV2Page, filters as v2Filters, LIMITS, WALLETS} from '../../research/v2-cursor-v1/adapter.js';
+import { restGet, RestRequestSkipped } from './egress.js';
+import {statSync,statfsSync} from 'node:fs';
+import {join} from 'node:path';
+import {storagePlan} from './storage-budget.js';
 import { randomUUID, createHash } from 'node:crypto';
 import type {
   ActivityPayload, RacingStore, Reconciler, RestRawRow,
@@ -37,6 +41,8 @@ export interface RestPollerOpts {
   limit?: number;
   /** Prospective acquisition amendment only; production wiring leaves disabled. */
   pagination?: { maxPages: number; overlap: number };
+  /** Prospective cursor acquisition; source identities and journals stay unchanged. */
+  v2?: boolean;
 }
 
 export class RestPoller {
@@ -59,6 +65,7 @@ export class RestPoller {
     if(!Number.isInteger(limit)||limit<1||limit>cap)throw Error('invalid REST page limit');
     const paging=opts.pagination;
     if(paging&&(!Number.isInteger(paging.maxPages)||paging.maxPages<1||paging.maxPages>16||!Number.isInteger(paging.overlap)||paging.overlap<1||paging.overlap>=limit))throw Error('invalid bounded REST pagination budget');
+    if(opts.v2 && (opts.pagination || limit!==LIMITS.records || [...opts.wallets].some(w=>!WALLETS.includes(w)))) throw Error('invalid v2 cohort or bounds');
     const sink=this.operational;
     if(sink){this.store.gatePublications(()=>sink.assertUsable());sink.onBroken(() => this.stop());}
     // Restart idempotence: previously committed identities are never
@@ -87,7 +94,13 @@ export class RestPoller {
   /** Number of source-native identities already committed (tests). */
   get seenCount(): number { return this.store.identityCount(this.opts.source); }
 
-  private url(wallet: string, offset=0): string {
+  private url(wallet: string, offset=0, cursor:string|null=null, end=0): string {
+    if(this.opts.v2){
+      const u=new URL(`https://data-api.polymarket.com/v2/${this.opts.endpoint}`);
+      for(const [k,v] of Object.entries(v2Filters(this.opts.endpoint,wallet,end)))u.searchParams.set(k,v);
+      if(cursor!==null)u.searchParams.set('cursor',cursor);
+      return u.href;
+    }
     const base = `${this.opts.baseUrl}/${this.opts.endpoint}?user=${wallet}`
       + `&limit=${this.opts.limit ?? 100}`;
     // takerOnly=false: /trades otherwise defaults to taker-only, which would
@@ -96,7 +109,7 @@ export class RestPoller {
     return this.opts.pagination ? `${legacy}&offset=${offset}` : legacy;
   }
 
-  async pollAll(): Promise<void> {
+  async pollAll(startAt=0): Promise<void> {
     this.operational?.assertUsable();
     if (this.polling) {
       for(const wallet of this.opts.wallets)this.skipped(wallet.toLowerCase(), 'SOURCE_POLL_IN_FLIGHT');
@@ -104,7 +117,10 @@ export class RestPoller {
     } // never overlap polls of the same source
     this.polling = true;
     try {
-      for (const wallet of this.opts.wallets) {
+      const wallets=[...this.opts.wallets];
+      if(!Number.isInteger(startAt)||startAt<0||startAt>=wallets.length)throw Error('invalid REST cohort rotation');
+      for (let i=0;i<wallets.length;i++) {
+        const wallet=wallets[(i+startAt)%wallets.length]!;
         try { await this.pollWallet(wallet.toLowerCase()); }
         catch (err) {
           // Rejection arrives only after the page and final-poll receipts have
@@ -139,6 +155,9 @@ export class RestPoller {
     this.activeWallets.add(wallet);
     const pollId=randomUUID(),limit=this.opts.limit ?? 100,paging=this.opts.pagination;
     let pages=0,totalItems=0,totalNew=0,totalSeen=0,offset=0;
+    const began=Date.now(),end=Math.floor(began/1000),deadline=began+LIMITS.traversalMs;
+    let cursor:string|null=null,lastTimestamp:number|null=null;
+    const seenCursors=new Set<string>();
     let outcome='SKIPPED',stopReason='INDEX_PREFLIGHT',pollError:unknown=null;
     let previousTail:string[]=[];
     let lastReceipt:Record<string,unknown>={};
@@ -148,28 +167,51 @@ export class RestPoller {
       try { this.store.assertUsable(); await this.store.initializeIndex(); }
       catch(err){outcome='PUBLICATION_FAILURE';recordQuarantine(null,'INDEX_ERROR',`index preflight: ${String(err)}`,pollId);throw err;}
       this.operational?.assertUsable();
-      const budget=paging?.maxPages ?? 1,overlap=paging?.overlap ?? 0;
+      const budget=this.opts.v2 ? LIMITS.pages : paging?.maxPages ?? 1,overlap=paging?.overlap ?? 0;
       for(let page=0;page<budget;page++){
         this.operational?.assertUsable();
         const quarantineStart=quarantineIds.length;
-        const requestUrl=this.url(wallet,offset),requestStartUtc=this.nowIso();
+        if(this.opts.v2){
+          try{
+          const disk=statfsSync(this.store.dir);
+          if(Number(disk.bavail)*Number(disk.bsize)-8*LIMITS.body<storagePlan.alertReserveBytes)throw Error('V2_DISK_RESERVE');
+          let bytes=0;
+          for(const name of ['rest_raw.ndjson','source_observations.ndjson','reconciliation.ndjson','rest_poll_receipts.ndjson','poll_telemetry.ndjson']){try{bytes+=statSync(join(this.store.dir,name)).size;}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e;}}
+          // Room for a bounded page's raw, normalized, reconciliation and receipts.
+          if(bytes+8*LIMITS.body>LIMITS.dailyBytes)throw Error('V2_APPEND_BUDGET');
+          }catch(error){outcome='PUBLICATION_FAILURE';stopReason='V2_RESOURCE_GATE';recordQuarantine(null,'PUBLICATION_ERROR',String(error),pollId);throw error;}
+        }
+        if(this.opts.v2 && Date.now()+LIMITS.requestMs>deadline){stopReason='TIME_BUDGET';break;}
+        const requestUrl=this.url(wallet,offset,cursor,end);let requestStartUtc=this.nowIso();
         const requestParams=Object.fromEntries(new URL(requestUrl).searchParams);
         let status:number|null=null,responseUtc:string|null=null;
         let headers:Record<string,unknown>={age:null,cacheControl:null,etag:null,date:null};
-        let items:unknown[]=[],error:string|null=null,thrown:unknown=null;
+        let items:unknown[]=[],wireItems:unknown[]=[],error:string|null=null,thrown:unknown=null;
+        let v2Next:string|null=null;
         let newCount=0,dupCount=0,published=0,newestTs:number|null=null;
         let pageOutcome='SUCCESS_EMPTY',publication='NOT_ATTEMPTED';
         let overlapState=page===0?'NOT_APPLICABLE':'UNVERIFIED';
         let identityVectorComplete=false;
         const ids:string[]=[];
         try {
-          const res=await this.fetchFn(requestUrl);
-          responseUtc=this.nowIso();status=res.status;headers={...headers,...res.headers};
+          const res=this.opts.v2 ? await this.fetchFn(requestUrl,LIMITS.requestMs,LIMITS.body,deadline) : await this.fetchFn(requestUrl);
+          if(this.opts.v2 && res.requestStartUtc)requestStartUtc=res.requestStartUtc;
+          responseUtc=res.responseUtc ?? this.nowIso();status=res.status;headers={...headers,...res.headers};
           if(status!==200){pageOutcome='HTTP_FAILURE';error=`HTTP ${status}`;}
           else if(res.bodyError){pageOutcome=res.bodyError.outcome;error=res.bodyError.message;}
+          else if(this.opts.v2){
+            if(Date.now()>deadline)throw Error('TIME_BUDGET');
+            if(!Number.isFinite(Date.parse(requestStartUtc)) || !Number.isFinite(Date.parse(responseUtc)) || Date.parse(responseUtc)<Date.parse(requestStartUtc))throw Error('REQUEST_RESPONSE_CLOCK_INVALID');
+            const decoded=decodeV2Page(this.opts.endpoint,res.body,wallet);
+            if(decoded.next!==null && (decoded.next===cursor || seenCursors.has(decoded.next)))throw Error('REPEATED_CURSOR');
+            let last:number|null=lastTimestamp;
+            for(const item of decoded.rows){if(item.timestamp>end || item.timestamp<end-3*365*86400 || last!==null&&item.timestamp>last)throw Error('ORDER_OR_WINDOW_ANOMALY');last=item.timestamp;}
+            lastTimestamp=last;v2Next=decoded.next;items=decoded.rows;wireItems=(res.body as {data:unknown[]}).data;
+            pageOutcome=items.length?'SUCCESS_NONEMPTY':'SUCCESS_EMPTY';
+          }
           else if(!Array.isArray(res.body)){pageOutcome='PARSE_FAILURE';error=res.parseError??'malformed REST non-array body';}
           else {items=res.body;pageOutcome=items.length?'SUCCESS_NONEMPTY':'SUCCESS_EMPTY';}
-        } catch(err){responseUtc=this.nowIso();error=String(err);pageOutcome=OperationalEvidence.errorClass(err)==='TIMEOUT'?'TIMEOUT':err instanceof SyntaxError?'PARSE_FAILURE':'HTTP_FAILURE';}
+        } catch(err){if(err instanceof RestRequestSkipped){outcome='SKIPPED';stopReason=err.message;return;}responseUtc ??=this.nowIso();error=String(err);pageOutcome=OperationalEvidence.errorClass(err)==='TIMEOUT'?'TIMEOUT':err instanceof SyntaxError||this.opts.v2&&status===200?'PARSE_FAILURE':'HTTP_FAILURE';}
         this.operational?.assertUsable();
         if(error)recordQuarantine(null,status===429?'HTTP_429':status===503?'HTTP_503':pageOutcome==='TIMEOUT'?'TIMEOUT':pageOutcome==='PARSE_FAILURE'?'MALFORMED_PAYLOAD':'HTTP_FAILURE',error,pollId);
         // Validate the entire bounded page before publication. A malformed item
@@ -199,10 +241,11 @@ export class RestPoller {
           for(let i=0;i<items.length;i++){
             const item=items[i] as Record<string,unknown>,identity=ids[i]!;
             try {
+              if(this.opts.v2 && Date.now()>deadline)throw Error('TIME_BUDGET');
               if(this.store.hasRestPublication(this.opts.source,identity))dupCount++;
               else {
                 this.commit(wallet,identity,item,typeof item.timestamp==='number'?item.timestamp:null,
-                  {requestStartUtc,responseUtc:responseUtc!,httpStatus:status!,ageHeader:headers.age as string|null,cacheControl:headers.cacheControl as string|null});
+                  {requestStartUtc,responseUtc:responseUtc!,httpStatus:status!,ageHeader:headers.age as string|null,cacheControl:headers.cacheControl as string|null}, this.opts.v2 ? wireItems[i] as Record<string,unknown> : undefined);
                 newCount++;published++;
               }
               // A durable exact publication is the only recovery authority,
@@ -230,8 +273,9 @@ export class RestPoller {
         const capped=items.length>=limit;
         const proposedOffset=offset+limit-overlap;
         const offsetCap=this.opts.endpoint==='trades'?10000:5000;
-        stopReason=error?'FAILURE':overlapState==='MISSING_OR_MOVED'?'UNSTABLE_OVERLAP':!capped?'SHORT_PAGE':!paging?'PAGINATION_DISABLED':page+1>=budget?'REQUEST_BUDGET_EXHAUSTED':proposedOffset>offsetCap?'OFFSET_CAP_EXHAUSTED':'CONTINUE';
-        const nextOffset=stopReason==='CONTINUE'?proposedOffset:null;
+        stopReason=this.opts.v2 ? error?'FAILURE':v2Next===null?'API_EXHAUSTED':page+1>=budget?'REQUEST_BUDGET_EXHAUSTED':Date.now()+LIMITS.requestMs>deadline?'TIME_BUDGET':'CONTINUE' : error?'FAILURE':overlapState==='MISSING_OR_MOVED'?'UNSTABLE_OVERLAP':!capped?'SHORT_PAGE':!paging?'PAGINATION_DISABLED':page+1>=budget?'REQUEST_BUDGET_EXHAUSTED':proposedOffset>offsetCap?'OFFSET_CAP_EXHAUSTED':'CONTINUE';
+        const nextOffset=!this.opts.v2 && stopReason==='CONTINUE'?proposedOffset:null;
+        const nextCursor:string|null=this.opts.v2 && stopReason==='CONTINUE'?v2Next:null;
         // Coverage limitations are aggregated from successful page receipts, not operational failures.
         // Failures above still quarantine; every page/poll remains UNKNOWN_UNPROVEN.
         lastReceipt={recordType:'REST_PAGE',pollId,pageIndex:page,source:this.opts.source,wallet,
@@ -240,10 +284,11 @@ export class RestPoller {
           overlap:overlapState,firstIdentity:ids[0]??null,lastIdentity:ids.at(-1)??null,
           firstTimestamp:(items[0] as Record<string,unknown>|null)?.timestamp??null,lastTimestamp:(items.at(-1) as Record<string,unknown>|null)?.timestamp??null,
           identityVectorComplete,identityVectorSha256:createHash('sha256').update(ids.join('\n')).digest('hex'),
-          alreadySeen:dupCount,newIdentities:newCount,published,publication,nextCursor:null,nextOffset,
+          alreadySeen:dupCount,newIdentities:newCount,published,publication,nextCursor,nextOffset,acquisition:this.opts.v2?'V2_CURSOR':'LEGACY_OFFSET',
           quarantineIds:quarantineIds.slice(quarantineStart),pagination:'UNKNOWN_UNPROVEN',stopReason};
         this.operational?.restReceipt(lastReceipt);
         if(thrown)throw thrown;
+        if(this.opts.v2){if(nextCursor===null)break;seenCursors.add(nextCursor);cursor=nextCursor;continue;}
         if(nextOffset===null)break;
         previousTail=ids.slice(-overlap);offset=nextOffset;
       }
@@ -275,19 +320,26 @@ export class RestPoller {
     item: Record<string, unknown>,
     sourceTs: number | null,
     http: { requestStartUtc: string; responseUtc: string; httpStatus: number; ageHeader: string | null; cacheControl: string | null },
+    sourcePayload?: Record<string,unknown>,
   ): void {
     this.operational?.assertUsable();
-    const firstSeenUtc = this.nowIso();
+    const firstSeenUtc = this.opts.v2 ? http.responseUtc : this.nowIso();
     const raw: RestRawRow = {
       source: this.opts.source as RestRawRow['source'], wallet, identity,
       payload: item, requestStartUtc: http.requestStartUtc,
       responseUtc: http.responseUtc, httpStatus: http.httpStatus,
       ageHeader: http.ageHeader, cacheControl: http.cacheControl,
-      sourceTs, firstSeenUtc, completedUtc:this.nowIso(),
+      sourceTs, firstSeenUtc, completedUtc:firstSeenUtc,
+      ...(sourcePayload ? {sourcePayload} : {}),
     };
+    // Sample completion only after the frozen normalizer has finished. Persist
+    // both clocks before any publication; restart repair reuses these bytes.
+    const prepared=normalizeRestRaw(raw);
+    raw.completedUtc=this.nowIso();prepared.completedUtc=raw.completedUtc;
+    if(this.opts.v2 && (!Number.isFinite(Date.parse(raw.completedUtc)) || Date.parse(raw.completedUtc)<Date.parse(http.responseUtc)))throw Error('NORMALIZATION_CLOCK_INVALID');
     const savedRaw=this.store.restRawIdentity(this.opts.source,identity);
     if(!savedRaw) this.store.appendRestRaw(raw);
-    const observation=this.store.sourceIdentity(this.opts.source,identity) ?? normalizeRestRaw(savedRaw ?? raw);
+    const observation=this.store.sourceIdentity(this.opts.source,identity) ?? (savedRaw ? normalizeRestRaw(savedRaw) : prepared);
     if(!this.store.hasIdentity(this.opts.source,identity)) this.store.appendSourceObservation(observation);
     this.reconciler.record(this.opts.source,identity,observation.groupKey,observation.sourceFirstSeenUtc);
   }

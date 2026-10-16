@@ -24,7 +24,8 @@ import { EvidenceIndexError } from './storage.js';
 
 export type SourceKind = 'CHAIN' | 'REST_TRADES' | 'REST_ACTIVITY';
 
-/** Raw REST evidence row: payload exactly as returned + arrival telemetry. */
+/** Raw REST evidence + arrival telemetry. V2 retains original sourcePayload
+ * alongside the reviewed field-name mapping in payload. */
 export interface RestRawRow {
   source: 'REST_TRADES' | 'REST_ACTIVITY';
   wallet: string;
@@ -41,6 +42,8 @@ export interface RestRawRow {
   firstSeenUtc: string;
   /** Frozen normalization time, persisted before downstream publication. */
   completedUtc?: string;
+  /** Original v2 wire row, before reviewed snake_case field mapping. */
+  sourcePayload?: Record<string, unknown>;
 }
 
 /** One poll cycle's measured behavior (freshness is measured, not assumed). */
