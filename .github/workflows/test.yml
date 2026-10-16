@@ -34,6 +34,22 @@ jobs:
       - name: Install Python authority dependencies for Python 3.14 regressions
         run: |
           "${{ steps.py314.outputs.python-path }}" -m pip install -r scripts/requirements-comparison-authority.txt
+      - name: Repeat sink timing and expired-start regressions
+        env:
+          TMPDIR: ${{ runner.temp }}
+          PYTHONDONTWRITEBYTECODE: "1"
+          POLY_SHADOW_TEST_PYTHON_312: ${{ steps.py312.outputs.python-path }}
+          POLY_SHADOW_TEST_PYTHON_314: ${{ steps.py314.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          for fixture_python in "$POLY_SHADOW_TEST_PYTHON_312" "$POLY_SHADOW_TEST_PYTHON_314"; do
+            for fixture_attempt in 1 2 3 4 5; do
+              printf 'fixture-repeat python=%s attempt=%s\n' "$fixture_python" "$fixture_attempt"
+              "$fixture_python" -B tests/phase4_runner_lifecycle.py \
+                Lifecycle.test_operational_sink_failure_never_completes_window \
+                Lifecycle.test_start_expiring_during_seal_is_missed_and_unpublished
+            done
+          done
       - name: synthetic operational readiness and status regressions
         env:
           TMPDIR: ${{ runner.temp }}

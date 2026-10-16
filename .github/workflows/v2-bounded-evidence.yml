@@ -1,36 +1,135 @@
-name: v2-bounded-evidence-once
+name: corrected-v2-evidence-v1-1
 on:
   pull_request:
+    types: [labeled]
     branches: [main]
-    paths: ['research/v2-cursor-v1/**', 'tests/v2-cursor-research.test.ts', '.github/workflows/v2-bounded-evidence.yml']
 permissions:
   contents: read
+  actions: read
+concurrency:
+  group: corrected-v2-evidence-v1-1
+  cancel-in-progress: false
 jobs:
-  sample:
-    if: github.event.action == 'opened'
+  reserve:
+    if: github.event.label.name == 'authorize-v2-evidence-v1-1-retry-1' && github.head_ref == 'test/corrected-v2-evidence-campaign-v1-1' && github.run_attempt == 1
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Verify exact head, frozen adapter and unused one-shot authorization
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node research/v2-corrected-v1-1/reserve.mjs
+  offline:
+    name: All offline gates before public acquisition
+    needs: reserve
+    timeout-minutes: 12
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+      - uses: actions/setup-python@v5
+        id: py312
+        with:
+          python-version: "3.12"
+      - run: npm ci --ignore-scripts
+      - name: Install Python authority dependencies for Vitest fixtures
+        run: |
+          "${{ steps.py312.outputs.python-path }}" -m pip install -r scripts/requirements-comparison-authority.txt
+      - run: npx tsc --noEmit
+      - run: npx vitest run
+      - uses: actions/setup-python@v5
+        id: py314
+        with:
+          python-version: "3.14"
+      - name: Install Python authority dependencies for Python 3.14 regressions
+        run: |
+          "${{ steps.py314.outputs.python-path }}" -m pip install -r scripts/requirements-comparison-authority.txt
+      - name: Repeat sink timing and expired-start regressions
+        env:
+          TMPDIR: ${{ runner.temp }}
+          PYTHONDONTWRITEBYTECODE: "1"
+          POLY_SHADOW_TEST_PYTHON_312: ${{ steps.py312.outputs.python-path }}
+          POLY_SHADOW_TEST_PYTHON_314: ${{ steps.py314.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          for fixture_python in "$POLY_SHADOW_TEST_PYTHON_312" "$POLY_SHADOW_TEST_PYTHON_314"; do
+            for fixture_attempt in 1 2 3 4 5; do
+              printf 'fixture-repeat python=%s attempt=%s\n' "$fixture_python" "$fixture_attempt"
+              "$fixture_python" -B tests/phase4_runner_lifecycle.py \
+                Lifecycle.test_operational_sink_failure_never_completes_window \
+                Lifecycle.test_start_expiring_during_seal_is_missed_and_unpublished
+            done
+          done
+      - name: synthetic operational readiness and status regressions
+        env:
+          TMPDIR: ${{ runner.temp }}
+          PYTHONDONTWRITEBYTECODE: "1"
+          POLY_SHADOW_TEST_PYTHON_312: ${{ steps.py312.outputs.python-path }}
+          POLY_SHADOW_TEST_PYTHON_314: ${{ steps.py314.outputs.python-path }}
+        run: |
+          "$POLY_SHADOW_TEST_PYTHON_312" -B -m unittest discover -s tests -p '*.py' -v
+          "$POLY_SHADOW_TEST_PYTHON_314" -B -m unittest discover -s tests -p '*.py' -v
+      # PHASE2_REMOVAL_PLAN §6: static dependency / network-client /
+      # signing-API guard.
+      - run: node scripts/static-safety.mjs
+      # Bounded zero-credential smoke: set-but-empty banned var must refuse.
+      - name: smoke — empty PRIVATE_KEY refuses startup
+        run: |
+          set +e
+          PRIVATE_KEY='' SHADOW_WATCHED_WALLETS=0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029 \
+            npx tsx src/shadow/main.ts > /tmp/smoke1.log 2>&1
+          code=$?
+          set -e
+          [ $code -ne 0 ] && grep -q CredentialGuardError /tmp/smoke1.log
+      # Bounded smoke: no watched wallets must refuse.
+      - name: smoke — missing watched wallets refuses startup
+        run: |
+          set +e
+          npx tsx src/shadow/main.ts > /tmp/smoke2.log 2>&1
+          code=$?
+          set -e
+          [ $code -ne 0 ] && grep -q SHADOW_WATCHED_WALLETS /tmp/smoke2.log
+
+  sample:
+    needs: [reserve, offline]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
       - run: npm ci --ignore-scripts
-      - name: Offline gates before any public request
-        run: |
-          npm run build
-          node node_modules/vitest/vitest.mjs run tests/v2-cursor-research.test.ts
-          npm run safety
-      - name: One bounded public campaign (no credentials, no production state)
+      - name: Exactly one corrected bounded public campaign
         env:
           GITHUB_EVENT_ACTION: ${{ github.event.action }}
+          CAMPAIGN_LABEL: ${{ github.event.label.name }}
+          CAMPAIGN_ID: POLY_SHADOW_CORRECTED_V2_EVIDENCE_CAMPAIGN_V1_1
+          CAMPAIGN_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: node --max-old-space-size=128 --import tsx research/v2-cursor-v1/campaign.mts
-      - name: Offline raw-evidence replay and manifest verification
-        run: node --max-old-space-size=128 --import tsx research/v2-cursor-v1/replay.mts
+      - name: Mandatory raw, clock, publication, checkpoint and resource audit
+        run: node --max-old-space-size=128 --import tsx research/v2-corrected-v1-1/audit.mts
+      - name: Exact offline replay of durable timestamps and summary
+        run: node --max-old-space-size=128 --import tsx research/v2-cursor-v1/replay.mts research/v2-corrected-v1-1/evidence
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: v2-bounded-evidence-v1
-          path: research/v2-cursor-v1/evidence
+          name: corrected-v2-evidence-v1-1
+          path: |
+            research/v2-corrected-v1-1/evidence
+            research/v2-corrected-v1-1/audit-output
           retention-days: 30
           if-no-files-found: error
