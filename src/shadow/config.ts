@@ -8,6 +8,8 @@
  * ignoring it.
  */
 
+import {WALLETS} from '../../research/v2-cursor-v1/adapter.js';
+
 const BANNED_ENV_VARS = [
   'PRIVATE_KEY',
   'CLOB_API_KEY',
@@ -65,6 +67,7 @@ export interface ShadowConfig {
   /** Independently justified bounded cadences (measured, not Poly2's). */
   tradesPollMs: number;
   activityPollMs: number;
+  v2Cursor?: boolean;
 }
 
 function parseWallets(csv: string | undefined): Set<string> {
@@ -86,7 +89,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ShadowConfig {
     throw new Error('SHADOW_WATCHED_WALLETS is empty — nothing to observe');
   }
 
+  if (env.SHADOW_V2_CURSOR !== undefined && !['true','false'].includes(env.SHADOW_V2_CURSOR)) throw Error('Invalid SHADOW_V2_CURSOR');
+  const v2Cursor = env.SHADOW_V2_CURSOR === 'true';
+  if (v2Cursor && (watchedWallets.size !== WALLETS.length || WALLETS.some(w => !watchedWallets.has(w)))) throw Error('V2 requires exact approved five-wallet cohort');
+
   return {
+    v2Cursor,
     chainId: 137,
     polygonHttpRpcUrl: env.POLYGON_HTTP_RPC_URL ?? 'https://polygon-bor-rpc.publicnode.com',
     polygonWsRpcUrl: env.POLYGON_WS_RPC_URL ?? 'wss://polygon-bor-rpc.publicnode.com',

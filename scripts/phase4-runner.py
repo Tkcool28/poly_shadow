@@ -898,7 +898,8 @@ def runtime_env(target):
     return {'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8',
             'HOME': str(target / 'runtime-home'), 'TMPDIR': str(target / 'runtime-home'),
             'XDG_RUNTIME_DIR': '/run/user/' + str(os.getuid()),
-            'SHADOW_WATCHED_WALLETS': ','.join(WALLETS), 'SHADOW_DATA_DIR': str(target / 'shadow-data')}
+            'SHADOW_WATCHED_WALLETS': ','.join(WALLETS), 'SHADOW_DATA_DIR': str(target / 'shadow-data'),
+            'SHADOW_V2_CURSOR': 'true'}
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

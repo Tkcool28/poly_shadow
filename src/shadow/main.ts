@@ -17,6 +17,7 @@ import { loadConfig } from './config.js';
 import { ShadowStore } from './storage.js';
 import { ChainWatcher } from './watcher.js';
 import { RacingStore, Reconciler, publishChainObservation } from './racing.js';
+import { pacedV2RestGet } from './egress.js';
 import { RestPoller } from './rest-poller.js';
 import { startMemoryPublisher } from './runtime-memory.js';
 import { selfToken } from './memory.js';
@@ -48,24 +49,31 @@ async function main(): Promise<void> {
 
   let trades: RestPoller | undefined;
   let activity: RestPoller | undefined;
+  let v2Trades:RestPoller|undefined,v2Activity:RestPoller|undefined;
   let stopMemory=()=>{};
+  let stopRest=()=>{trades?.stop();activity?.stop();v2Trades?.stop();v2Activity?.stop();};
   installSinkFailureControl(operational,cfg.dataDir,()=>{
     process.exitCode=74;
     // Reserved operational failure exit is independent of diagnostic disk IO.
     setImmediate(()=>process.exit(74));
-    stopMemory(); watcher.stop(); trades?.stop(); activity?.stop();
+    stopMemory(); watcher.stop(); stopRest();
   });
   const initializePollers=()=>{
+    const fetchRest=cfg.v2Cursor?pacedV2RestGet():undefined;
     trades = new RestPoller({
       source: 'REST_TRADES', endpoint: 'trades',
       baseUrl: cfg.dataApiBaseUrl, wallets: cfg.watchedWallets,
       intervalMs: cfg.tradesPollMs,
-    }, racing, reconciler, undefined, undefined, operational);
+    }, racing, reconciler, undefined, fetchRest, operational);
     activity = new RestPoller({
       source: 'REST_ACTIVITY', endpoint: 'activity',
       baseUrl: cfg.dataApiBaseUrl, wallets: cfg.watchedWallets,
       intervalMs: cfg.activityPollMs,
-    }, racing, reconciler, undefined, undefined, operational);
+    }, racing, reconciler, undefined, fetchRest, operational);
+    if(cfg.v2Cursor){
+      v2Trades=new RestPoller({source:'REST_TRADES',endpoint:'trades',baseUrl:cfg.dataApiBaseUrl,wallets:cfg.watchedWallets,intervalMs:60000,v2:true},racing,reconciler,undefined,fetchRest,operational);
+      v2Activity=new RestPoller({source:'REST_ACTIVITY',endpoint:'activity',baseUrl:cfg.dataApiBaseUrl,wallets:cfg.watchedWallets,intervalMs:60000,v2:true},racing,reconciler,undefined,fetchRest,operational);
+    }
   };
 
   console.log('[poly-shadow] starting multi-source observation-only shadow', {
@@ -86,7 +94,7 @@ async function main(): Promise<void> {
 
   const shutdown = () => {
     try {
-      memoryPublisher.finish(()=>{trades?.stop();activity?.stop();watcher.stop();});
+      memoryPublisher.finish(()=>{stopRest();watcher.stop();});
     } finally { process.exit(operational.isUsable()?0:74); }
   };
   process.on('SIGINT', shutdown);
@@ -100,8 +108,22 @@ async function main(): Promise<void> {
     initializePollers();
     publishMemory();
     watcher.start();
-    trades!.start();
-    activity!.start();
+    trades!.start();activity!.start();
+    if(cfg.v2Cursor){
+      // A single sequential supplemental cohort cycle bounds both sources together. Each
+      // wallet/source retains an independent <=3-page, <=8-second traversal.
+      let busy=false,stopped=false;
+      const cycle=async()=>{
+        if(busy||stopped)return;
+        busy=true;
+        try{await v2Trades!.pollAll();if(!stopped)await v2Activity!.pollAll();}
+        catch{stopRest();}
+        finally{busy=false;}
+      };
+      const timer=setInterval(()=>void cycle(),60000);
+      stopRest=()=>{stopped=true;clearInterval(timer);trades?.stop();activity?.stop();v2Trades?.stop();v2Activity?.stop();};
+      void cycle();
+    }
   } catch (err) {
     // Operational evidence exists before index initialization; preserve startup
     // failure context without attempting any source or live action.
@@ -110,7 +132,7 @@ async function main(): Promise<void> {
       operational.quarantine({component:'STARTUP',source:null,sourceIdentity:null,rawEvidenceRef:null,rpcRequestId:null,errorClass:'INDEX_ERROR',reason:`startup index/reconciliation failure: ${String(err).slice(0,256)}`,eventIdentityKnown:false,wallet:null,txHash:null,logIdentity:null,affectedRange:null,scientificImpactPossible:true});
     } catch (sinkError) { err=sinkError; } // retain the first latched sink exception
     stopMemory();
-    trades?.stop(); activity?.stop(); watcher.stop();
+    stopRest(); watcher.stop();
     process.off('SIGINT', shutdown); process.off('SIGTERM', shutdown);
     store.close(); racing.close();
     throw err;
