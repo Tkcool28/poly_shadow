@@ -150,14 +150,23 @@ class MemoryHarness(unittest.TestCase):
     def test_poly2_config_inventory_and_heartbeat_are_read_only(self):
         calls=[]
         now=time.time()
+        config=dict(paper_mode=True,allow_live_trading=False,order_kill_switch=False,shadow_capture_enabled=False,max_order_size_usd=10,max_exposure_global_usd=200)
         def invoke(args,input=None,**kw):
             calls.append((args,input))
             if 'inspect' in args:return '\n'.join(json.dumps({'Name':'/'+n,'Id':n,'RestartCount':0,'State':{'Running':True,'Restarting':False,'OOMKilled':False,'StartedAt':'fixed'}}) for n in M.PROTECTED)
-            if '-c' in args and 'get_settings' in args[-1]:return json.dumps(dict(paper_mode=True,allow_live_trading=False,order_kill_switch=True,shadow_capture_enabled=False,max_order_size_usd=10,max_exposure_global_usd=200))
+            if '-c' in args and 'get_settings' in args[-1]:return json.dumps(config)
             if 'psql' in args[-1]:return json.dumps({'readOnly':'on','heartbeats':[{'service':s,'last_seen':M.utc(now-1)} for s in ('bot_alive','bot_success')]})
             return 'a'*40
         with mock.patch.object(M,'command',side_effect=invoke):v=M.poly2_snapshot()
         self.assertEqual(len(v['containers']),4)
+        for service in ('poly2-backend-1','poly2-bot-1'):
+            self.assertIs(v['config'][service]['order_kill_switch'],False)
+        for key,value in [('order_kill_switch',True),('paper_mode',False),('allow_live_trading',True),('shadow_capture_enabled',True)]:
+            with self.subTest(refused_setting=key):
+                original=config[key];config[key]=value
+                with mock.patch.object(M,'command',side_effect=invoke),self.assertRaisesRegex(M.Abort,'Poly2 paper/capture safety baseline refused'):
+                    M.poly2_snapshot()
+                config[key]=original
         sql=next(i for a,i in calls if i)
         self.assertIn('BEGIN TRANSACTION READ ONLY',sql);self.assertIn('ROLLBACK',sql)
         self.assertFalse(any('restart' in a or 'stop' in a or 'start' in a for a,i in calls))

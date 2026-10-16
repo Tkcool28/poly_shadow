@@ -125,7 +125,12 @@ activation, orders, configuration changes or service restarts are performed.
    This PR does not measure available VPS RAM/disk or authorize stopping workloads.
 4. No existing Shadow observer/test; no overlapping scheduled Shadow launch.
    Shared owner lock/orphan checks must pass. Approved Poly2 remains normal PAPER,
-   live disabled, kill switch engaged, capture disabled. No capture installation or
+   live disabled, PAPER order kill switch **false**, capture disabled. The intended
+   settings are `POLYCOPY_PAPER_MODE=true`, `POLYCOPY_ALLOW_LIVE_TRADING=false`,
+   `POLYCOPY_ORDER_KILL_SWITCH=false`, and `POLYCOPY_SHADOW_CAPTURE_ENABLED=false`.
+   The false kill switch permits autonomous PAPER BUYs and SELLs; live trading
+   remains independently disabled. A true kill switch fails preflight.
+   No capture installation or
    scientific authority is needed or permitted for this memory test.
 5. Local Docker socket read access to the existing fixed Poly2 backend/bot/Postgres/
    Redis containers and read-only heartbeat probe is required. Baseline service,

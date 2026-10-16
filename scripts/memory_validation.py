@@ -207,7 +207,7 @@ def poly2_snapshot():
     for service in ('poly2-bot-1', 'poly2-backend-1'):
         code = "import json;from polycopy.config import get_settings;s=get_settings();print(json.dumps({k:getattr(s,k) for k in ['paper_mode','allow_live_trading','order_kill_switch','shadow_capture_enabled','max_order_size_usd','max_exposure_global_usd']}))"
         c = json.loads(command(docker + ['exec', service, 'python', '-c', code]))
-        require(c['paper_mode'] is True and c['allow_live_trading'] is False and c['order_kill_switch'] is True
+        require(c['paper_mode'] is True and c['allow_live_trading'] is False and c['order_kill_switch'] is False
                 and c['shadow_capture_enabled'] is False, 'Poly2 paper/capture safety baseline refused')
         config[service] = c
     sql = "BEGIN TRANSACTION READ ONLY; SELECT json_build_object('readOnly',current_setting('transaction_read_only'),'heartbeats',(SELECT json_agg(row_to_json(h)) FROM (SELECT service,max(seen_at) AS last_seen FROM service_heartbeats WHERE service IN ('bot_alive','bot_success') GROUP BY service) h)); ROLLBACK;"
