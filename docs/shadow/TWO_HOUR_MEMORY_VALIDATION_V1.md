@@ -62,8 +62,8 @@ npm. Any safety failure before GO means **no acquisition launch**. Limits, inode
 manager binding/identity and resource properties are checked every 10s, without
 silently repairing changed controls.
 
-Normal abort/deadline cleanup tries manager kill for the captured exact scope,
-then descriptor/inode-verified `cgroup.kill`, and always the reviewed reserved
+Normal abort/deadline cleanup first uses descriptor/inode-verified `cgroup.kill`,
+then manager kill for the captured exact scope, and always the reviewed reserved
 child/process-group cleanup independently of manager errors. The cgroup includes
 new-session/reparented descendants. Empty cgroup + no live owned group are required;
 cleanup control failures cannot certify completion. Guardian SIGKILL causes systemd
@@ -84,6 +84,7 @@ never represented as a complete tree sum. Process counts and read sizes are boun
 Observer stdout/stderr is drained into a separate log capped at16 MiB.
 
 Summary includes measured startup/GO/exec attempt/shutdown times, stop reason and
+terminal local host/disk/cgroup-event and early-exit checks before intentional kill,
 cleanup proof, phase sample counts/spans, first/last memory values and growth,
 peaks, minimum host MemAvailable and evidence growth. A request to exec is not proof
 of first source observation; acquisition activity retains its own existing clocks.

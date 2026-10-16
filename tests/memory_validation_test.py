@@ -251,5 +251,20 @@ class MemoryHarness(unittest.TestCase):
         with self.assertRaises(M.Abort):M.kill_leaf(leaf,(0,0))
         self.assertEqual(M.tagged({'evidenceBoundary':'wrong'})['evidenceBoundary'],M.LABEL)
 
+    def test_terminal_interval_failures_cannot_certify_success(self):
+        leaf=self.root/'leaf';leaf.mkdir()
+        events=leaf/'memory.events';events.write_text('max 0\noom 0\noom_kill 0\n')
+        manifest={'preflight':{'host':host()}}
+        with mock.patch.object(M,'leaf_controls'),mock.patch.object(T,'host_snapshot',return_value=host()),mock.patch.object(T,'disk_snapshot',return_value={'freeBytes':30*T.GIB}),mock.patch.object(M.R,'child_exited',return_value=False) as exited:
+            args=(self.root,manifest,mock.Mock(),leaf,(1,2),{'max':0,'oom':0,'oom_kill':0},0)
+            self.assertIn('memoryEvents',M.terminal_check(*args))
+            events.write_text('max 0\noom 1\noom_kill 0\n')
+            with self.assertRaisesRegex(M.Abort,'OBSERVER_OOM'):M.terminal_check(*args)
+            events.write_text('max 0\noom 0\noom_kill 0\n');exited.return_value=True
+            with self.assertRaisesRegex(M.Abort,'OBSERVER_EARLY_EXIT'):M.terminal_check(*args)
+            events.unlink()
+            with self.assertRaises(FileNotFoundError):M.terminal_check(*args)
+
+
 
 if __name__ == '__main__':unittest.main()

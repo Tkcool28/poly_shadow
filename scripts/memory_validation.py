@@ -304,6 +304,11 @@ def cleanup(child, token, scope, scope_invocation, leaf, end_wall, inode=None):
     group_gone = child is None
     if child is not None:
         try:
+            if leaf and leaf.exists() and inode is not None:
+                kill_leaf(leaf,inode)
+        except BaseException as exc:
+            errors.append('LEAF_KILL_' + type(exc).__name__)
+        try:
             s = unit_state(scope)
             if s.get('LoadState') == 'loaded' and s.get('ActiveState') in ('active','activating','deactivating'):
                 require(s.get('Id') == scope, 'Cleanup scope name changed')
@@ -320,11 +325,6 @@ def cleanup(child, token, scope, scope_invocation, leaf, end_wall, inode=None):
                 require(s.get('LoadState') == 'not-found' or s.get('ActiveState') in ('inactive','failed'), 'Scope state unknown')
         except BaseException as exc:
             errors.append('MANAGER_' + type(exc).__name__)
-        try:
-            if leaf and leaf.exists() and inode is not None:
-                kill_leaf(leaf,inode)
-        except BaseException as exc:
-            errors.append('LEAF_KILL_' + type(exc).__name__)
         # This attempt is independent of *every* manager/cgroup operation above.
         try:
             require(token is not None, 'Direct-child ownership unavailable')
@@ -343,6 +343,22 @@ def cleanup(child, token, scope, scope_invocation, leaf, end_wall, inode=None):
         empty = True
     return {'complete':bool(group_gone and empty and not errors),'ownedProcessGroupGone':group_gone,
             'observerCgroupEmpty':empty,'errors':errors,'completedUtc':utc()}
+
+
+def terminal_check(directory, manifest, child, leaf, inode, initial_events, psi_streak):
+    """Local bounded reads before intentional kill; never certify an unchecked tail."""
+    require(child is not None and leaf is not None and initial_events is not None,
+            'TERMINAL_OBSERVER_UNVERIFIABLE')
+    leaf_controls(leaf, inode)
+    events = T.pairs(T.bounded(leaf / 'memory.events'))
+    require(all(k in events for k in ('max', 'oom', 'oom_kill')), 'TERMINAL_EVENTS_UNVERIFIABLE')
+    host = T.host_snapshot()
+    disk = T.disk_snapshot(directory)
+    failure, _ = T.pressure_failure(host, manifest['preflight']['host'], disk,
+                                   {'events': events}, initial_events, psi_streak)
+    require(not failure, failure or 'TERMINAL_PRESSURE')
+    require(not R.child_exited(child), 'OBSERVER_EARLY_EXIT')
+    return {'utc':utc(), 'host':host, 'disk':disk, 'memoryEvents':events}
 
 
 def supervise(directory, manifest):
@@ -495,7 +511,12 @@ def supervise(directory, manifest):
     except Abort as exc:
         receipt['failure'] = str(exc)
         if str(exc) == 'DEADLINE' and receipt['actualObserverAuthorizedUtc']:
-            receipt.update(status='COMPLETE', failure=None)
+            try:
+                receipt['terminalSafety'] = terminal_check(directory, manifest, child, leaf, inode, initial_events, psi_streak)
+                require(last_sample == int((DURATION - .000001) // CADENCE), 'INCOMPLETE_TELEMETRY')
+                receipt.update(status='COMPLETE', failure=None)
+            except BaseException as terminal:
+                receipt.update(status='FAILED', failure=str(terminal) if isinstance(terminal, Abort) else 'TERMINAL_' + type(terminal).__name__)
     except BaseException as exc:
         receipt['failure'] = type(exc).__name__
     finally:

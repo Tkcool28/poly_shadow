@@ -45,6 +45,9 @@ def dummy(directory,mode):
         'controlGroup':'/fixture/scope','inode':[1,2]})
     while not (directory/'observer-go.json').exists():time.sleep(.005)
     if mode=='early':return
+    if mode=='end-oom':
+        while time.time()<json.loads((directory/'fixture-clock.json').read_text())['end']-.08:time.sleep(.005)
+        (directory/'leaf/memory.events').write_text('max 0\noom 1\noom_kill 0\n')
     while True:time.sleep(.05)
 
 
@@ -61,6 +64,7 @@ def fixture(directory,mode):
     manifest={'launcherToken':parent,'startWall':start,'startMono':mono,'startUtc':M.utc(start),
               'deadlineUtc':M.utc(start+M.DURATION),'bootId':M.T.bounded(Path('/proc/sys/kernel/random/boot_id')).strip(),
               'preflight':{'host':h,'poly2':poly},'shadowSha':'a'*40}
+    write(directory/'fixture-clock.json',{'end':start+M.DURATION})
     write(directory/'guard-token.json',M.R.proc(os.getpid()))
     def snapshot():
         now=dict(h)
@@ -159,7 +163,7 @@ class MemoryLifecycle(unittest.TestCase):
         self.assertTrue(report['cleanup']['observerCgroupEmpty']);self.assert_no_observer()
 
     def test_early_exit_oom_and_host_pressure_are_failures(self):
-        for mode,reason in [('early','OBSERVER_EARLY_EXIT'),('oom','OBSERVER_OOM'),('pressure','HOST_MEMAVAILABLE')]:
+        for mode,reason in [('early','OBSERVER_EARLY_EXIT'),('oom','OBSERVER_OOM'),('pressure','HOST_MEMAVAILABLE'),('end-oom','OBSERVER_OOM')]:
             with self.subTest(mode=mode):
                 # Each mode gets exclusively new fixture files.
                 self.directory=Path(self.tmp.name)/('memory-'+mode);self.directory.mkdir()
