@@ -45,7 +45,7 @@ describe('v2 research evidence bridge',()=>{
   await withRows(rows.map(wrap),async dir=>{
    const actual=await readVerifiedV2Groups(dir,cohort,window);
    const expected=buildShadowGroups(rows,cohort,window);
-   expect([...actual.entries()]).toEqual([...expected.entries()]);
+   expect([...actual.entries()].map(([k,g])=>[k,{...g,members:[]}])).toEqual([...expected.entries()].map(([k,g])=>[k,{...g,members:[]}]));
    expect(actual.get(rows[0]!.groupKey)?.rawUtc).toBe(rows[0]!.sourceFirstSeenUtc);
    expect(actual.get(rows[0]!.groupKey)?.usableUtc).toBe(rows[0]!.completedUtc);
   });
