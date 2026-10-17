@@ -14,7 +14,7 @@
  */
 
 import {page as decodeV2Page, filters as v2Filters, LIMITS, WALLETS} from '../../research/v2-cursor-v1/adapter.js';
-import { restGet, RestRequestSkipped } from './egress.js';
+import { restGet, RestRequestSkipped, RestTransportError } from './egress.js';
 import {statSync,statfsSync} from 'node:fs';
 import {join} from 'node:path';
 import {storagePlan} from './storage-budget.js';
@@ -182,7 +182,8 @@ export class RestPoller {
           }catch(error){outcome='PUBLICATION_FAILURE';stopReason='V2_RESOURCE_GATE';recordQuarantine(null,'PUBLICATION_ERROR',String(error),pollId);throw error;}
         }
         if(this.opts.v2 && Date.now()+LIMITS.requestMs>deadline){stopReason='TIME_BUDGET';break;}
-        const requestUrl=this.url(wallet,offset,cursor,end);let requestStartUtc=this.nowIso();
+        const requestUrl=this.url(wallet,offset,cursor,end),queueIntentUtc=this.nowIso();let requestStartUtc=queueIntentUtc;
+        let scheduling:unknown=null,rateLimitHeaders:Record<string,string>={},requestStartEvidence='FETCH_BOUNDARY_FALLBACK';
         const requestParams=Object.fromEntries(new URL(requestUrl).searchParams);
         let status:number|null=null,responseUtc:string|null=null;
         let headers:Record<string,unknown>={age:null,cacheControl:null,etag:null,date:null};
@@ -195,7 +196,8 @@ export class RestPoller {
         const ids:string[]=[];
         try {
           const res=this.opts.v2 ? await this.fetchFn(requestUrl,LIMITS.requestMs,LIMITS.body,deadline) : await this.fetchFn(requestUrl);
-          if(this.opts.v2 && res.requestStartUtc)requestStartUtc=res.requestStartUtc;
+          if(res.requestStartUtc){requestStartUtc=res.requestStartUtc;requestStartEvidence='TRANSPORT';}
+          scheduling=res.scheduling??null;rateLimitHeaders=res.rateLimitHeaders??{};
           responseUtc=res.responseUtc ?? this.nowIso();status=res.status;headers={...headers,...res.headers};
           if(status!==200){pageOutcome='HTTP_FAILURE';error=`HTTP ${status}`;}
           else if(res.bodyError){pageOutcome=res.bodyError.outcome;error=res.bodyError.message;}
@@ -211,7 +213,10 @@ export class RestPoller {
           }
           else if(!Array.isArray(res.body)){pageOutcome='PARSE_FAILURE';error=res.parseError??'malformed REST non-array body';}
           else {items=res.body;pageOutcome=items.length?'SUCCESS_NONEMPTY':'SUCCESS_EMPTY';}
-        } catch(err){if(err instanceof RestRequestSkipped){outcome='SKIPPED';stopReason=err.message;return;}responseUtc ??=this.nowIso();error=String(err);pageOutcome=OperationalEvidence.errorClass(err)==='TIMEOUT'?'TIMEOUT':err instanceof SyntaxError||this.opts.v2&&status===200?'PARSE_FAILURE':'HTTP_FAILURE';}
+        } catch(err){if(err instanceof RestRequestSkipped){outcome='SKIPPED';stopReason=err.message;
+          const skippedRequest={queueIntentUtc,requestUrl,requestStartUtc:null,responseUtc:null,httpStatus:null,scheduling:err.scheduling??null,reason:err.message};
+          lastReceipt={...lastReceipt,...(pages===0?skippedRequest:{}),skippedRequest};return;}
+          if(err instanceof RestTransportError){requestStartUtc=err.requestStartUtc;requestStartEvidence='TRANSPORT';scheduling=err.scheduling??null;}responseUtc ??=this.nowIso();error=String(err);pageOutcome=OperationalEvidence.errorClass(err)==='TIMEOUT'?'TIMEOUT':err instanceof SyntaxError||this.opts.v2&&status===200?'PARSE_FAILURE':'HTTP_FAILURE';}
         this.operational?.assertUsable();
         if(error)recordQuarantine(null,status===429?'HTTP_429':status===503?'HTTP_503':pageOutcome==='TIMEOUT'?'TIMEOUT':pageOutcome==='PARSE_FAILURE'?'MALFORMED_PAYLOAD':'HTTP_FAILURE',error,pollId);
         // Validate the entire bounded page before publication. A malformed item
@@ -279,7 +284,7 @@ export class RestPoller {
         // Coverage limitations are aggregated from successful page receipts, not operational failures.
         // Failures above still quarantine; every page/poll remains UNKNOWN_UNPROVEN.
         lastReceipt={recordType:'REST_PAGE',pollId,pageIndex:page,source:this.opts.source,wallet,
-          requestUrl,requestParams,offset,limit,requestStartUtc,responseUtc,httpStatus:status,cacheHeaders:headers,
+          requestUrl,requestParams,offset,limit,queueIntentUtc,requestStartUtc,requestStartEvidence,responseUtc,httpStatus:status,cacheHeaders:headers,rateLimitHeaders,scheduling,
           outcome:pageOutcome,error,itemCount:items.length,atApiLimit:capped,orderingEvidence:'Returned order only; no snapshot or cross-poll watermark proof',
           overlap:overlapState,firstIdentity:ids[0]??null,lastIdentity:ids.at(-1)??null,
           firstTimestamp:(items[0] as Record<string,unknown>|null)?.timestamp??null,lastTimestamp:(items.at(-1) as Record<string,unknown>|null)?.timestamp??null,

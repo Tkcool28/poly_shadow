@@ -48,8 +48,10 @@ At 900s the guardian creates an inert observer scope entry with:
 - Reviewed own-leaf/ancestor verification; `memory.oom.group=1` written and read back.
 - BindsTo + After the exact guardian service; KillMode=control-group,
   KillSignal=SIGKILL, TimeoutStopSec=2, with manager readback before GO.
-- A conservative finite scope RuntimeMaxSec<=6300 as a **coarse** last-resort cap.
-  It is not represented as the absolute test deadline; the live guardian's frozen
+- A conservative finite scope RuntimeMaxSec<=6330 as a **coarse** last-resort cap.
+  Its launch-time bound is remaining acquisition time +30s, preventing a race
+  with normal deadline cleanup. It never extends the absolute 7200s acquisition
+  deadline enforced by the independent guardian. It is not represented as that deadline; the live guardian's frozen
   dual clocks/alarm enforce that, while guardian termination immediately stops the
   bound scope. An externally SIGSTOP-frozen guardian is not a claimed termination
   test; kernel/manager loss is not a recoverable certified result.
@@ -66,7 +68,11 @@ Normal abort/deadline cleanup first uses descriptor/inode-verified `cgroup.kill`
 then manager kill for the captured exact scope, and always the reviewed reserved
 child/process-group cleanup independently of manager errors. The cgroup includes
 new-session/reparented descendants. Empty cgroup + no live owned group are required;
-cleanup control failures cannot certify completion. Guardian SIGKILL causes systemd
+cleanup control failures cannot certify completion. A manager kill error alone
+may be benign only after readback proves the captured scope inactive (same
+incarnation) or gone, the verified own cgroup empty/gone, the owned process group
+gone and the direct child exited. This race proof is recorded in the summary;
+unknown, replaced or active scope and missing ownership/empty proof fail closed. Guardian SIGKILL causes systemd
 to terminate the bound observer scope independently; the surviving launcher records
 a failed fallback summary if the guardian cannot report. No process-name kills.
 
@@ -75,7 +81,8 @@ a failed fallback summary if the guardian cannot report. No process-name kills.
 A sample is due every 10s from test start. Missed slots are recorded and invalidate
 completion. JSONL is exclusive, fsynced and capped at 721 rows x64 KiB. Each row
 includes phase, actual UTC/elapsed time, observer tree RSS/PSS availability, cgroup
-current/peak/swap/events, host MemAvailable/swap/PSI/OOM counter, top12 readable
+current/peak/swap/events and the six bounded memory.stat byte categories
+active_file/inactive_file/file_mapped/shmem/file_dirty/file_writeback, host MemAvailable/swap/PSI/OOM counter, top12 readable
 other processes >=64 MiB RSS (no argv/environment), filesystem free/capacity,
 selected evidence/journal + SQLite WAL/SHM byte growth, acquisition/failure counters
 from the existing runtime snapshot, and cached read-only Poly2 health with age.
