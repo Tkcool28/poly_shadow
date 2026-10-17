@@ -10,8 +10,10 @@
     "start": "tsx src/shadow/main.ts",
     "safety": "node scripts/static-safety.mjs",
     "metrics": "node scripts/multisource-metrics.mjs",
-    "compare": "tsx src/compare/cli.ts",
-    "dashboard": "tsx src/compare/dashboard.ts"
+    "compare": "tsx src/compare/stage1-cli.ts",
+    "dashboard": "tsx src/compare/dashboard.ts",
+    "compare:v1-history": "tsx src/compare/cli.ts",
+    "stage1:monitor": "node --max-old-space-size=192 --import tsx src/compare/live-monitor-cli.ts"
   },
   "license": "MIT",
   "dependencies": {

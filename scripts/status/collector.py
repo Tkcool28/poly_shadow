@@ -20,6 +20,11 @@ _BUDGET = types.ModuleType('status_storage_budget')
 _BUDGET.__file__ = str(_BUDGET_PATH)
 exec(compile(_BUDGET_PATH.read_bytes(), str(_BUDGET_PATH), 'exec', dont_inherit=True), _BUDGET.__dict__)
 
+_LIVE_PATH = Path(__file__).with_name('live_match.py')
+_LIVE = types.ModuleType('stage1_live_match')
+_LIVE.__file__ = str(_LIVE_PATH)
+exec(compile(_LIVE_PATH.read_bytes(), str(_LIVE_PATH), 'exec', dont_inherit=True), _LIVE.__dict__)
+
 import stat
 import sys
 import tempfile
@@ -389,6 +394,7 @@ def unbound_status(now, state):
             'scope': 'Operational status only; no observer activation.',
             'window': {k: None for k in ('startUtc', 'endUtc', 'startMdt', 'endMdt', 'elapsedSeconds', 'remainingSeconds', 'startsInSeconds', 'durationSeconds')},
             'processes': {k: process_status({}) for k in ('runner', 'guardian', 'observer')},
+            'stage1LiveMatches': {'state':'COMPARISON_NOT_AUTHORIZED','authorization':False,'provisional':True,'certified':False,'counts':None,'recent':[]},
             'memory': unknown_memory(), 'terminal': {'restartCount': None, 'classification': None, 'exitReason': None, 'bindingValid': False},
             'heartbeat': {'latestUtc': None, 'ageSeconds': None},
             'evidence': {'files': [], 'totalBytes': None, 'growthBytes': None, 'sampleSeconds': None},
@@ -759,6 +765,7 @@ def collect(run=None, now=None, cache_path=CACHE, health_provider=production_hea
             'evidence': {'files': inventory, 'totalBytes': total, 'requiredBytes': required_total, 'growthBytes': growth, 'sampleSeconds': sample_seconds,
                          'scope': 'total: all regular direct shadow-data files, stat-only; growth: four required files only; shared sizes are not per-source counts; CHAIN raw stat-only'},
             'sources': sources, 'quarantine': quarantine_summary, 'operations': operations, 'poly2Operations': poly2_operations,
+            'stage1LiveMatches': _LIVE.refresh(run, cache_path, utc(now)) if not context['explicit'] else {'state':'HISTORICAL_VIEW_NOT_LIVE','provisional':True,'certified':False,'counts':None,'recent':[]},
             'poly2': health, 'poly2ComparisonCapture': poly2_capture_status(run, START, END, now, context['window']),
             'disk': dict(disk_quality, warningThresholdBytes=10*1024**3),
             'boundedReads': {'maxBytesPerEvidenceFile': LIMIT, 'heartbeatBytes': heartbeat_read, 'sourceObservationBytes': obs_read,
