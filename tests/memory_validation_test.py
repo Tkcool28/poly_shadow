@@ -77,7 +77,7 @@ class MemoryHarness(unittest.TestCase):
         self.assertIn('--scope',cmd)
         for s in ('MemoryMax=4294967296','MemoryHigh=3221225472','MemorySwapMax=536870912',
                   'BindsTo=poly-shadow-memory-a.service','After=poly-shadow-memory-a.service',
-                  'KillSignal=SIGKILL','KillMode=control-group','TimeoutStopSec=2','RuntimeMaxSec=6000.000000'):
+                  'KillSignal=SIGKILL','KillMode=control-group','TimeoutStopSec=2','RuntimeMaxSec=6030.000000'):
             self.assertIn('--property='+s,cmd)
         self.assertNotIn('timeout',cmd)
         self.assertNotIn('npm',cmd)
@@ -248,7 +248,53 @@ class MemoryHarness(unittest.TestCase):
         with mock.patch.object(M,'unit_state',return_value=s),mock.patch.object(M,'command') as call,mock.patch.object(M.R,'stop_owned',return_value=True):
             result=M.cleanup(child,{'pid':123},'scope','a'*32,None,100)
         self.assertTrue(any('--signal=KILL' in c.args[0] for c in call.mock_calls))
-        self.assertFalse(result['observerCgroupEmpty'])  # active scope still lacks empty proof
+        self.assertFalse(result['observerCgroupEmpty'])  # no retained leaf lacks empty proof
+
+    def test_manager_abort_race_requires_all_independent_stop_proofs(self):
+        leaf=self.root/'leaf';leaf.mkdir();(leaf/'cgroup.procs').write_text('')
+        inode=(leaf.stat().st_dev,leaf.stat().st_ino)
+        active=scope()
+        for final,group_gone,exited,pids,expected in [
+            ({'LoadState':'not-found'},True,0,[],True),
+            ({**active,'ActiveState':'inactive'},True,0,[],True),
+            ({**active,'ActiveState':'failed'},True,0,[],True),
+            (active,True,0,[],False),
+            ({**active,'ActiveState':'inactive','InvocationID':'b'*32},True,0,[],False),
+            ({'LoadState':'not-found'},False,0,[],False),
+            ({'LoadState':'not-found'},True,None,[],False),
+            ({'LoadState':'not-found'},True,0,[123],False),
+        ]:
+            with self.subTest(final=final,group_gone=group_gone,exited=exited,pids=pids):
+                child=mock.Mock();child.poll.return_value=exited
+                with mock.patch.object(M,'unit_state',side_effect=[active,final]),mock.patch.object(M,'command',side_effect=M.Abort('unit vanished during kill')),mock.patch.object(M,'kill_leaf'),mock.patch.object(M.R,'stop_owned',return_value=group_gone),mock.patch.object(T,'cgroup_pids',return_value=pids),mock.patch.object(M.time,'monotonic',side_effect=[0,3]):
+                    result=M.cleanup(child,{'pid':123},'scope','a'*32,leaf,100,inode)
+                self.assertEqual(result['complete'],expected,result)
+                self.assertEqual(result['benignManagerKillRace'],expected)
+                self.assertEqual(result['managerKillError'],'MANAGER_Abort')
+                if not expected:self.assertIn('MANAGER_Abort',result['errors'])
+
+    def test_manager_race_without_verified_leaf_inode_fails_closed(self):
+        leaf=self.root/'absent-leaf';child=mock.Mock();child.poll.return_value=0
+        with mock.patch.object(M,'unit_state',side_effect=[scope(),{'LoadState':'not-found'}]),mock.patch.object(M,'command',side_effect=M.Abort('unit gone')),mock.patch.object(M.R,'stop_owned',return_value=True):
+            result=M.cleanup(child,{'pid':123},'scope','a'*32,leaf,100,None)
+        self.assertFalse(result['complete']);self.assertIn('MANAGER_Abort',result['errors'])
+
+    def test_bounded_memory_stat_categories_preserve_existing_telemetry(self):
+        leaf=self.root/'memory-leaf';leaf.mkdir();(leaf/'cgroup.procs').write_text('')
+        for name,value in [('memory.current','101'),('memory.peak','202'),('memory.swap.current','3'),('memory.events','max 0\noom 0\noom_kill 0')]:
+            (leaf/name).write_text(value)
+        values={k:i+10 for i,k in enumerate(T.MEMORY_STAT_CATEGORIES)}
+        (leaf/'memory.stat').write_text('\n'.join(f'{k} {v}' for k,v in values.items())+'\nanon 999\nunknown_category 123')
+        snapshot=T.observer_snapshot(leaf)
+        self.assertEqual(snapshot['memoryStatBytes'],values)
+        self.assertEqual(snapshot['memoryCurrentBytes'],101);self.assertEqual(snapshot['memoryPeakBytes'],202)
+        self.assertEqual(snapshot['swapCurrentBytes'],3);self.assertEqual(snapshot['events']['oom'],0)
+        self.assertTrue(snapshot['rssComplete']);self.assertEqual(snapshot['treePssBytes'],0)
+        (leaf/'memory.stat').write_text('active_file 1')
+        with self.assertRaises(KeyError):T.observer_snapshot(leaf)
+        (leaf/'memory.stat').write_text('x'*16385)
+        with self.assertRaises(ValueError):T.observer_snapshot(leaf)
+
 
     def test_owned_leaf_kill_descriptor_and_wrong_inode_refusal(self):
         leaf=self.root/'leaf';leaf.mkdir();(leaf/'cgroup.kill').write_text('0')

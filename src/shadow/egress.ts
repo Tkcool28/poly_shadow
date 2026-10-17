@@ -58,6 +58,8 @@ export interface RestGetResult {
   /** Freshness/cache headers when exposed (CDN cache behavior is measured). */
   headers: { age: string | null; cacheControl: string | null; etag: string | null; date: string | null };
   body: unknown;
+  rateLimitHeaders?: Record<string, string>;
+  scheduling?: RestScheduleEvidence;
   /** Full bounded body arrival, sampled before JSON parsing. */
   responseUtc?: string;
   requestStartUtc?: string;
@@ -71,12 +73,13 @@ export async function restGet(url: string, timeoutMs = 15_000, maxBodyBytes = RE
   assertAllowedUrl(url, []);
   if (!Number.isInteger(maxBodyBytes) || maxBodyBytes < 1 || maxBodyBytes > REST_MAX_BODY_BYTES) throw Error('REST body budget');
   const requestStartUtc = new Date().toISOString();
-  const res = await fetch(url, {
+  let res: Response;
+  try { res = await fetch(url, {
     method: 'GET',
     redirect: 'error',
     headers: { Accept: 'application/json' },
     signal: AbortSignal.timeout(timeoutMs),
-  });
+  }); } catch (error) { throw new RestTransportError(String(error).slice(0,512), requestStartUtc); }
   // Bound transport memory too: page/item validation alone happens too late.
   const reader=res.body?.getReader();
   const boundedBody=Buffer.alloc(maxBodyBytes);let bytes=0,body:unknown=null,parseError:string|undefined;
@@ -97,6 +100,7 @@ export async function restGet(url: string, timeoutMs = 15_000, maxBodyBytes = RE
     status: res.status,
     responseUtc,
     requestStartUtc,
+    rateLimitHeaders: rateLimitHeaders(res.headers),
     headers: {
       age: res.headers.get('age'),
       cacheControl: res.headers.get('cache-control'),
@@ -109,35 +113,100 @@ export async function restGet(url: string, timeoutMs = 15_000, maxBodyBytes = RE
   };
 }
 
-/** Scheduling limits are receipted as skips, never provider failures. */
-export class RestRequestSkipped extends Error {}
+/** Only fixed provider rate-limit fields, at most 9 x 256 characters. */
+export function rateLimitHeaders(headers: Headers): Record<string,string> {
+  const result: Record<string,string> = {};
+  for (const name of ['retry-after','ratelimit-limit','ratelimit-remaining','ratelimit-reset',
+    'ratelimit-policy','x-ratelimit-limit','x-ratelimit-remaining','x-ratelimit-reset','x-ratelimit-reset-after']) {
+    const value=headers.get(name);
+    if(value!==null)result[name]=value.slice(0,256);
+  }
+  return result;
+}
 
-/** Shared legacy+v2 budget: one HTTP request at a time, >=500ms start
- * spacing, <=60 starts/minute. Reserve 40 starts for existing legacy cadences;
- * supplemental cursors may use at most 20. No retries after host denial. */
+export interface RestScheduleEvidence {
+  state: 'NORMAL' | 'THROTTLED' | 'RECOVERY' | 'TERMINAL';
+  recoveryAttempt: boolean;
+  cooldownUntilUtc: string | null;
+  reason: string | null;
+}
+export class RestTransportError extends Error {
+  scheduling?:RestScheduleEvidence;
+  constructor(message:string,readonly requestStartUtc:string){super(message);}
+}
+/** Scheduling skips never denote transport attempts or provider observations. */
+export class RestRequestSkipped extends Error {
+  constructor(message:string,readonly scheduling?:RestScheduleEvidence){super(message);}
+}
+
+function retryAfterMs(value:string|undefined,now:number):number|null {
+  if(value===undefined)return null;
+  const text=value.trim();
+  // Delta seconds or HTTP-date; reject permissive Date.parse numeric strings.
+  const delay=/^\d+$/.test(text)?Number(text)*1000:
+    /^(?:Mon(?:day)?|Tue(?:sday)?|Wed(?:nesday)?|Thu(?:rsday)?|Fri(?:day)?|Sat(?:urday)?|Sun(?:day)?)[, ]/i.test(text)?Math.max(0,Date.parse(text)-now):NaN;
+  return Number.isFinite(delay)&&delay>=0&&now+delay<=8.64e15?delay:null;
+}
+
+/** Shared legacy+v2 limits stay fixed: serial transport, >=500ms spacing,
+ * <=60 starts/minute total, <=20 v2. Cooldown skips rather than queues work;
+ * exactly one fresh poll may probe recovery. Old queued polls never replay. */
 export function pacedV2RestGet() {
-  let tail=Promise.resolve(), stopped=false, last=-Infinity;
+  let tail=Promise.resolve(), terminal=false, last=-Infinity;
   let starts:{at:number;v2:boolean}[]=[];
+  let cooldownUntil=0, failures=0, generation=0, recovering=false;
+  const evidence=(state:RestScheduleEvidence['state'],recoveryAttempt=false,reason:string|null=null):RestScheduleEvidence=>
+    ({state,recoveryAttempt,cooldownUntilUtc:failures?new Date(cooldownUntil).toISOString():null,reason});
+  const throttle=(reply?:RestGetResult)=>{
+    failures=Math.min(failures+1,32);generation++;
+    const fallback=Math.min(300000,30000*2**Math.min(failures-1,4)*(.8+.4*Math.random()));
+    cooldownUntil=Date.now()+(retryAfterMs(reply?.rateLimitHeaders?.['retry-after'],Date.now())??fallback);
+  };
   return async (url:string,timeoutMs=15000,maxBodyBytes=REST_MAX_BODY_BYTES,deadline=Date.now()+timeoutMs+8000):Promise<RestGetResult> => {
+    if(terminal)throw new RestRequestSkipped('HOST_STOPPED',evidence('TERMINAL',false,'HTTP_403'));
+    if(recovering || Date.now()<cooldownUntil)throw new RestRequestSkipped('THROTTLED',evidence('THROTTLED',false,'COOLDOWN'));
+    const recoveryAttempt=failures>0, admittedGeneration=generation;
+    if(recoveryAttempt)recovering=true;
     let release!:()=>void;
     const turn=new Promise<void>(r=>{release=r;}),previous=tail;
     tail=previous.then(()=>turn);
     let timer:ReturnType<typeof setTimeout>|undefined;
+    let started=false;
     try {
       await Promise.race([previous,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new RestRequestSkipped('QUEUE_DEADLINE')),Math.max(0,deadline-Date.now()));})]);
       if(timer)clearTimeout(timer);
-      if(stopped)throw new RestRequestSkipped('HOST_STOPPED');
+      const check=()=>{
+        if(terminal)throw new RestRequestSkipped('HOST_STOPPED',evidence('TERMINAL',false,'HTTP_403'));
+        if(admittedGeneration!==generation || Date.now()<cooldownUntil)
+          throw new RestRequestSkipped('THROTTLED',evidence('THROTTLED',false,'STALE_QUEUE_OR_COOLDOWN'));
+      };
+      check();
       const wait=Math.max(0,last+500-Date.now());
       if(Date.now()+wait+timeoutMs>deadline)throw new RestRequestSkipped('TIME_BUDGET');
       if(wait)await new Promise(r=>setTimeout(r,wait));
+      check();
+      if(Date.now()+timeoutMs>deadline)throw new RestRequestSkipped('TIME_BUDGET');
       const now=Date.now(),v2=new URL(url).pathname.startsWith('/v2/');
       starts=starts.filter(t=>now-t.at<60000);
       if(starts.length>=60 || v2&&starts.filter(t=>t.v2).length>=20)throw new RestRequestSkipped('REQUEST_BUDGET');
-      starts.push({at:now,v2});last=now;
+      starts.push({at:now,v2});last=now;started=true;
       const reply=await restGet(url,timeoutMs,maxBodyBytes);
       if(reply.requestStartUtc){last=Date.parse(reply.requestStartUtc);starts[starts.length-1]!.at=last;}
-      if([403,429,503].includes(reply.status))stopped=true;
+      if(reply.status===403){terminal=true;generation++;reply.scheduling=evidence('TERMINAL',recoveryAttempt,'HTTP_403');}
+      else if(reply.status===429 || reply.status===503 || recoveryAttempt&&(reply.status<200||reply.status>=300||reply.bodyError)){
+        throttle(reply);reply.scheduling=evidence('THROTTLED',recoveryAttempt,`HTTP_${reply.status}`);
+      }else{
+        reply.scheduling=evidence(recoveryAttempt?'RECOVERY':'NORMAL',recoveryAttempt);
+        failures=0;cooldownUntil=0;
+      }
       return reply;
-    }finally{if(timer)clearTimeout(timer);release();}
+    }catch(error){
+      if(started && error instanceof RestTransportError){last=Date.parse(error.requestStartUtc);starts[starts.length-1]!.at=last;}
+      if(recoveryAttempt && started && !(error instanceof RestRequestSkipped)){
+        throttle();
+        if(error instanceof RestTransportError)error.scheduling=evidence('THROTTLED',true,'RECOVERY_TRANSPORT_FAILURE');
+      }
+      throw error;
+    }finally{if(timer)clearTimeout(timer);if(recoveryAttempt)recovering=false;release();}
   };
 }

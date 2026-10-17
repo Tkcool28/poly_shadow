@@ -43,6 +43,7 @@ ROW_BYTES = 65536
 MAX_ROWS = 721
 LOG_BYTES = 16 * 1024 ** 2
 SERVICE_GRACE = 8  # administrative cleanup only; observer deadline never extended
+SCOPE_GRACE = 30  # coarse manager fallback must not race the absolute guardian deadline
 PROTECTED = ('poly2-bot-1', 'poly2-backend-1', 'poly2-postgres-1', 'poly2-redis-1')
 
 
@@ -162,7 +163,7 @@ def scope_identity(unit, guardian, invocation=None, deadline_mono=None, control_
         require(s['InvocationID'] == invocation, 'Observer scope incarnation changed')
     if control_group:
         require(s.get('ControlGroup') == control_group, 'Observer manager cgroup changed')
-    require(0 < duration_us(s.get('RuntimeMaxUSec', '')) <= (DURATION - BASELINE) * 1e6, 'Observer runtime fallback bound unavailable')
+    require(0 < duration_us(s.get('RuntimeMaxUSec', '')) <= (DURATION - BASELINE + SCOPE_GRACE) * 1e6, 'Observer runtime fallback bound unavailable')
     return s
 
 
@@ -278,7 +279,7 @@ def scope_command(directory, manifest):
             '--property=MemoryHigh=' + str(E.HIGH), '--property=MemoryMax=' + str(E.MAX),
             '--property=MemorySwapMax=' + str(E.SWAP), '--property=BindsTo=' + service,
             '--property=After=' + service, '--property=KillMode=control-group',
-            '--property=KillSignal=SIGKILL', '--property=TimeoutStopSec=2', '--property=RuntimeMaxSec=%.6f' % remaining(manifest),
+            '--property=KillSignal=SIGKILL', '--property=TimeoutStopSec=2', '--property=RuntimeMaxSec=%.6f' % (remaining(manifest) + SCOPE_GRACE),
             '/usr/bin/python3', '-B', str(ROOT / 'scripts/memory-observer-entry.py'), '--directory', str(directory)]
 
 
@@ -302,6 +303,8 @@ def kill_leaf(leaf, inode, execute=True):
 def cleanup(child, token, scope, scope_invocation, leaf, end_wall, inode=None):
     errors = []
     group_gone = child is None
+    manager_kill_error = None
+    manager_race_verified = False
     if child is not None:
         try:
             if leaf and leaf.exists() and inode is not None:
@@ -320,9 +323,12 @@ def cleanup(child, token, scope, scope_invocation, leaf, end_wall, inode=None):
                     ident = scope.removeprefix('poly-shadow-observer-phase4-').removesuffix('.scope')
                     guard = 'poly-shadow-' + ident + '.service'
                     require(guard in s.get('BindsTo','').split() and guard in s.get('After','').split(), 'Pre-GO cleanup binding unavailable')
-                command(['systemctl','--user','kill','--kill-who=all','--signal=KILL',scope],timeout=1)
+                try:
+                    command(['systemctl','--user','kill','--kill-who=all','--signal=KILL',scope],timeout=1)
+                except BaseException as exc:
+                    manager_kill_error = 'MANAGER_' + type(exc).__name__
             else:
-                require(s.get('LoadState') == 'not-found' or s.get('ActiveState') in ('inactive','failed'), 'Scope state unknown')
+                require(s.get('LoadState') == 'not-found' or s.get('Id') == scope and s.get('LoadState') == 'loaded' and s.get('ActiveState') in ('inactive','failed') and scope_invocation is not None and s.get('InvocationID') == scope_invocation, 'Scope inactive identity unknown')
         except BaseException as exc:
             errors.append('MANAGER_' + type(exc).__name__)
         # This attempt is independent of *every* manager/cgroup operation above.
@@ -335,13 +341,25 @@ def cleanup(child, token, scope, scope_invocation, leaf, end_wall, inode=None):
         try:
             while leaf and leaf.exists() and T.cgroup_pids(leaf) and time.monotonic() < limit:
                 time.sleep(.02)
-            empty = (not leaf.exists() or not T.cgroup_pids(leaf)) if leaf else unit_state(scope).get('ActiveState') in ('inactive','failed') or unit_state(scope).get('LoadState') == 'not-found'
+            if leaf and leaf.exists():
+                require(inode is not None and (leaf.stat().st_dev,leaf.stat().st_ino) == tuple(inode), 'Empty proof cgroup ownership changed')
+                empty = not T.cgroup_pids(leaf)
+            else:
+                empty = leaf is not None and inode is not None  # absent verified own leaf is an empty-cgroup proof
+            if manager_kill_error:
+                final = unit_state(scope)
+                gone = final.get('LoadState') == 'not-found'
+                inactive = final.get('Id') == scope and final.get('LoadState') == 'loaded' and final.get('ActiveState') in ('inactive','failed') and scope_invocation is not None and final.get('InvocationID') == scope_invocation
+                require((gone or inactive) and empty and group_gone and child.poll() is not None, 'Manager kill failure lacks independent stop proof')
+                manager_race_verified = True
         except BaseException as exc:
             empty = False
             errors.append('EMPTY_PROOF_' + type(exc).__name__)
     else:
         empty = True
-    return {'complete':bool(group_gone and empty and not errors),'ownedProcessGroupGone':group_gone,
+    if manager_kill_error and not manager_race_verified:
+        errors.append(manager_kill_error)
+    return {'benignManagerKillRace':manager_race_verified,'managerKillError':manager_kill_error,'complete':bool(group_gone and empty and not errors),'ownedProcessGroupGone':group_gone,
             'observerCgroupEmpty':empty,'errors':errors,'completedUtc':utc()}
 
 

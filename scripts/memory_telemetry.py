@@ -7,6 +7,7 @@ import time
 
 LABEL = 'MEMORY_VALIDATION_ONLY_NOT_SCIENTIFIC_COMPARISON'
 GIB = 1024 ** 3
+MEMORY_STAT_CATEGORIES = ('active_file','inactive_file','file_mapped','shmem','file_dirty','file_writeback')
 MAX_PIDS = 256
 MAX_HOST_PIDS = 16384
 EVIDENCE_FILES = ('raw_log_tombstones.ndjson','dispositions.ndjson','quarantine.ndjson','rpc_recoveries.ndjson','rpc_publications.ndjson','audit_snapshots.ndjson','chain_tail_proofs.ndjson','raw_logs.ndjson', 'observations.ndjson', 'source_observations.ndjson',
@@ -101,6 +102,8 @@ def cgroup_pids(leaf):
 
 
 def observer_snapshot(leaf, root=Path('/proc')):
+    categories = pairs(bounded(leaf / 'memory.stat', 16384))
+    selected = {key:categories[key] for key in MEMORY_STAT_CATEGORIES}
     pids = cgroup_pids(leaf)
     rows = [process_memory(pid, root) for pid in pids]
     rss = [r['rssBytes'] for r in rows if r['rssBytes'] is not None]
@@ -110,6 +113,7 @@ def observer_snapshot(leaf, root=Path('/proc')):
             'treePssBytes': sum(pss) if len(pss) == len(rows) else None,
             'availableRssSubtotalBytes': sum(rss), 'availablePssSubtotalBytes': sum(pss),
             'rssComplete': len(rss) == len(rows), 'pssComplete': len(pss) == len(rows),
+            'memoryStatBytes': selected,
             'memoryCurrentBytes': int(bounded(leaf / 'memory.current', 128)),
             'memoryPeakBytes': int(bounded(leaf / 'memory.peak', 128)),
             'swapCurrentBytes': int(bounded(leaf / 'memory.swap.current', 128)),

@@ -7,6 +7,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { RestPoller, type RestPollerOpts } from '../src/shadow/rest-poller.js';
 import { RacingStore, Reconciler, tradesIdentity } from '../src/shadow/racing.js';
 import { OperationalEvidence } from '../src/shadow/operational-evidence.js';
+import {pacedV2RestGet,RestTransportError} from '../src/shadow/egress.js';
 import { runtimeHealthSnapshot } from '../src/shadow/runtime-health.js';
 const clean:(()=>void)[]=[];
 afterEach(()=>{for(const f of clean.splice(0).reverse())f();});
@@ -217,4 +218,38 @@ it('historical coverage warnings need an exact successful publication receipt; o
  expect(readFileSync(join(f.dir,'quarantine_v2.ndjson'),'utf8')).toBe(before);
  f.closeOperational();rmSync(join(f.dir,'operational-index.sqlite'));const rebuilt=new OperationalEvidence(f.dir);
  expect(rebuilt.quarantineState()).toMatchObject({coverageWarnings:1,unresolved:0});rebuilt.close();
+});
+
+it('legacy receipts and raw evidence use transport start after queue delay, retaining queue intent',async()=>{
+ const get=pacedV2RestGet();const f=await fixture(get,{baseUrl:'https://data-api.polymarket.com'});
+ vi.useFakeTimers();vi.setSystemTime(new Date('2026-10-17T00:00:00Z'));
+ let release!:()=>void,count=0;
+ vi.stubGlobal('fetch',vi.fn(async()=>{if(count++===0)await new Promise<void>(r=>{release=r;});return new Response(JSON.stringify([item(1)]),{headers:{'retry-after':'7'}});}));
+ try{
+  const first=get('https://data-api.polymarket.com/activity');await vi.advanceTimersByTimeAsync(0);
+  const pending=f.poller.pollWallet('wallet');await vi.advanceTimersByTimeAsync(1000);
+  release();await first;await vi.advanceTimersByTimeAsync(0);await pending;
+  expect(rows(f.dir)[0]).toMatchObject({queueIntentUtc:'2026-10-17T00:00:00.000Z',requestStartUtc:'2026-10-17T00:00:01.000Z',requestStartEvidence:'TRANSPORT',rateLimitHeaders:{'retry-after':'7'},scheduling:{state:'NORMAL',recoveryAttempt:false}});
+  expect(f.store.restRaw()[0]!.requestStartUtc).toBe('2026-10-17T00:00:01.000Z');
+ }finally{vi.unstubAllGlobals();vi.useRealTimers();}
+});
+it('throttle and recovery receipts never manufacture observations or clear unproven coverage',async()=>{
+ const get=pacedV2RestGet();const f=await fixture(get,{baseUrl:'https://data-api.polymarket.com'});
+ vi.useFakeTimers();vi.setSystemTime(new Date('2026-10-17T00:00:00Z'));let n=0;
+ vi.stubGlobal('fetch',vi.fn(async()=>new Response('[]',{status:n++===0?429:200,headers:{'retry-after':'30'}})));
+ try{
+  const denied=f.poller.pollWallet('wallet');await vi.advanceTimersByTimeAsync(0);await denied;
+  await f.poller.pollWallet('wallet');
+  expect(rows(f.dir)[0]).toMatchObject({outcome:'HTTP_FAILURE',httpStatus:429,scheduling:{state:'THROTTLED'},publication:'NOT_ATTEMPTED'});
+  expect(rows(f.dir).at(-1)).toMatchObject({outcome:'SKIPPED',stopReason:'THROTTLED',requestStartUtc:null,responseUtc:null,httpStatus:null,publication:'NOT_ATTEMPTED',scheduling:{state:'THROTTLED'},pagination:'UNKNOWN_UNPROVEN'});
+  expect(f.store.restRaw()).toHaveLength(0);expect(f.op.unresolvedQuarantineCount()).toBe(1);
+  await vi.advanceTimersByTimeAsync(30000);const recovery=f.poller.pollWallet('wallet');await vi.advanceTimersByTimeAsync(0);await recovery;
+  expect(rows(f.dir).at(-1)).toMatchObject({outcome:'SUCCESS_EMPTY',scheduling:{state:'RECOVERY',recoveryAttempt:true},pagination:'UNKNOWN_UNPROVEN'});
+  expect(f.op.unresolvedQuarantineCount()).toBe(1);expect(f.store.restRaw()).toHaveLength(0);
+  expect(f.op.restCompletenessState().state).toBe('UNKNOWN_UNPROVEN');
+ }finally{vi.unstubAllGlobals();vi.useRealTimers();}
+});
+it('legacy transport rejection preserves actual start without publishing a successful observation',async()=>{
+ const start='2026-10-17T00:00:01.000Z';const f=await fixture(async()=>{throw new RestTransportError('fetch timeout',start);});
+ await f.poller.pollWallet('wallet');expect(rows(f.dir)[0]).toMatchObject({requestStartUtc:start,requestStartEvidence:'TRANSPORT',outcome:'TIMEOUT',publication:'NOT_ATTEMPTED'});expect(f.store.restRaw()).toHaveLength(0);
 });

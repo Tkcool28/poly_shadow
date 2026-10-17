@@ -42,7 +42,7 @@ def dummy(directory,mode):
     write(directory/'tokens.json',tokens)
     (directory/'leaf/cgroup.procs').write_text(str(os.getpid())+'\n'+str(grandchild.pid)+'\n')
     M.write_new(directory/'observer-ready.json',{'token':tokens[0],'guardianInvocation':'a'*32,
-        'controlGroup':'/fixture/scope','inode':[1,2]})
+        'controlGroup':'/fixture/scope','inode':[(directory/'leaf').stat().st_dev,(directory/'leaf').stat().st_ino]})
     while not (directory/'observer-go.json').exists():time.sleep(.005)
     if mode=='early':return
     if mode=='end-oom':
@@ -86,7 +86,7 @@ def fixture(directory,mode):
     leaf=directory/'leaf'
     with mock.patch.object(M,'guard_identity',return_value={'InvocationID':'a'*32}),\
          mock.patch.object(M,'scope_identity',side_effect=lambda *a,**k:state(a[0])),\
-         mock.patch.object(M,'leaf_controls',return_value=(1,2)),\
+         mock.patch.object(M,'leaf_controls',return_value=(leaf.stat().st_dev,leaf.stat().st_ino)),\
          mock.patch.object(M,'kill_leaf',side_effect=lambda leaf,inode,execute=True:kill_fixture(directory) if execute else None),\
          mock.patch.object(M,'cgroup_leaf',return_value=leaf),\
          mock.patch.object(M,'unit_state',side_effect=state),\
