@@ -62,7 +62,7 @@ it.skipIf(!chrome&&!process.env.CI)('headless Chrome renders unauthorized and pr
  try{
   for(const kind of ['unauthorized','stale-authorized','missing-authorized','unavailable']){
    const data=fixture();if(kind!=='unauthorized')data.stage1LiveMatches={...data.stage1LiveMatches,authorization:kind!=='unavailable',state:kind==='unavailable'?'MONITOR_UNAVAILABLE':'ACTIVE',generatedUtc:kind==='missing-authorized'?undefined:kind==='stale-authorized'?'2030-01-01T00:38:29Z':now};
-   const prelude=`<script>Date.now=()=>${Date.parse(now)};window.setInterval=()=>0;window.fetch=async()=>({ok:true,json:async()=>${JSON.stringify(data)}});</script>`;
+   const prelude=`<script>Date.now=()=>${Date.parse(now)};window.setInterval=()=>0;window.fetch=async()=>({ok:true,json:async()=>(${JSON.stringify(data)})});</script>`;
    const probe=`<script>setTimeout(()=>{const p=document.createElement('pre');p.id='browser-probe';p.textContent=JSON.stringify({state:document.getElementById('live-match-state').textContent,rows:document.getElementById('live-match-rows').children.length,counts:document.getElementById('live-match-counts').textContent,failed:!document.getElementById('connection').hidden});document.body.append(p)},0)</script>`;
    const file=join(root,kind+'.html');writeFileSync(file,readFileSync('scripts/status/index.html','utf8').replace('<script>',prelude+'<script>').replace('</body>',probe+'</body>'));
    const result=spawnSync(chrome!,['--headless','--no-sandbox','--disable-dev-shm-usage','--disable-background-networking','--no-proxy-server','--user-data-dir='+join(root,kind+'-profile'),'--dump-dom','--virtual-time-budget=1000',pathToFileURL(file).href],{encoding:'utf8',timeout:15000,maxBuffer:1024*1024});
