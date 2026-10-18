@@ -390,7 +390,7 @@ def binding_context(run, pointer_path, runs_root):
 def unbound_status(now, state):
     return {'schemaVersion': 1, 'generatedUtc': utc(now), 'experimentId': None,
             'shadowSha': None, 'state': state, 'currentActive': False, 'currentInactive': True,
-            'historical': False, 'binding': {'status': state, 'mode': 'current', 'runDirectory': None},
+            'historical': False, 'binding': {'status': state, 'mode': 'current', 'runId': None},
             'scope': 'Operational status only; no observer activation.',
             'window': {k: None for k in ('startUtc', 'endUtc', 'startMdt', 'endMdt', 'elapsedSeconds', 'remainingSeconds', 'startsInSeconds', 'durationSeconds')},
             'processes': {k: process_status({}) for k in ('runner', 'guardian', 'observer')},
@@ -750,7 +750,7 @@ def collect(run=None, now=None, cache_path=CACHE, health_provider=production_hea
     return {'schemaVersion': 1, 'generatedUtc': utc(now), 'experimentId': run.name,
             'shadowSha': SHA, 'state': state, 'currentActive': current_active,
             'currentInactive': not current_active, 'historical': historical,
-            'binding': {'status': binding, 'mode': 'historical' if context['explicit'] else 'current', 'runDirectory': str(run)},
+            'binding': {'status': binding, 'mode': 'historical' if context['explicit'] else 'current', 'runId': run.name},
             'scope': 'Operational status only. COMPLETE means lifecycle completion only.',
             'window': {'startUtc': context['window']['startUtc'], 'endUtc': context['window']['endUtc'],
                        'clockEvidence': _CLOCK.evidence(context['window'], ['startUtc','endUtc']),

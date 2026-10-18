@@ -44,6 +44,16 @@ class BindingTests(unittest.TestCase):
             self.assertIsNone(result['memory'][key])
     def test_missing_pointer_no_fallback(self):
         self.pointer.unlink(); self.unknown(self.collect(), 'NO_ACTIVE_RUN')
+    def test_public_status_does_not_expose_absolute_run_directory(self):
+        result = self.collect()
+        self.assertEqual(result['binding']['runId'], self.target.name)
+        self.assertNotIn('runDirectory', result['binding'])
+        self.assertNotIn(str(self.root), json.dumps(result))
+        self.pointer.unlink()
+        unbound = self.collect()
+        self.assertNotIn('runDirectory', unbound['binding'])
+        self.assertIsNone(unbound['binding']['runId'])
+
     def test_valid_authorized_binding(self):
         result=self.collect()
         self.assertEqual(result['shadowSha'], SHA); self.assertEqual(result['state'], 'SEALED')
