@@ -43,7 +43,13 @@ class BindingTests(unittest.TestCase):
         for key in ('rssBytes', 'replayRows', 'indexRows', 'blockCache', 'matchedCache', 'aggregateCache', 'exclusiveDepth', 'filteredLogs'):
             self.assertIsNone(result['memory'][key])
     def test_missing_pointer_no_fallback(self):
-        self.pointer.unlink(); self.unknown(self.collect(), 'NO_ACTIVE_RUN')
+        self.pointer.unlink(); result=self.collect(); self.unknown(result, 'NO_ACTIVE_RUN')
+        live=result['stage1LiveMatches']
+        self.assertEqual(live['generatedUtc'],result['generatedUtc'])
+        self.assertEqual(live['state'],'COMPARISON_NOT_AUTHORIZED')
+        self.assertFalse(live['authorization']);self.assertTrue(live['provisional']);self.assertFalse(live['certified'])
+        self.assertIsNone(live['counts']);self.assertEqual(live['recent'],[]);self.assertEqual(live['coverage'],'UNKNOWN_UNPROVEN')
+        self.assertNotIn(str(self.root),json.dumps(result))
     def test_public_status_does_not_expose_absolute_run_directory(self):
         result = self.collect()
         self.assertEqual(result['binding']['runId'], self.target.name)

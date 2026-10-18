@@ -394,7 +394,7 @@ def unbound_status(now, state):
             'scope': 'Operational status only; no observer activation.',
             'window': {k: None for k in ('startUtc', 'endUtc', 'startMdt', 'endMdt', 'elapsedSeconds', 'remainingSeconds', 'startsInSeconds', 'durationSeconds')},
             'processes': {k: process_status({}) for k in ('runner', 'guardian', 'observer')},
-            'stage1LiveMatches': {'state':'COMPARISON_NOT_AUTHORIZED','authorization':False,'provisional':True,'certified':False,'counts':None,'recent':[]},
+            'stage1LiveMatches': {'generatedUtc':utc(now),'coverage':'UNKNOWN_UNPROVEN','state':'COMPARISON_NOT_AUTHORIZED','authorization':False,'provisional':True,'certified':False,'counts':None,'recent':[]},
             'memory': unknown_memory(), 'terminal': {'restartCount': None, 'classification': None, 'exitReason': None, 'bindingValid': False},
             'heartbeat': {'latestUtc': None, 'ageSeconds': None},
             'evidence': {'files': [], 'totalBytes': None, 'growthBytes': None, 'sampleSeconds': None},

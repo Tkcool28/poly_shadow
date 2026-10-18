@@ -36,6 +36,8 @@ class Stage1ApprovalStatus(unittest.TestCase):
         with mock.patch.object(L.subprocess,'Popen') as launch:
             result=L.refresh(self.root/'run',self.root/'status-cache.json','2030-01-01T00:40:00Z',self.root/'absent')
             self.assertEqual(result['state'],'COMPARISON_NOT_AUTHORIZED');self.assertIsNone(result['counts']);launch.assert_not_called()
+            self.assertEqual(result['generatedUtc'],'2030-01-01T00:40:00Z')
+            self.assertEqual({k:result[k] for k in ('authorization','provisional','certified','recent','coverage')},dict(authorization=False,provisional=True,certified=False,recent=[],coverage='UNKNOWN_UNPROVEN'))
     def test_symlink_projection_cannot_touch_evidence(self):
         run=self.root/'runs/phase4-test';run.mkdir(parents=True);evidence=run/'must-not-change';evidence.write_text('original')
         config=self.root/'config.json';config.write_text(json.dumps(dict(runDirectory=str(run))))
@@ -43,6 +45,8 @@ class Stage1ApprovalStatus(unittest.TestCase):
         with mock.patch.object(L.subprocess,'Popen') as launch:
             result=L.refresh(run,cache,'2030-01-01T00:40:00Z',config)
             self.assertEqual(result['state'],'MONITOR_UNAVAILABLE');launch.assert_not_called()
+            self.assertEqual(result['generatedUtc'],'2030-01-01T00:40:00Z')
+            self.assertIsNone(result['counts']);self.assertEqual(result['recent'],[]);self.assertFalse(result['certified'])
         self.assertEqual(evidence.read_text(),'original');self.assertFalse((run/'refresh.lock').exists())
     def test_symlink_lock_refused_without_truncating_target(self):
         run=self.root/'runs/phase4-test';run.mkdir(parents=True);target=run/'evidence';target.write_text('original')
