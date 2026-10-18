@@ -19,7 +19,7 @@ def safe(path):
     return path
 
 def refresh(run, cache_path, now_utc, config_path=CONFIG):
-    unknown = dict(version='stage1-v2', provisional=True, certified=False,
+    unknown = dict(version='stage1-v2', generatedUtc=now_utc, provisional=True, certified=False,
                    authorization=False, state='COMPARISON_NOT_AUTHORIZED', counts=None,
                    coverage='UNKNOWN_UNPROVEN', recent=[], checkpoint=dict(classification='CAPTURE_OR_IDENTITY_BLOCKED'))
     if not config_path.exists():
