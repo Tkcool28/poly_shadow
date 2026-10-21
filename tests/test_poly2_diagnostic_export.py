@@ -67,7 +67,7 @@ class FakeConnection:
             return Result([{'max_id': max((r['id'] for r in self.audit_rows), default=0)}])
         if 'FROM trades AS t' in sql:
             cursor, high, limit = params['cursor'], params['high_id'], params['limit']
-            rows = [r for r in self.trade_rows if cursor < r['source_record_id'] <= high and exporter.parse_utc(params['start_utc'])<=r['ingested_at']<exporter.parse_utc(params['end_utc']) and ('event_start' not in params or exporter.parse_utc(params['event_start'])<=r['traded_at']<exporter.parse_utc(params['event_end']))]
+            rows = [r for r in self.trade_rows if cursor < r['source_record_id'] <= high and params['start_utc']<=r['ingested_at']<params['end_utc'] and ('event_start' not in params or params['event_start']<=r['traded_at']<params['event_end'])]
             return Result(rows[:limit])
         if 'FROM signals' in sql:
             return Result([{'id': 7, 'source_trade_id': SOURCE_ID, 't1_detected_at': START + dt.timedelta(seconds=3)}])
@@ -80,7 +80,7 @@ class FakeConnection:
             used=0; result=[]
             for audit in batch:
                 payload=json.dumps(audit['context'],separators=(',',':'),ensure_ascii=False)
-                size=len(payload.encode('utf-8')); used+=size
+                size=len(payload.encode('utf-8')); used+=size if size<=row_cap else 0
                 result.append({'id':audit['id'],'actor':audit['actor'],'action':audit['action'],'created_at':audit['created_at'],
                     'context_bytes':size,'linked_source_trade_id':audit['context'].get('source_trade_id'),
                     'context_payload':payload if size<=row_cap and used<=budget else None})

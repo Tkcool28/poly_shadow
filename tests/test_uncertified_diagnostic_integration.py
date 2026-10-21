@@ -41,7 +41,7 @@ class OfflinePoly2:
         if 'MAX(id)' in sql and 'FROM trades' in sql: return Result([{'max_id':3}])
         if 'MAX(id)' in sql and 'FROM decision_log' in sql: return Result([{'max_id':0}])
         if 'FROM trades AS t' in sql:
-            return Result([r for r in self.rows if params['cursor']<r['source_record_id']<=params['high_id'] and params['start_utc']<=r['ingested_at'].isoformat()<=params['end_utc']][:params['limit']])
+            return Result([r for r in self.rows if params['cursor']<r['source_record_id']<=params['high_id'] and params['start_utc']<=r['ingested_at']<params['end_utc']][:params['limit']])
         if 'FROM signals' in sql: return Result([])
         if 'FROM decision_log' in sql: return Result([])
         raise AssertionError(sql)

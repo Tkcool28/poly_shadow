@@ -127,10 +127,13 @@ def resource_envelope(root=Path('/sys/fs/cgroup'),membership=Path('/proc/self/cg
 
 def publish_progress(args,value):
  if not args.publish_dashboard: return
- path=assert_isolated_path(args.dashboard_summary)
+ path=assert_isolated_path(getattr(args,'publisher_snapshot',None) or args.dashboard_summary)
  if 'diagnostic-comparison' not in path.parts: raise ValueError('diagnostic public directory required')
  path.parent.mkdir(parents=True,exist_ok=True,mode=0o755)
- atomic_json(path,value,0o644)
+ public=dict(value)
+ retro=public.get('retrospectiveAndUnknown')
+ if isinstance(retro,dict): public['retrospectiveAndUnknown']={k:len(v) for k,v in retro.items()}
+ atomic_json(path,public,0o644)
 
 def evidence_inventory(run_dir):
  files=[]
@@ -260,11 +263,13 @@ def _run(args,signal_state):
   env=os.environ.copy(); env.update(SHADOW_WATCHED_WALLETS=','.join(WALLETS),SHADOW_DATA_DIR=str(data_dir),SHADOW_V2_CURSOR='true')
   for key in list(env):
    if key in ('PRIVATE_KEY','CLOB_API_KEY','CLOB_API_SECRET','CLOB_API_PASSPHRASE','FUNDER_ADDRESS','RELAYER_API_KEY','RELAYER_API_KEY_ADDRESS') or key.startswith(('ARB_','SCALP_')): raise RuntimeError('SHADOW_CREDENTIAL_GUARD_FAILED')
+  if signal_state['count']: raise RuntimeError('INTERRUPTED_BEFORE_LAUNCH')
   boundary_start=now_utc(); planned_end=add_seconds(boundary_start,args.duration_seconds)
   base.update({'state':'RUNNING','startedUtc':boundary_start,'plannedEndUtc':planned_end,'durationSeconds':args.duration_seconds,'window':{'startUtc':boundary_start,'endUtc':planned_end},'frozenWindow':{'startUtc':boundary_start,'endUtc':planned_end}})
   atomic_json(run_dir/'diagnostic-manifest.json',base)
   publish_progress(args,progress_projection(base))
   child=subprocess.Popen(['node','--max-old-space-size=3072','--import','tsx','src/shadow/main.ts'],cwd=repo,env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+  signal_state['child']=child
   # Independent deadline remains effective while live export/report work runs.
   def deadline_stop():
    try: os.killpg(child.pid,signal.SIGTERM)
@@ -288,7 +293,7 @@ def _run(args,signal_state):
     atomic_json(run_dir/'diagnostic-preview-manifest.json',preview)
     export_poly2(export_source,script,preview,run_dir/'poly2-live-export.json')
     cmd=['node','--max-old-space-size=384','--import','tsx','src/compare/diagnostic-report-cli.ts','--run-directory',str(run_dir),
-      '--manifest-name','diagnostic-preview-manifest.json','--poly2-export',str(run_dir/'poly2-live-export.json'),'--preview','--publish-summary',str(assert_isolated_path(args.dashboard_summary))]
+      '--manifest-name','diagnostic-preview-manifest.json','--poly2-export',str(run_dir/'poly2-live-export.json'),'--preview','--publish-summary',str(assert_isolated_path(getattr(args,'publisher_snapshot',None) or args.dashboard_summary))]
     result=subprocess.run(cmd,cwd=repo,capture_output=True,text=True,timeout=60)
     if result.returncode: raise RuntimeError('LIVE_REPORT_FAILED')
    atomic_json(run_dir/'diagnostic-checkpoint.json',{'observedUtc':now_utc(),'state':base['state'],'window':base['window'],'resource':observed})
@@ -324,7 +329,7 @@ def _run(args,signal_state):
   if not stable: raise RuntimeError('POLY2_RUNTIME_CHANGED_DURING_OBSERVATION')
   export_poly2(export_source,script,base,run_dir/'poly2-export.json')
   cmd=['node','--max-old-space-size=384','--import','tsx','src/compare/diagnostic-report-cli.ts','--run-directory',str(run_dir),'--poly2-export',str(run_dir/'poly2-export.json')]
-  if args.publish_dashboard: cmd+=['--publish-summary',str(assert_isolated_path(args.dashboard_summary))]
+  if args.publish_dashboard: cmd+=['--publish-summary',str(assert_isolated_path(getattr(args,'publisher_snapshot',None) or args.dashboard_summary))]
   report=subprocess.run(cmd,cwd=repo,capture_output=True,text=True,timeout=300)
   if report.returncode: raise RuntimeError('DIAGNOSTIC_REPORT_FAILED')
   # COMPLETE is written only after export and report successfully exist.
@@ -374,6 +379,10 @@ def run(args):
   signal_state['count']+=1
   if signal_state['number'] is None:
    signal_state['number']=number; signal_state['name']=signal.Signals(number).name
+  child=signal_state.get('child')
+  if child is not None:
+   try: os.killpg(child.pid,signal.SIGTERM if signal_state['count']==1 else signal.SIGKILL)
+   except ProcessLookupError: pass
  for number in (signal.SIGTERM,signal.SIGINT):
   previous[number]=signal.getsignal(number); signal.signal(number,record_signal)
  fd=None
@@ -391,6 +400,7 @@ def main(argv=None):
  p=argparse.ArgumentParser(description=__doc__); sub=p.add_subparsers(dest='command',required=True); r=sub.add_parser('run')
  r.add_argument('--poly2-container',required=True); r.add_argument('--repo',type=Path,default=ROOT); r.add_argument('--poly2-repo',type=Path,default=POLY2_REPO); r.add_argument('--run-root',type=Path,default=DEFAULT_RUN_ROOT)
  r.add_argument('--poly2-dsn-file',type=Path,required=True)
+ r.add_argument('--publisher-snapshot',type=Path,help='separate private snapshot consumed by existing status publisher')
  r.add_argument('--duration-seconds',type=int,required=True); r.add_argument('--publish-dashboard',action='store_true'); r.add_argument('--dashboard-summary',type=Path,default=DEFAULT_DASHBOARD_SUMMARY)
  r.add_argument('--late-arrival-grace-seconds',type=int,default=30)
  a=p.parse_args(argv)

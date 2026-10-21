@@ -22,3 +22,9 @@ it('refuses symlinked evidence inputs',async()=>{
  const rows:unknown[]=[];await expect((async()=>{for await(const row of readNdjson(link))rows.push(row)})()).rejects.toThrow();
  expect(rows).toHaveLength(0);
 });
+it('live snapshots omit an uncommitted tail while default final evidence remains strict',async()=>{
+ const dir=fixture(),path=join(dir,'live.ndjson');writeFileSync(path,'{"committed":true}\n{"partial":');
+ const live:unknown[]=[];for await(const row of readNdjson(path,8,{freezeAtOpen:true,allowIncompleteTail:true}))live.push(row);
+ expect(live).toEqual([{committed:true}]);
+ await expect((async()=>{for await(const _ of readNdjson(path)){} })()).rejects.toThrow('malformed NDJSON');
+});

@@ -7,11 +7,13 @@ import { createReadStream, constants, openSync, fstatSync, closeSync } from 'nod
 export async function* readNdjson<T = Record<string, unknown>>(
   file: string,
   highWaterMark = 64 * 1024,
-  limits: {maxBytes?:number;maxRows?:number;maxLineBytes?:number;onBytes?:(n:number)=>void;onRecord?:()=>void} = {},
+  limits: {maxBytes?:number;maxRows?:number;maxLineBytes?:number;onBytes?:(n:number)=>void;onRecord?:()=>void;allowIncompleteTail?:boolean;freezeAtOpen?:boolean} = {},
 ): AsyncGenerator<T> {
   const fd=openSync(file,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
-  if(!fstatSync(fd).isFile()){closeSync(fd);throw new Error(`${file}: NDJSON input is not a regular file`)}
-  const stream = createReadStream(file, { encoding: 'utf8', highWaterMark, fd, autoClose:true });
+  const initial=fstatSync(fd);
+  if(!initial.isFile()){closeSync(fd);throw new Error(`${file}: NDJSON input is not a regular file`)}
+  if(limits.freezeAtOpen&&initial.size===0){closeSync(fd);return;}
+  const stream = createReadStream(file, { encoding: 'utf8', highWaterMark, fd, autoClose:true, ...(limits.freezeAtOpen?{end:initial.size-1}:{}) });
   let pending = '';
   let lineNumber = 0;
   let bytesRead = 0;
@@ -45,7 +47,7 @@ export async function* readNdjson<T = Record<string, unknown>>(
       }
       pending = pending.slice(start);
     }
-    if (pending.trim()) {
+    if (pending.trim() && !limits.allowIncompleteTail) {
       lineNumber++;
       if(Buffer.byteLength(pending,'utf8')>maxLineBytes)throw new Error(`${file}:${lineNumber}: NDJSON line limit exceeded`);
       rowsRead++;

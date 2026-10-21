@@ -29,11 +29,17 @@ def horizon_proof(cadence=CADENCE_SECONDS, window=86400, drain=MAXIMUM_DRAIN_GRA
 
 class Publisher:
     def __init__(self, output, cache, pointer=collector.POINTER, runs_root=collector.RUNS_ROOT,
-                 cadence=CADENCE_SECONDS, now=time.time, collect=collector.collect, write=collector.atomic_json):
+                 cadence=CADENCE_SECONDS, now=time.time, collect=collector.collect, write=collector.atomic_json,
+                 diagnostic_snapshot=None, diagnostic_output=None):
         horizon_proof(cadence)
         self.output, self.cache, self.pointer, self.runs_root = map(Path, (output, cache, pointer, runs_root))
         self.state_path = self.cache.with_name(self.cache.name+'.publisher.json')
         self.cadence, self.now, self.collect, self.write = cadence, now, collect, write
+        if bool(diagnostic_snapshot) != bool(diagnostic_output):
+            raise ValueError('both separate diagnostic paths required')
+        self.diagnostic_snapshot, self.diagnostic_output = diagnostic_snapshot, diagnostic_output
+        if diagnostic_output and (Path(diagnostic_output) == self.output or 'diagnostic-comparison' not in Path(diagnostic_output).parts):
+            raise ValueError('distinct diagnostic output required')
         prior = collector.obj(self.state_path)
         self.state = dict(schemaVersion=1, state='STARTING', attempts=0, failures=0, consecutiveFailures=0,
                           lastAttemptUtc=None, lastSuccessfulUtc=None, nextExpectedUtc=None, error=None,
@@ -63,6 +69,15 @@ class Publisher:
                               consecutiveFailures=self.state['consecutiveFailures']+1,
                               error=type(error).__name__)  # no secrets/paths/payloads in public diagnostics
         success = self.state['state'] == 'ACTIVE'
+        if self.diagnostic_snapshot:
+            # Separate bounded projection. Never retimestamp stale evidence or
+            # alter certified JSON/authorization when diagnostic output fails.
+            try:
+                diagnostic = collector.obj(self.diagnostic_snapshot)
+                if diagnostic.get('classification') == 'UNCERTIFIED_DIAGNOSTIC' and diagnostic.get('certified') is False:
+                    self.write(self.diagnostic_output, diagnostic, 0o644)
+            except (OSError, ValueError, TypeError):
+                pass  # previous evidence remains last-known with its original clock
         try:
             self.write(self.state_path, self.state)
         except OSError:
@@ -85,6 +100,8 @@ def main():
     p.add_argument('--current-run', type=Path, default=collector.POINTER)
     p.add_argument('--runs-root', type=Path, default=collector.RUNS_ROOT)
     p.add_argument('--cadence-seconds', type=float, default=CADENCE_SECONDS)
+    p.add_argument('--diagnostic-snapshot', type=Path)
+    p.add_argument('--diagnostic-output', type=Path)
     a = p.parse_args()
     # Exclusive publisher lock outside sealed evidence, shared across restarts.
     import fcntl
@@ -94,7 +111,8 @@ def main():
         stopped = threading.Event()
         for s in (signal.SIGTERM, signal.SIGINT):
             signal.signal(s, lambda *_: stopped.set())
-        Publisher(a.output, a.cache, a.current_run, a.runs_root, a.cadence_seconds).run(stopped)
+        Publisher(a.output, a.cache, a.current_run, a.runs_root, a.cadence_seconds,
+                  diagnostic_snapshot=a.diagnostic_snapshot, diagnostic_output=a.diagnostic_output).run(stopped)
     return 0
 
 

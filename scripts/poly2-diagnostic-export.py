@@ -369,7 +369,7 @@ async def read_export(conn, text, *, start_utc: str, end_utc: str, run_id: str,
     # Sequence allocation is not commit order: a pre-start allocated ID may
     # commit during the window. Retain the start mark as metadata, never as a
     # lower selection fence. The repeatable-read snapshot supplies visibility.
-    params.update(start_utc=start.isoformat(), end_utc=end.isoformat(), cursor=0, high_id=trade_end_high_water)
+    params.update(start_utc=start, end_utc=end, cursor=0, high_id=trade_end_high_water)
     trade_sql = f'''SELECT t.id AS source_record_id,
         CASE WHEN octet_length(t.polymarket_trade_id) <= 512 THEN t.polymarket_trade_id ELSE NULL END AS source_event_id,
         lower(w.address) AS wallet, t.asset_id, m.condition_id, t.side, t.size, t.price,
@@ -391,8 +391,8 @@ async def read_export(conn, text, *, start_utc: str, end_utc: str, run_id: str,
             'AND t.ingested_at < CAST(:end_utc AS timestamptz)',
             'AND t.ingested_at < CAST(:end_utc AS timestamptz) AND t.traded_at >= CAST(:event_start AS timestamptz) AND t.traded_at < CAST(:event_end AS timestamptz)')
         late_rows = await _paged_rows(conn, text, late_sql,
-            {**params, 'start_utc': end.isoformat(), 'end_utc': late_end.isoformat(),
-             'event_start': start.isoformat(), 'event_end': end.isoformat()}, cap=max_trade_rows)
+            {**params, 'start_utc': end, 'end_utc': late_end,
+             'event_start': start, 'event_end': end}, cap=max_trade_rows)
         if any(not isinstance(r.get('source_event_id'), str) for r in late_rows):
             raise ValueError('late source identity exceeds SQL byte limit')
     unique_trades, duplicate_ids = deduplicate_trade_rows(raw_trades)
@@ -422,12 +422,12 @@ async def read_export(conn, text, *, start_utc: str, end_utc: str, run_id: str,
         SELECT id, left(actor, 128) AS actor, left(action, 128) AS action, created_at,
           context_bytes, context ->> 'source_trade_id' AS linked_source_trade_id,
           CASE WHEN context_bytes <= :max_context_row_bytes
-            AND SUM(context_bytes) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) <= :context_budget_bytes
+            AND SUM(CASE WHEN context_bytes <= :max_context_row_bytes THEN context_bytes ELSE 0 END) OVER (ORDER BY id ROWS UNBOUNDED PRECEDING) <= :context_budget_bytes
             THEN context::text ELSE NULL END AS context_payload
         FROM audit_page ORDER BY id'''
         audits, retained_context_bytes = await _paged_audit_rows(conn, text, audit_sql, {
             'cursor': decision_high_water, 'high_id': decision_end_high_water,
-            'start_utc': start.isoformat(), 'end_utc': max(end, snapshot_time).isoformat(), 'source_ids': source_ids,
+            'start_utc': start, 'end_utc': max(end, snapshot_time), 'source_ids': source_ids,
         }, cap=max_audit_rows)
     else:
         retained_context_bytes = 0
