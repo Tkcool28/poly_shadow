@@ -63,3 +63,15 @@ class PublisherTests(unittest.TestCase):
     def test_invalid_cadence(self):
         for value in (0, -1, float('nan'), float('inf')):
             with self.assertRaises(ValueError): p.horizon_proof(value)
+    def test_separate_diagnostic_snapshot_preserves_certified_fields_and_original_clock(self):
+        source=self.root/'private.json'; output=self.root/'diagnostic-comparison'/'summary.json'
+        diagnostic={'classification':'UNCERTIFIED_DIAGNOSTIC','certified':False,'state':'INCOMPLETE',
+                    'failureType':'SOURCE_FAILED','generatedUtc':'2026-01-01T00:00:00Z','overall':{}}
+        p.collector.atomic_json(source,diagnostic)
+        original={'stage1LiveMatches':{'state':'COMPARISON_NOT_AUTHORIZED','counts':None}}
+        pub=self.publisher(collect=lambda **kw:dict(original),diagnostic_snapshot=source,diagnostic_output=output)
+        self.assertTrue(pub.cycle())
+        self.assertEqual(p.collector.obj(output),diagnostic)
+        self.assertEqual(p.collector.obj(self.root/'public.json')['stage1LiveMatches'],original['stage1LiveMatches'])
+        source.unlink();self.now+=300;self.assertTrue(pub.cycle())
+        self.assertEqual(p.collector.obj(output),diagnostic)
