@@ -231,12 +231,13 @@ def reap_group(pgid):
   except ChildProcessError: return True
   if pid==0: return False
 
-def stop_process_group(child,grace_seconds=35,killpg=os.killpg,group_alive=process_group_alive,monotonic=time.monotonic,sleep=time.sleep,force_escalation=None):
+def stop_process_group(child,grace_seconds=35,killpg=os.killpg,group_alive=process_group_alive,monotonic=time.monotonic,sleep=time.sleep,force_escalation=None,initial_signal_sent=False):
  """Stop and verify the collector leader and all live descendants in its session."""
  pgid=child.pid
- try: killpg(pgid,signal.SIGTERM)
- except ProcessLookupError: pass
- except PermissionError: raise RuntimeError('COLLECTOR_GROUP_SIGNAL_DENIED')
+ if not initial_signal_sent:
+  try: killpg(pgid,signal.SIGTERM)
+  except ProcessLookupError: pass
+  except PermissionError: raise RuntimeError('COLLECTOR_GROUP_SIGNAL_DENIED')
  deadline=monotonic()+grace_seconds
  while (child.poll() is None or group_alive(pgid)) and monotonic()<deadline and not (force_escalation and force_escalation()):
   try: child.wait(timeout=min(0.05,max(0.001,deadline-monotonic())))
@@ -309,7 +310,7 @@ def _run(args,signal_state):
   base['startupCoverageGap']={'startUtc':boundary_start,'collectorSpawnReturnedUtc':now_utc(),
     'coverage':'UNKNOWN_UNPROVEN','reason':'SOURCE_STARTUP_BEFORE_FIRST_HEALTH_RECEIPTS_NOT_PROVEN'}
   atomic_json(run_dir/'diagnostic-manifest.json',base)
-  deadline_state={'observed':False,'aliveAtDeadline':False,'observedUtc':None}
+  deadline_state={'observed':False,'aliveAtDeadline':False,'observedUtc':None,'terminationForwarded':False}
   deadline_lock=threading.Lock()
   # Independent deadline remains effective while live export/report work runs.
   def deadline_stop():
@@ -317,7 +318,9 @@ def _run(args,signal_state):
     if deadline_state['observed']: return
     deadline_state.update(observed=True,aliveAtDeadline=child.poll() is None,observedUtc=now_utc())
     if deadline_state['aliveAtDeadline']:
-     try: os.killpg(child.pid,signal.SIGTERM)
+     try:
+      os.killpg(child.pid,signal.SIGTERM)
+      deadline_state['terminationForwarded']=True
      except ProcessLookupError: deadline_state['aliveAtDeadline']=False
   deadline_timer=threading.Timer(max(0,(parse_utc(planned_end)-parse_utc(now_utc())).total_seconds()),deadline_stop)
   deadline_timer.daemon=True; deadline_timer.start()
@@ -348,10 +351,10 @@ def _run(args,signal_state):
    if not waited['early']: deadline_stop()
    if deadline_state['aliveAtDeadline'] and not waited.get('interrupted'): waited['early']=False
    boundary_end=min(waited['endedUtc'],planned_end) if waited['early'] else planned_end
-   stop_process_group(child,grace_seconds=10,force_escalation=lambda:signal_state['count']>1)
+   stop_process_group(child,grace_seconds=10,force_escalation=lambda:signal_state['count']>1,initial_signal_sent=bool(signal_state.get('terminationForwarded') or deadline_state['terminationForwarded']))
    interrupted=bool(waited.get('interrupted') or signal_state['count'])
   except KeyboardInterrupt:
-   interrupted=True; boundary_end=now_utc(); signal_state.update({'number':signal.SIGINT,'name':'SIGINT','count':max(1,signal_state['count'])}); stop_process_group(child,grace_seconds=10,force_escalation=lambda:signal_state['count']>1)
+   interrupted=True; boundary_end=now_utc(); signal_state.update({'number':signal.SIGINT,'name':'SIGINT','count':max(1,signal_state['count'])}); stop_process_group(child,grace_seconds=10,force_escalation=lambda:signal_state['count']>1,initial_signal_sent=bool(signal_state.get('terminationForwarded') or deadline_state['terminationForwarded']))
   base['observedThroughUtc']=boundary_end
   exit_code=child.returncode
   deadline_timer.cancel()
@@ -406,7 +409,7 @@ def _run(args,signal_state):
   if 'deadline_timer' in locals(): deadline_timer.cancel()
   failure=str(exc) if re.fullmatch(r'[A-Z][A-Z0-9_]{2,80}',str(exc)) else type(exc).__name__
   if child is not None:
-   try: boundary_end=boundary_end or now_utc(); stop_process_group(child,grace_seconds=10,force_escalation=lambda:signal_state['count']>1)
+   try: boundary_end=boundary_end or now_utc(); stop_process_group(child,grace_seconds=10,force_escalation=lambda:signal_state['count']>1,initial_signal_sent=bool(signal_state.get('terminationForwarded') or locals().get('deadline_state',{}).get('terminationForwarded')))
    except Exception: failure='CollectorStopFailed'
   base.update({'state':'FAILED' if child is None else 'INCOMPLETE','failureType':failure,'endedUtc':now_utc()})
   if signal_state['count']:
@@ -434,7 +437,9 @@ def run(args):
    signal_state['number']=number; signal_state['name']=signal.Signals(number).name
   child=signal_state.get('child')
   if child is not None:
-   try: os.killpg(child.pid,signal.SIGTERM if signal_state['count']==1 else signal.SIGKILL)
+   try:
+    os.killpg(child.pid,signal.SIGTERM if signal_state['count']==1 else signal.SIGKILL)
+    signal_state['terminationForwarded']=True
    except ProcessLookupError: pass
  for number in (signal.SIGTERM,signal.SIGINT):
   previous[number]=signal.getsignal(number); signal.signal(number,record_signal)

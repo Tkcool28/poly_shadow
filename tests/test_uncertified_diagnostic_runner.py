@@ -108,6 +108,9 @@ class RunnerTests(unittest.TestCase):
         def alive(pgid): return not state['killed']
         runner.stop_process_group(child, grace_seconds=0.1, killpg=killpg, group_alive=alive, monotonic=clock.monotonic, sleep=clock.sleep)
         self.assertEqual(signals,[runner.signal.SIGTERM,runner.signal.SIGKILL])
+        signals=[]
+        runner.stop_process_group(FakeChild(exit_code=0),killpg=lambda pgid,sig:signals.append(sig),group_alive=lambda _:False,initial_signal_sent=True)
+        self.assertEqual(signals,[], 'already forwarded TERM must not re-enter graceful child shutdown')
 
     def execute_run(self, tmp, *, interrupted=False, early=False, launch_error=False, export_error=False, late_exit=False):
         repo=runner.ROOT; poly_repo=Path(tmp)/'poly2'; poly_repo.mkdir()
