@@ -1,143 +1,33 @@
-# Diagnostic readiness completion V1 — recovery checkpoint
+# Recovered diagnostic source checkpoint — October 21, 2026
 
-Status: **BLOCKED_DIAGNOSTIC_IMPLEMENTATION**. Current phase: **Phase 0, recovery**.
-This checkpoint is not implementation readiness, deployment approval, or a run result.
+Phase 0 recovery is complete enough to proceed. **Phase 1 implementation is in progress; NOT DEPLOYABLE.**
 
-## Controlling specification
+The cache worktree and its preservation directory were deleted by scratch pruning. Hermes recovered historical source snapshots and subsequent matching patch chains from read-only session records; the exact final deleted tree remains unverified. No Git implementation commit or staged diagnostic changes survived. All eight named implementation/test files and three tracked patch chains below are RECOVERED; existing collectors, V2 comparator, certified publisher and Poly2 models are PRESENT_IN_MAIN. The deleted working directories are LOST, but the source is recoverable from records. Historical tests do not establish current readiness.
 
-The complete supplied October 21 master plan is preserved alongside this file as
-`POLY_SHADOW_VS_POLY2_24_HOUR_COMPARISON_MASTER_PLAN_2026-10-21.md`.
-SHA-256: `5a09ea532f45700b5cdfd96fde529b498701b50efcc33f76a523dcdf42097b56`.
-The old Polycopy specialist plan is not the specification.
+| Recovered file | SHA-256 at recovery checkpoint |
+| --- | --- |
+| `scripts/poly2-diagnostic-export.py` | `f4c8a09b8e34c0d2314f95ec49400bd4b46c5170a6132c6441e26e78e3696b27` |
+| `scripts/uncertified-diagnostic-runner.py` | `5964d46f35087fb31e97cd8495b00b9c9b3bc4c6e629b63b9750229ab6840029` |
+| `src/compare/diagnostic-report-cli.ts` | `e5e0988238a0683d4acccffc94585b05ae8cd98691209c390703e052ad525787` |
+| `src/compare/uncertified-diagnostic.ts` | `24ac86e65779226117407e6cb77eef8df75c6ea27a441fb1b2f4b8ac96e397a4` |
+| `tests/test_poly2_diagnostic_export.py` | `d1124162e3cd037a5de04503006595e874742e5e7d74f95a46593e19795238b9` |
+| `tests/test_uncertified_diagnostic_runner.py` | `8845445487b6b3c14775176d06d9d945505019541ae5cd73a239ce18d5b2ad52` |
+| `tests/test_uncertified_diagnostic_integration.py` | `4bf13fe4ac2e41cee92ff6f202251c88652a1404bb2ef9591cb161fb15cdfe74` |
+| `tests/diagnostic-bounds.test.ts` | `89f9f319d3114eefc7fcb2b32c0483bc479eab076a8a93808aebdfeba863bf31` |
+| `scripts/status/index.html` | `25c7036526f2ee8408b9421bb0621ace9cf257f95f6452a61c439e15f68e3235` |
+| `src/compare/ndjson.ts` | `105fe2b4e9aa789881ee2c4514781d74e2acccba2e100322cd57e96d91adfc52` |
+| `tests/status-live-render.test.ts` | `e0858d406c1b19471774b1b73e32335059ca9441d1416fa011004ac2b712a820` |
 
-## Verified starting state
+Recovery tasks: `95d0287d-bb97-4f09-a38c-39d0d6511f52` (inspection) and `95b1203f-49ed-4bc0-91c5-4edfb8bcb886` (restoration). Durable VPS recovery checkout: `/root/hermes-workspaces/poly-shadow-diagnostic-readiness-v1`; implementation checkout: `/workspace/poly-shadow-diagnostic`; remote draft: https://github.com/Tkcool28/poly_shadow/pull/23 . No production checkouts or services modified.
 
-Read on October 21, 2026:
+Recovery-fidelity limitation: snapshots plus evidenced patch chains are recovered work, not an assertion that every last uncommitted edit survived. The prior exact final tree is LOST/UNVERIFIED. Source copies were checked against current recovered-file SHA-256 values before further edits.
 
-| Repository | Remote main (fresh full clone) | Production HEAD ref and main ref |
-| --- | --- | --- |
-| Tkcool28/poly_shadow | `29c0ff181dba212a56c50402766873afcd344ad2` | main, same SHA |
-| Tkcool28/Poly2 | `219ad2c66442632b5e41506ba485062420a27c15` | main, same SHA |
+Verified starting Shadow main `29c0ff181dba212a56c50402766873afcd344ad2`; Poly2 main `219ad2c66442632b5e41506ba485062420a27c15`. Both production HEAD/main refs agree; working-tree/runtime health was not inferred. No open PRs existed before this new draft. Controlling plan copied unchanged (SHA-256 `5a09ea532f45700b5cdfd96fde529b498701b50efcc33f76a523dcdf42097b56`).
 
-GitHub searches found no open PR in either repository. Shadow's remote branch
-inventory and `git ls-remote` found no diagnostic branch. Recent Shadow PR history
-through #22 was inspected; the recent work concerns certified monitoring,
-freshness, collector integration and memory controls, not a verified separate
-diagnostic exporter/runner/reporting path.
+Fresh recovery checks: TypeScript build PASS; focused bounds/dashboard Vitest 10 passed, 1 browser skip. Python recovered exporter/runner/integration 33 cases, 5 failures in restricted local environment (subprocess/IPC and process-group lifecycle); no readiness claim. Baseline main full local TypeScript: 695 passed, 2 failed, 1 skipped; baseline Python: 268 cases, 35 failures, 39 errors, 55 skipped. Baseline failures include IPC and /proc process-observation restrictions; unrestricted CI is required without weakening fixtures. No native PostgreSQL test executed yet. Baseline build/static safety PASS.
 
-Production revision checks used only filesystem reads of HEAD and branch refs.
-They do not establish clean working trees, DB health, current wallet approvals,
-or runtime configuration. No such conclusions are claimed.
+Known implementation gaps identified before fixes: V2 disabled in recovered runner; closed end-window bounds; no late-arrival reconciliation; no native-driver fixture; no enforced memory/CPU envelope; final-only dashboard; missing matched timing/examples/p90 and explicit price-unknown output. This checkpoint deliberately preserves recovered code before corrections. Do not merge/deploy it as a completed implementation.
 
-Development clone: `/workspace/poly-shadow-diagnostic`, outside production and
-outside the reported prunable Hermes cache. Remote branch:
-`feat/diagnostic-readiness-completion-v1`. The pushed draft PR is the durable copy
-of this progress; the local clone must not be treated as the only durable copy.
+No observer/resource benchmark or production DB evidence collected. PRICE_ADVANTAGE_UNKNOWN. An instantaneous Hermes VPS preflight free-space value (41,122,324,480 bytes) is not a runtime resource budget or headroom proof.
 
-## Recovery inventory
-
-| File/component | Classification | Direct evidence / remaining uncertainty |
-| --- | --- | --- |
-| `src/shadow/main.ts`, `config.ts`, `rest-poller.ts`, `racing.ts` | PRESENT_IN_MAIN | Three-lane entrypoint, V2 option, normalized clocks, native source journals and reconciliation inspected in starting main. Existing V2 configuration requires the historical exact five-wallet set; actual deployment cohort must be checked later. |
-| `src/compare/phase4-v2.ts`, `phase4.ts` | PRESENT_IN_MAIN | `compareV2()`, high-confidence/probable/ambiguous matching, coverage-dependent INDETERMINATE and retrospective classification inspected. No certified CLI changes proposed. |
-| `scripts/status/publisher.py`, `collector.py`, `index.html` | PRESENT_IN_MAIN | Existing atomic status publisher and certified surface exist; a separate diagnostic surface is still missing. |
-| Poly2 `backend/src/polycopy/models.py` | PRESENT_IN_MAIN | Persisted trades, signals, decision log and paper orders inspected as exporter inputs. No Poly2 edits. |
-| Poly2 vendored `poly2-comparison-checkpoint.py` | PRESENT_IN_MAIN | Existing certified SQL linkage reviewed as schema context, not used as a diagnostic exporter or bypassed. |
-| VPS `.git/worktrees/poly-shadow-diagnostic-v1/HEAD`, `gitdir`, `logs/HEAD` | RECOVERED (metadata only) | Worktree points to `feat/uncertified-diagnostic-comparison-v1`; gitdir references `/root/.hermes/cache/scratch/poly-shadow-diagnostic-v1/.git`. Two reflog entries only: creation at starting main and reset to the same SHA. Contents recorded below. No implementation commit proved. |
-| VPS `.git/refs/heads/feat/uncertified-diagnostic-comparison-v1` | RECOVERED (metadata only) | Contains starting Shadow main SHA only. Local branch name is not surviving implementation. |
-| Prior diagnostic exporter source and tests | UNVERIFIED, not declared LOST | Cache access denied by connector; no recovered source bytes. Exact filenames not independently known. |
-| Prior diagnostic runner source and tests | UNVERIFIED, not declared LOST | Same restriction. Historical test counts are not current test results. |
-| Prior diagnostic reporter/dashboard source and unfinished tests | UNVERIFIED, not declared LOST | Same restriction. |
-
-No implementation file is positively classified LOST yet. Forcing a LOST label
-would misrepresent the inaccessible evidence. No uncommitted Git recovery is
-claimed. Local fresh-clone `git fsck --no-reflogs --unreachable` produced no
-unreachable objects; that says nothing about VPS-only loose objects.
-
-Recovered worktree reflog SHA transitions:
-
-```
-0000000000000000000000000000000000000000 -> 29c0ff181dba212a56c50402766873afcd344ad2
-29c0ff181dba212a56c50402766873afcd344ad2 -> 29c0ff181dba212a56c50402766873afcd344ad2 (reset: moving to HEAD)
-```
-
-Other inspected locations: `/opt`, `/root/hermes-workspaces`, and existing local
-Shadow development directories under `/workspace/scratch/56ac43c22f1e`. No
-diagnostic implementation was identified there. This was not an exhaustive
-content scan of every persistent developer directory or Hermes archive.
-
-## Exact blocker and next corrective action
-
-Direct read-only `filesystem_list` of the reported cache path returned:
-`secret or credential path denied`. No alternate path or tool was used to
-circumvent that restriction.
-
-An ordinary Hermes read-only inspection request was submitted through the
-available `polycopy` routing context (the unrelated repository was explicitly
-excluded from changes). Task ID: `95d0287d-bb97-4f09-a38c-39d0d6511f52`.
-Its requested scope is inspection only: cache, reflogs, dangling objects without
-`--lost-found`, relevant logs/artifacts, exact surviving file paths and checksums.
-Latest task command status: **waiting_for_approval**. No recovery result exists
-yet. The gateway reports native Hermes approval gates and no MCP approval authority.
-
-Smallest next action: resolve that native read-only recovery approval, obtain
-the bounded recovery inventory and surviving source bytes, then commit recovered
-or minimally rebuilt components onto this branch. Do not start a duplicate
-implementation while the required recovery search is pending.
-
-## Implementation and validation at this checkpoint
-
-Only this checkpoint and the unchanged controlling plan have been added.
-Runner, bounded SQL exporter, reporter, public diagnostic surface and new
-regression tests are **not implemented by this checkpoint**.
-
-New implementation tests executed: **0**. Full TS/Python regression gates,
-native PostgreSQL exporter tests, resource/process fixtures, offline end-to-end
-diagnostic/dashboard fixture and independent final implementation review:
-**NOT RUN / NOT SATISFIED**. Existing historical passing counts are not reused.
-
-Preparation: `npm ci --ignore-scripts` succeeded (52 packages), and Python
-psycopg 3.3.6 plus existing authority dependencies installed locally.
-No local PostgreSQL server or initdb is installed. Package-manager setup failed
-with setgroups/setegid/seteuid permission errors; no native DB test is claimed.
-A later implementation can provision PostgreSQL in isolated CI if local server
-installation remains unavailable. No production DB may be used for fixtures.
-
-Checks applicable to the documentation checkpoint: original plan byte equality,
-Git whitespace check, and exact changed-file scope. These checks are not
-substitutes for diagnostic acceptance tests.
-
-Resource measurements: no observer RSS/CPU/disk/request measurements collected.
-Hermes preflight reported 41,122,324,480 free bytes on the VPS, an instantaneous
-metadata reading only, not an approved resource budget or 24-hour headroom proof.
-
-## Evidence limitations and future operator handoff
-
-No prospective observation, baseline DB export, actual five-wallet cohort read,
-matched example, decision/action result or quote evidence was collected.
-**PRICE_ADVANTAGE_UNKNOWN**. Poly2 paper orders have historical book snapshots,
-but those alone do not establish quotes at Shadow's earlier observation time.
-No quote sidecar has been added.
-
-Deployment readiness: **NO — Phase 0 blocked; do not deploy this draft**.
-Certified Stage 1 `COMPARISON_NOT_AUTHORIZED` semantics and all V5 code are
-unchanged. No source DB write, migration, capture activation, worker restart,
-observer launch, comparison launch, deployment or merge occurred.
-
-After recovery, implementation and all required exact-head tests/review pass:
-
-1. Stop for user review of the completed draft PR. Merge/deployment require
-   separate authorization; do not deploy this documentation checkpoint.
-2. In a separately authorized preflight, verify current mains and runtime,
-   freeze the actual five approved wallets, confirm baseline ingestion and
-   read-only DB credentials, and measure shared VPS resource headroom.
-3. Deploy only the reviewed separate diagnostic path with approved resource
-   ceilings and isolated run storage. Do not restart or alter Poly2.
-4. Authorize and run a short bounded smoke test; verify genuine normalization,
-   bounded read-only export, clocks, dashboard freshness and child cleanup.
-   Report `NO_MATCHED_EVENT_OBSERVED` if appropriate; do not invent an example.
-5. Review smoke evidence. A 24-hour comparison requires its own explicit start
-   authorization and a fresh exact UTC window; smoke time is excluded.
-
-This document intentionally supplies no executable launch command for a path
-that has not yet been implemented and validated.
+Next: fix actual scope gaps, run native isolated PostgreSQL and full relevant regressions, produce fixture report/dashboard, independently review final exact PR head, then stop for user review. Future deployment/preflight must separately authorize actual cohort freeze, current main/runtime/ingestion verification, read-only DB access and resource measurements. Next operational milestone is a short bounded smoke test; no 24-hour launch is authorized here.

@@ -73,3 +73,17 @@ it.skipIf(!chrome&&!process.env.CI)('headless Chrome renders unauthorized and pr
   }
  }finally{rmSync(root,{recursive:true,force:true});}
 },60000);
+
+it('diagnostic panel accepts only explicitly uncertified reports and remains separate from Stage 1',async()=>{
+ const data=fixture();const page=await dashboard(data);const d={classification:'UNCERTIFIED_DIAGNOSTIC',certified:false,state:'INCOMPLETE',runId:'fixture-run',window:{startUtc:'2030-01-01T00:00:00Z',endUtc:'2030-01-01T01:00:00Z'},overall:{matched:2,shadowOnlyObserved:1,poly2OnlyObserved:1,ambiguous:0,indeterminate:2,duplicateShadowObservationRows:1},wallets:[{walletAlias:'wallet-1',wallet:'0x01',counts:{matched:2,shadowOnlyObserved:1,poly2OnlyObserved:1,indeterminate:2}}],sources:[{source:'CHAIN',state:'UNKNOWN_UNPROVEN',observations:1,uniqueIdentities:1,observationLatencyFromEvent:{medianSeconds:2,p95Seconds:3},uncertainty:'coverage gap'}],actualPoly2PaperActions:{paperOrderExecutions:1,skipDecisions:0,unknownDecisionAudits:1},additionalShadowCandidates:{count:1}};
+ (page.context as any).diagnosticFixture=d;runInContext('renderDiagnosticReport(diagnosticFixture)',page.context);
+ expect(page.document.getElementById('diagnostic-state').textContent).toContain('UNCERTIFIED_DIAGNOSTIC · INCOMPLETE');
+ expect(page.document.getElementById('diagnostic-counts').textContent).toContain('INDETERMINATE');
+ expect(page.document.getElementById('diagnostic-wallets').textContent).toContain('wallet-1');
+ expect(page.document.getElementById('diagnostic-sources').textContent).toContain('coverage gap');
+ expect(page.document.getElementById('diagnostic-actions').textContent).toContain('eligibility UNKNOWN');
+ expect(page.state()).toContain('COMPARISON_NOT_AUTHORIZED');
+ runInContext("renderDiagnosticReport({...diagnosticFixture,certified:true})",page.context);
+ expect(page.document.getElementById('diagnostic-state').textContent).toContain('no valid diagnostic report');
+ expect(page.state()).toContain('COMPARISON_NOT_AUTHORIZED');
+});
