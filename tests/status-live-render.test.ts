@@ -29,6 +29,14 @@ async function dashboard(data:any){
  expect(document.getElementById('connection').hidden).toBe(true); // real refresh/render completed, not caught JS failure
  return {context,document,state:()=>document.getElementById('live-match-state').textContent};
 }
+it('known diagnostic failure survives a later projection fetch outage',async()=>{
+ const page=await dashboard(fixture());
+ runInContext(`diagnosticSnapshot={classification:'UNCERTIFIED_DIAGNOSTIC',certified:false,state:'INCOMPLETE',failureType:'SOURCE_FAILED',generatedUtc:'2030-01-01T00:40:00Z',overall:{matched:2},wallets:[],sources:[]};fetch=async()=>{throw Error('offline')};void refreshDiagnostic()`,page.context);
+ await new Promise(r=>setImmediate(r));
+ expect(page.document.getElementById('diagnostic-state').textContent).toContain('SOURCE_FAILED');
+ expect(page.document.getElementById('diagnostic-state').textContent).toContain('LAST-KNOWN');
+ expect(page.document.getElementById('diagnostic-counts').textContent).toContain('2');
+});
 it('fresh unbound unauthorized publisher JSON renders its state rather than stale',async()=>{
  const data=fixture();const page=await dashboard(data);
  expect(data.stage1LiveMatches.generatedUtc).toBe(data.generatedUtc);

@@ -43,3 +43,10 @@ it('keeps one-sided observations indeterminate and retrospective/exact-end rows 
  expect(r.retrospectiveAndUnknown.shadow).toHaveLength(1);
  expect(r.timing.every(x=>x.detectionLatency.samples===0)).toBe(true);
 });
+it('scopes economic candidate groups by wallet while retaining original source group references',async()=>{
+ const r=await run([row(),row({wallet:WALLETS[1],sourceRecordId:2,sourceEventId:'second-wallet'})],
+  [obs('CHAIN',2,3),obs('CHAIN',2,3,{wallet:WALLETS[1]})]);
+ expect(r.discovery.shadowUnionUnique).toBe(2);expect(r.overall.matched).toBe(2);
+ expect(r.wallets[0]!.counts.matched).toBe(1);expect(r.wallets[1]!.counts.matched).toBe(1);
+ expect(r.examples[0]!.sourceGroupReferences).toEqual(r.examples[1]!.sourceGroupReferences);
+});

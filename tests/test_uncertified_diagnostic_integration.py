@@ -79,7 +79,7 @@ class OfflineDiagnosticIntegration(unittest.TestCase):
                 data_dir=Path(env['SHADOW_DATA_DIR']); data_dir.mkdir(parents=True,exist_ok=True)
                 (data_dir/'source_observations.ndjson').write_text(chr(10).join(json.dumps(row) for row in source_rows)+chr(10))
                 (data_dir/'rest_poll_receipts.ndjson').write_text(json.dumps({'source':'REST_ACTIVITY','wallet':exporter.WALLETS[1],'responseUtc':'2026-10-19T00:00:10.000000Z','outcome':'HTTP_FAILURE','stopReason':None})+chr(10))
-                return types.SimpleNamespace(pid=34567,returncode=0,poll=lambda:0)
+                return types.SimpleNamespace(pid=34567,returncode=None,poll=lambda:None)
             def fake_export(container,script,manifest,path):
                 self.assertEqual(manifest['poly2Preflight']['tradeIdHighWater'],0)
                 self.assertEqual(manifest['poly2EndPreflight']['tradeIdHighWater'],3)
@@ -110,7 +110,8 @@ class OfflineDiagnosticIntegration(unittest.TestCase):
                 stack.enter_context(patch.object(runner,'now_utc',side_effect=lambda:next(times,'2026-10-19T00:01:01.000000Z')))
                 stack.enter_context(patch.object(runner.subprocess,'Popen',side_effect=fake_popen))
                 stack.enter_context(patch.object(runner,'wait_for_window',return_value={'endedUtc':'2026-10-19T00:01:00.000000Z','early':False}))
-                stack.enter_context(patch.object(runner,'stop_process_group',return_value=None))
+                stack.enter_context(patch.object(runner,'stop_process_group',side_effect=lambda child,**kw:setattr(child,'returncode',0)))
+                stack.enter_context(patch.object(runner.os,'killpg',return_value=None))
                 stack.enter_context(patch.object(runner,'export_poly2',side_effect=fake_export))
                 stack.enter_context(patch.object(runner.subprocess,'run',side_effect=report_only))
                 rc=runner.run(args)

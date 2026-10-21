@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded, read-only Poly2 export for UNCERTIFIED_DIAGNOSTIC.
 
-This script is executed in the existing backend container. It performs no
+This script runs independently with a dedicated SELECT-only DSN. It performs no
 writes and never reads mutable order, settlement, or current eligibility state.
 Decision-log rows are application audit evidence, not a DB-enforced immutable
 ledger; reports must retain that limitation.
@@ -369,7 +369,9 @@ async def read_export(conn, text, *, start_utc: str, end_utc: str, run_id: str,
     # Sequence allocation is not commit order: a pre-start allocated ID may
     # commit during the window. Retain the start mark as metadata, never as a
     # lower selection fence. The repeatable-read snapshot supplies visibility.
-    params.update(start_utc=start, end_utc=end, cursor=0, high_id=trade_end_high_water)
+    visible_trade_high = int(trade_max_rows[0]['max_id'])
+    visible_decision_high = int(decision_max_rows[0]['max_id'])
+    params.update(start_utc=start, end_utc=end, cursor=0, high_id=visible_trade_high)
     trade_sql = f'''SELECT t.id AS source_record_id,
         CASE WHEN octet_length(t.polymarket_trade_id) <= 512 THEN t.polymarket_trade_id ELSE NULL END AS source_event_id,
         lower(w.address) AS wallet, t.asset_id, m.condition_id, t.side, t.size, t.price,
@@ -408,7 +410,7 @@ async def read_export(conn, text, *, start_utc: str, end_utc: str, run_id: str,
         if len(signal_ids) != len(set(signal_ids)):
             raise RuntimeError('duplicate signal primary keys returned')
     audits: list[dict[str, Any]] = []
-    if source_ids and decision_end_high_water > decision_high_water:
+    if source_ids and visible_decision_high > 0:
         audit_sql = '''WITH audit_page AS MATERIALIZED (
           SELECT id, actor, action, context, created_at,
             COALESCE(octet_length(context::text), 0) AS context_bytes
@@ -426,7 +428,7 @@ async def read_export(conn, text, *, start_utc: str, end_utc: str, run_id: str,
             THEN context::text ELSE NULL END AS context_payload
         FROM audit_page ORDER BY id'''
         audits, retained_context_bytes = await _paged_audit_rows(conn, text, audit_sql, {
-            'cursor': decision_high_water, 'high_id': decision_end_high_water,
+            'cursor': 0, 'high_id': visible_decision_high,
             'start_utc': start, 'end_utc': max(end, snapshot_time), 'source_ids': source_ids,
         }, cap=max_audit_rows)
     else:
@@ -461,8 +463,10 @@ async def read_export(conn, text, *, start_utc: str, end_utc: str, run_id: str,
             'decisionLogIdRange': {'after': decision_high_water, 'through': decision_end_high_water},
             'tradeIdBoundary': 'SNAPSHOT_VISIBLE_ID_THROUGH_END_MARK; PRESTART_MARK_METADATA_ONLY',
             'queryLowerIdExclusive': 0,
+            'exportSnapshotHighWater': {'trade':visible_trade_high,'decision':visible_decision_high},
+            'decisionQueryLowerIdExclusive': 0,
             'prestartAllocatedIdsIncluded': sum(r['sourceRecordId'] <= trade_high_water for r in rows),
-            'decisionAuditBoundary': 'PRIMARY_KEY_RANGE_AFTER_PRESTART_HIGH_WATER_AND_OBSERVATION_INTERVAL',
+            'decisionAuditBoundary': 'SNAPSHOT_VISIBLE_IDS_AND_TIMESTAMP_LINKAGE; PRESTART_MARK_METADATA_ONLY',
             'decisionAuditCompleteWithinConfiguredCap': True, 'decisionAuditRows': len(audits),
             'decisionAuditContext': {'retainedBytes':retained_context_bytes,'maxRowBytes':MAX_AUDIT_CONTEXT_ROW_BYTES,'maxTotalBytes':MAX_AUDIT_CONTEXT_TOTAL_BYTES,'maxPageBytes':MAX_AUDIT_CONTEXT_PAGE_BYTES,'evidenceCounts':context_evidence_counts,'complete': all(k=='AVAILABLE' for k in context_evidence_counts) or not audits},
             'decisionAuditEvidenceClass': 'APPLICATION_WRITTEN_DECISION_LOG; DATABASE_IMMUTABILITY_NOT_GUARANTEED',

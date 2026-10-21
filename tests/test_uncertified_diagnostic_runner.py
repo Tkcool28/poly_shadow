@@ -109,21 +109,21 @@ class RunnerTests(unittest.TestCase):
         runner.stop_process_group(child, grace_seconds=0.1, killpg=killpg, group_alive=alive, monotonic=clock.monotonic, sleep=clock.sleep)
         self.assertEqual(signals,[runner.signal.SIGTERM,runner.signal.SIGKILL])
 
-    def execute_run(self, tmp, *, interrupted=False, early=False, launch_error=False, export_error=False):
+    def execute_run(self, tmp, *, interrupted=False, early=False, launch_error=False, export_error=False, late_exit=False):
         repo=runner.ROOT; poly_repo=Path(tmp)/'poly2'; poly_repo.mkdir()
         run_root=Path(tmp)/'runs'; start='2026-10-19T00:00:00.000000Z'
         before={'imageId':'sha256:'+'a'*64,'revisionLabel':runner.EXPECTED_POLY2_SHA,'flags':runner.REQUIRED_FLAGS.copy()}
         highs=[{'classification':'UNCERTIFIED_DIAGNOSTIC','certified':False,'mode':'preflight','cohort':list(runner.WALLETS),'approvedWallets':list(runner.WALLETS),'tradeIdHighWater':5,'decisionLogIdHighWater':3},
                {'classification':'UNCERTIFIED_DIAGNOSTIC','certified':False,'mode':'preflight','cohort':list(runner.WALLETS),'approvedWallets':list(runner.WALLETS),'tradeIdHighWater':8,'decisionLogIdHighWater':7}]
         args=types.SimpleNamespace(repo=repo,poly2_repo=poly_repo,run_root=run_root,poly2_container='fake-backend',duration_seconds=60,publish_dashboard=False,dashboard_summary=Path(tmp)/'diagnostic-comparison'/'latest.json')
-        child=FakeChild(exit_code=0)
+        child=FakeChild()
         cli=types.SimpleNamespace(returncode=0,stdout='{}',stderr='')
         now_values=iter((start,'2026-10-19T00:01:02.000000Z'))
         def fake_report(cmd, **kwargs):
             run_dir=Path(cmd[cmd.index('--run-directory')+1])
             (run_dir/'diagnostic-report.json').write_text('{"fixture":true}\\n')
             return cli
-        wait_effect=KeyboardInterrupt if interrupted else lambda *a,**k:({'endedUtc':'2026-10-19T00:00:20.000000Z','early':True} if early else {'endedUtc':'2026-10-19T00:01:00.000000Z','early':False})
+        wait_effect=KeyboardInterrupt if interrupted else lambda *a,**k:({'endedUtc':'2026-10-19T00:01:20.000000Z' if late_exit else '2026-10-19T00:00:20.000000Z','early':True} if early else {'endedUtc':'2026-10-19T00:01:00.000000Z','early':False})
         export_effect=(lambda *a,**k:(_ for _ in ()).throw(RuntimeError('export failed'))) if export_error else lambda container,script,manifest,out:runner.atomic_json(out,{'runId':manifest['runId'],'classification':'UNCERTIFIED_DIAGNOSTIC','certified':False})
         def fake_launch(*args, **kwargs):
             data_dir = Path(kwargs['env']['SHADOW_DATA_DIR'])
@@ -137,7 +137,8 @@ class RunnerTests(unittest.TestCase):
              patch.object(runner,'now_utc',side_effect=lambda:next(now_values,'2026-10-19T00:01:02.000000Z')), \
              patch.object(runner.subprocess,'Popen',side_effect=fake_launch), \
              patch.object(runner,'wait_for_window',side_effect=wait_effect), \
-             patch.object(runner,'stop_process_group',return_value=None) as stopped, \
+             patch.object(runner,'stop_process_group',side_effect=lambda *a,**k:setattr(child,'returncode',0)) as stopped, \
+             patch.object(runner.os,'killpg',return_value=None), \
              patch.object(runner,'export_poly2',side_effect=export_effect) as exported, \
              patch.object(runner.subprocess,'run',side_effect=fake_report) as reported:
             if launch_error:
@@ -171,6 +172,13 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(m['poly2Preflight']['tradeIdHighWater'],5)
             self.assertEqual(m['poly2EndPreflight']['tradeIdHighWater'],8)
             self.assertTrue((run_dir/'poly2-export.json').is_file())
+
+    def test_late_poll_of_early_exit_never_proves_complete_window(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(runner.threading,'Timer'):
+            rc,m,_=self.execute_run(tmp,early=True,late_exit=True)
+            self.assertEqual(rc,2)
+            self.assertEqual(m['state'],'INCOMPLETE')
+            self.assertFalse(m['collectorDeadlineObservation']['aliveAtDeadline'])
 
     def test_interruption_and_early_exit_preserve_incomplete_manifest(self):
         for kwargs,expected_rc in (({'interrupted':True},130),({'early':True},2)):

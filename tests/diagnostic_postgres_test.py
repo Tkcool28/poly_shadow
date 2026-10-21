@@ -56,7 +56,7 @@ class NativeDiagnosticPostgres(unittest.TestCase):
                 await c.execute(text('GRANT SELECT ON ALL TABLES IN SCHEMA public TO fixture_reader'))
 
             kwargs = dict(start_utc=START.isoformat(), end_utc=END.isoformat(), run_id='native-fixture',
-                decision_high_water=0, decision_end_high_water=10, trade_high_water=2, trade_end_high_water=3,
+                decision_high_water=9, decision_end_high_water=10, trade_high_water=2, trade_end_high_water=3,
                 shadow_sha='1'*40, poly2_checkout_sha='2'*40, runtime_image_id=None, runtime_revision=None,
                 exported_utc=(END+dt.timedelta(seconds=30)).isoformat())
             async with reader.connect() as c:

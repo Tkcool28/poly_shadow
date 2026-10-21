@@ -270,10 +270,19 @@ def _run(args,signal_state):
   publish_progress(args,progress_projection(base))
   child=subprocess.Popen(['node','--max-old-space-size=3072','--import','tsx','src/shadow/main.ts'],cwd=repo,env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
   signal_state['child']=child
+  base['startupCoverageGap']={'startUtc':boundary_start,'collectorSpawnReturnedUtc':now_utc(),
+    'coverage':'UNKNOWN_UNPROVEN','reason':'SOURCE_STARTUP_BEFORE_FIRST_HEALTH_RECEIPTS_NOT_PROVEN'}
+  atomic_json(run_dir/'diagnostic-manifest.json',base)
+  deadline_state={'observed':False,'aliveAtDeadline':False,'observedUtc':None}
+  deadline_lock=threading.Lock()
   # Independent deadline remains effective while live export/report work runs.
   def deadline_stop():
-   try: os.killpg(child.pid,signal.SIGTERM)
-   except ProcessLookupError: pass
+   with deadline_lock:
+    if deadline_state['observed']: return
+    deadline_state.update(observed=True,aliveAtDeadline=child.poll() is None,observedUtc=now_utc())
+    if deadline_state['aliveAtDeadline']:
+     try: os.killpg(child.pid,signal.SIGTERM)
+     except ProcessLookupError: deadline_state['aliveAtDeadline']=False
   deadline_timer=threading.Timer(max(0,(parse_utc(planned_end)-parse_utc(now_utc())).total_seconds()),deadline_stop)
   deadline_timer.daemon=True; deadline_timer.start()
   monitor_started=time.monotonic()
@@ -299,8 +308,9 @@ def _run(args,signal_state):
    atomic_json(run_dir/'diagnostic-checkpoint.json',{'observedUtc':now_utc(),'state':base['state'],'window':base['window'],'resource':observed})
   try:
    waited=wait_for_window(child,max(0,(parse_utc(planned_end)-parse_utc(now_utc())).total_seconds()),check_storage=check_disk,signal_state=signal_state)
-   if waited['early'] and not waited.get('interrupted') and parse_utc(waited['endedUtc'])>=parse_utc(planned_end): waited['early']=False
-   boundary_end=waited['endedUtc'] if waited['early'] else planned_end
+   if not waited['early']: deadline_stop()
+   if deadline_state['aliveAtDeadline'] and not waited.get('interrupted'): waited['early']=False
+   boundary_end=min(waited['endedUtc'],planned_end) if waited['early'] else planned_end
    stop_process_group(child,grace_seconds=10,force_escalation=lambda:signal_state['count']>1)
    interrupted=bool(waited.get('interrupted') or signal_state['count'])
   except KeyboardInterrupt:
@@ -308,6 +318,7 @@ def _run(args,signal_state):
   base['observedThroughUtc']=boundary_end
   exit_code=child.returncode
   deadline_timer.cancel()
+  base['collectorDeadlineObservation']=deadline_state
   if boundary_end is None: boundary_end=now_utc()
   if interrupted:
    signum=signal_state['number'] or signal.SIGINT
@@ -323,9 +334,11 @@ def _run(args,signal_state):
   lag_seconds=getattr(args,'late_arrival_grace_seconds',0)
   if lag_seconds: time.sleep(lag_seconds)
   end_pre=preflight(export_source,script)
-  base.update({'window':{'startUtc':boundary_start,'endUtc':boundary_end},'endedUtc':now_utc(),'plannedEndUtc':planned_end,'poly2EndPreflight':end_pre,'software':{**base['software'],'runtimeStable':stable},'collectorExitCode':exit_code,'collectorEndedAtRequestedDuration':boundary_end==planned_end,'interrupted':False,'poly2RuntimeStable':stable})
-  complete=(not interrupted and boundary_end==planned_end and exit_code==0 and stable and end_pre['cohort']==list(WALLETS))
-  base['state']='INCOMPLETE'; base['reportState']='FINALIZING'; atomic_json(run_dir/'diagnostic-manifest.json',base)
+  base.update({'window':{'startUtc':boundary_start,'endUtc':boundary_end},'endedUtc':now_utc(),'plannedEndUtc':planned_end,'poly2EndPreflight':end_pre,'software':{**base['software'],'runtimeStable':stable},'collectorExitCode':exit_code,'collectorEndedAtRequestedDuration':deadline_state['aliveAtDeadline'],'interrupted':False,'poly2RuntimeStable':stable})
+  complete=(not interrupted and deadline_state['aliveAtDeadline'] and boundary_end==planned_end and exit_code==0 and stable and end_pre['cohort']==list(WALLETS))
+  base['state']='INCOMPLETE'; base['reportState']='FINALIZING';
+  if not complete: base['failureType']='COLLECTOR_DEADLINE_NOT_PROVEN' if not deadline_state['aliveAtDeadline'] else 'COLLECTOR_NONZERO_EXIT_OR_BASELINE_CHANGED'
+  atomic_json(run_dir/'diagnostic-manifest.json',base)
   if not stable: raise RuntimeError('POLY2_RUNTIME_CHANGED_DURING_OBSERVATION')
   export_poly2(export_source,script,base,run_dir/'poly2-export.json')
   cmd=['node','--max-old-space-size=384','--import','tsx','src/compare/diagnostic-report-cli.ts','--run-directory',str(run_dir),'--poly2-export',str(run_dir/'poly2-export.json')]
