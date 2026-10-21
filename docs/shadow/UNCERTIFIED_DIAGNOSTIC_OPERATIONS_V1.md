@@ -34,6 +34,15 @@ outages, pagination limits, normalization failures and missing clocks remain
 evidence, not zero counts or completeness proofs. Wall-clock discontinuities
 fail the run rather than silently stretching the window.
 
+The Linux runner temporarily becomes a child subreaper, waits the Popen leader
+before collecting adopted children in that exact process group, and restores
+its previous subreaper setting afterward. A late poll cannot prove a complete
+window: completion requires a separate deadline observation that found the
+collector still alive before sending shutdown. Startup coverage remains
+explicitly unproven. Checkpoints retain actual cgroup memory-current/peak and
+CPU usage/throttling counters when readable; missing measurements are UNKNOWN.
+Smoke runs are labeled BOUNDED_SMOKE_TEST even if their bounded lifecycle completes.
+
 `scripts/poly2-diagnostic-export.py` runs on the Shadow host using a dedicated
 SELECT-only PostgreSQL role, a private <=4 KiB DSN file and the native asyncpg
 driver. It does not import Poly2 runtime settings or require changing/restarting

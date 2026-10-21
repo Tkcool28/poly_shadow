@@ -35,3 +35,12 @@ class DiagnosticResources(unittest.TestCase):
             self.assertFalse(inventory['rawEvidencePublic'])
             self.assertEqual(inventory['files'][0]['file'],'shadow-data/source_observations.ndjson')
             self.assertEqual(len(inventory['files'][0]['sha256']),64)
+
+    def test_usage_counters_are_measured_or_unknown_without_invented_zeroes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);leaf=root/'fixture';leaf.mkdir();membership=root/'membership';membership.write_text('0::/fixture\n')
+            self.assertEqual(R.resource_usage(root,membership)['state'],'UNKNOWN')
+            (leaf/'cpu.stat').write_text('usage_usec 1234\nthrottled_usec 50\n')
+            (leaf/'memory.current').write_text('1024');(leaf/'memory.peak').write_text('2048')
+            counters=R.resource_usage(root,membership)
+            self.assertEqual(counters['memoryPeakBytes'],2048);self.assertEqual(counters['cpuUsageMicroseconds'],1234)

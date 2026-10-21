@@ -121,7 +121,7 @@ class RunnerTests(unittest.TestCase):
         now_values=iter((start,'2026-10-19T00:01:02.000000Z'))
         def fake_report(cmd, **kwargs):
             run_dir=Path(cmd[cmd.index('--run-directory')+1])
-            (run_dir/'diagnostic-report.json').write_text('{"fixture":true}\\n')
+            (run_dir/'diagnostic-report.json').write_text('{"fixture":true}\n')
             return cli
         wait_effect=KeyboardInterrupt if interrupted else lambda *a,**k:({'endedUtc':'2026-10-19T00:01:20.000000Z' if late_exit else '2026-10-19T00:00:20.000000Z','early':True} if early else {'endedUtc':'2026-10-19T00:01:00.000000Z','early':False})
         export_effect=(lambda *a,**k:(_ for _ in ()).throw(RuntimeError('export failed'))) if export_error else lambda container,script,manifest,out:runner.atomic_json(out,{'runId':manifest['runId'],'classification':'UNCERTIFIED_DIAGNOSTIC','certified':False})
@@ -139,6 +139,7 @@ class RunnerTests(unittest.TestCase):
              patch.object(runner,'wait_for_window',side_effect=wait_effect), \
              patch.object(runner,'stop_process_group',side_effect=lambda *a,**k:setattr(child,'returncode',0)) as stopped, \
              patch.object(runner.os,'killpg',return_value=None), \
+             patch.object(runner.threading,'Timer'), \
              patch.object(runner,'export_poly2',side_effect=export_effect) as exported, \
              patch.object(runner.subprocess,'run',side_effect=fake_report) as reported:
             if launch_error:

@@ -2,6 +2,7 @@
 """Run an isolated, bounded PAPER-only UNCERTIFIED_DIAGNOSTIC comparison."""
 from __future__ import annotations
 import argparse
+import ctypes
 import hashlib
 import datetime as dt
 import fcntl
@@ -125,6 +126,18 @@ def resource_envelope(root=Path('/sys/fs/cgroup'),membership=Path('/proc/self/cg
  except ValueError: raise RuntimeError('FINITE_RESOURCE_LIMITS_REQUIRED')
  return {'memoryMaxBytes':memory,'swapMaxBytes':swap,'cpuQuota':quota,'cpuPeriod':period,'pidsMax':pids,'enforcement':'KERNEL_CGROUP_V2'}
 
+def resource_usage(root=Path('/sys/fs/cgroup'),membership=Path('/proc/self/cgroup')):
+ try:
+  unified=[r.split(':',2)[2] for r in membership.read_text().splitlines() if r.startswith('0::')]
+  if len(unified)!=1 or '..' in Path(unified[0]).parts: raise ValueError()
+  path=root/unified[0].lstrip('/')
+  cpu=dict(line.split() for line in (path/'cpu.stat').read_text().splitlines())
+  return {'state':'MEASURED','scope':'DIAGNOSTIC_CGROUP_INCLUDING_REPORTER',
+    'memoryCurrentBytes':int((path/'memory.current').read_text()),
+    'memoryPeakBytes':int((path/'memory.peak').read_text()),
+    'cpuUsageMicroseconds':int(cpu['usage_usec']),'cpuThrottledMicroseconds':int(cpu.get('throttled_usec','0'))}
+ except (OSError,ValueError,KeyError): return {'state':'UNKNOWN','reason':'CGROUP_USAGE_UNAVAILABLE'}
+
 def publish_progress(args,value):
  if not args.publish_dashboard: return
  path=assert_isolated_path(getattr(args,'publisher_snapshot',None) or args.dashboard_summary)
@@ -159,7 +172,7 @@ def check_retained_limit(directory,cap=6*1024**3):
 def progress_projection(base,state=None):
  return {'classification':'UNCERTIFIED_DIAGNOSTIC','certified':False,'state':state or base['state'],
   'runId':base['runId'],'window':base.get('window',{}),'plannedEndUtc':base.get('plannedEndUtc'),
-  'generatedUtc':now_utc(),'failureType':base.get('failureType'),
+  'generatedUtc':now_utc(),'failureType':base.get('failureType'),'runKind':base.get('runKind'),
   'overall':{},'wallets':[{'wallet':w,'counts':{}} for w in WALLETS],
   'sources':[{'source':s,'state':'UNKNOWN_UNPROVEN','uncertainty':'No completed snapshot yet'} for s in ('CHAIN','REST_TRADES','REST_ACTIVITY')],
   'priceOpportunity':{'state':'PRICE_ADVANTAGE_UNKNOWN'}}
@@ -205,6 +218,19 @@ def process_group_alive(pgid):
  except ProcessLookupError: return False
  except PermissionError: return True
 
+def set_subreaper():
+ libc=ctypes.CDLL(None,use_errno=True); prior=ctypes.c_int()
+ if libc.prctl(37,ctypes.byref(prior),0,0,0)!=0 or libc.prctl(36,1,0,0,0)!=0:
+  raise RuntimeError('LINUX_CHILD_SUBREAPER_REQUIRED')
+ return prior.value
+
+def reap_group(pgid):
+ """Only adopted children in our collector's owned process group."""
+ while True:
+  try: pid,_=os.waitpid(-pgid,os.WNOHANG)
+  except ChildProcessError: return True
+  if pid==0: return False
+
 def stop_process_group(child,grace_seconds=35,killpg=os.killpg,group_alive=process_group_alive,monotonic=time.monotonic,sleep=time.sleep,force_escalation=None):
  """Stop and verify the collector leader and all live descendants in its session."""
  pgid=child.pid
@@ -212,22 +238,30 @@ def stop_process_group(child,grace_seconds=35,killpg=os.killpg,group_alive=proce
  except ProcessLookupError: pass
  except PermissionError: raise RuntimeError('COLLECTOR_GROUP_SIGNAL_DENIED')
  deadline=monotonic()+grace_seconds
- while group_alive(pgid) and monotonic()<deadline and not (force_escalation and force_escalation()):
+ while (child.poll() is None or group_alive(pgid)) and monotonic()<deadline and not (force_escalation and force_escalation()):
   try: child.wait(timeout=min(0.05,max(0.001,deadline-monotonic())))
   except subprocess.TimeoutExpired: pass
   sleep(min(0.05,max(0,deadline-monotonic())))
- if group_alive(pgid):
+ if child.poll() is None or group_alive(pgid):
   try: killpg(pgid,signal.SIGKILL)
   except ProcessLookupError: pass
   except PermissionError: raise RuntimeError('COLLECTOR_GROUP_KILL_DENIED')
   deadline=monotonic()+5
-  while group_alive(pgid) and monotonic()<deadline:
+  while (child.poll() is None or group_alive(pgid)) and monotonic()<deadline:
    try: child.wait(timeout=min(0.05,max(0.001,deadline-monotonic())))
    except subprocess.TimeoutExpired: pass
    sleep(min(0.05,max(0,deadline-monotonic())))
  if group_alive(pgid): raise RuntimeError('COLLECTOR_GROUP_DID_NOT_EXIT')
  try: child.wait(timeout=0.1)
  except subprocess.TimeoutExpired: raise RuntimeError('COLLECTOR_LEADER_DID_NOT_EXIT')
+ # A group of zombies is no longer running, but still must be reaped by the
+ # runner's subreaper rather than left for an unrelated init process.
+ deadline=monotonic()+5
+ while not reap_group(pgid):
+  if monotonic()>=deadline: raise RuntimeError('COLLECTOR_DESCENDANTS_NOT_REAPED')
+  try: killpg(pgid,signal.SIGKILL)
+  except ProcessLookupError: pass
+  sleep(0.02)
 
 def wait_for_window(child,duration_seconds,monotonic=time.monotonic,wall=now_utc,check_storage=None,check_interval=5.0,signal_state=None):
  deadline=monotonic()+duration_seconds; next_check=monotonic()+check_interval
@@ -260,6 +294,8 @@ def _run(args,signal_state):
  child=None; boundary_start=None; boundary_end=None; interrupted=False; exit_code=None
  try:
   storage=storage_preflight(repo,data_dir); base['resourcePreflight']=storage
+  base['resourceAtStart']=resource_usage()
+  base['runKind']='TWENTY_FOUR_HOUR_DIAGNOSTIC' if args.duration_seconds==86400 else 'BOUNDED_SMOKE_TEST'
   env=os.environ.copy(); env.update(SHADOW_WATCHED_WALLETS=','.join(WALLETS),SHADOW_DATA_DIR=str(data_dir),SHADOW_V2_CURSOR='true')
   for key in list(env):
    if key in ('PRIVATE_KEY','CLOB_API_KEY','CLOB_API_SECRET','CLOB_API_PASSPHRASE','FUNDER_ADDRESS','RELAYER_API_KEY','RELAYER_API_KEY_ADDRESS') or key.startswith(('ARB_','SCALP_')): raise RuntimeError('SHADOW_CREDENTIAL_GUARD_FAILED')
@@ -290,6 +326,7 @@ def _run(args,signal_state):
   def check_disk():
    nonlocal next_projection
    observed=storage_telemetry(repo,data_dir,time.monotonic()-monitor_started)
+   observed['resourceUsage']=resource_usage()
    if observed['disk']['state']!='GREEN': raise RuntimeError('STORAGE_BUDGET_EXHAUSTED')
    check_retained_limit(data_dir)
    wall_elapsed=(parse_utc(now_utc())-parse_utc(boundary_start)).total_seconds()
@@ -350,6 +387,7 @@ def _run(args,signal_state):
   if not report_path.is_file(): raise RuntimeError('REPORT_ARTIFACT_MISSING')
   if report_path.exists():
    final=json.loads(report_path.read_text()); final['state']='COMPLETE' if complete else 'INCOMPLETE'
+   final['resourceMeasurements']={'atStart':base['resourceAtStart'],'atEnd':resource_usage()}
    atomic_json(report_path,final); publish_progress(args,final)
    inventory=evidence_inventory(run_dir); atomic_json(run_dir/'evidence-manifest.json',inventory)
    base['finalReportSha256']=hashlib.sha256(report_path.read_bytes()).hexdigest()
@@ -359,6 +397,7 @@ def _run(args,signal_state):
     atomic_json(assert_isolated_path(public/'evidence-manifest.json'),inventory,0o644)
     atomic_json(assert_isolated_path(public/'report-sha256.json'),{'sha256':base['finalReportSha256']},0o644)
   base['state']='COMPLETE' if complete else 'INCOMPLETE'; base['reportState']='AVAILABLE'
+  base['resourceAtEnd']=resource_usage()
   base['observationContinuity']='SOURCE_GAPS_DISCLOSED_NOT_PROVEN_CONTINUOUS'
   atomic_json(run_dir/'diagnostic-manifest.json',base)
   print(json.dumps({'classification':'UNCERTIFIED_DIAGNOSTIC','certified':False,'runId':run_id,'state':base['state'],'runDirectory':str(run_dir),'report':str(run_dir/'diagnostic-report.json'),'dashboardPublished':bool(args.publish_dashboard)},separators=(',',':')))
@@ -386,6 +425,7 @@ def _run(args,signal_state):
   return 2
 
 def run(args):
+ previous_subreaper=set_subreaper()
  signal_state={'count':0,'number':None,'name':None}
  previous={}
  def record_signal(number,_frame):
@@ -407,6 +447,7 @@ def run(args):
  finally:
   if fd is not None: os.close(fd)
   for number,handler in previous.items(): signal.signal(number,handler)
+  if ctypes.CDLL(None).prctl(36,previous_subreaper,0,0,0)!=0: raise RuntimeError('SUBREAPER_RESTORE_FAILED')
 
 
 def main(argv=None):

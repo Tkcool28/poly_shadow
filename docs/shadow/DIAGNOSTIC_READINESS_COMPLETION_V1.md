@@ -1,6 +1,10 @@
-# Recovered diagnostic source checkpoint — October 21, 2026
+# Historical recovered-source checkpoint — October 21, 2026
 
-Phase 0 recovery is complete enough to proceed. **Phase 1 implementation is in progress; NOT DEPLOYABLE.**
+This file records the recovered-source checkpoint at commit
+`478c44a3feee754bc60259ebad4d577818572fae`, before implementation corrections.
+It is not the latest readiness verdict. Current implementation, exact-head
+validation and review status are reported in draft PR #23 and the adjacent
+`UNCERTIFIED_DIAGNOSTIC_OPERATIONS_V1.md` handoff.
 
 The cache worktree and its preservation directory were deleted by scratch pruning. Hermes recovered historical source snapshots and subsequent matching patch chains from read-only session records; the exact final deleted tree remains unverified. No Git implementation commit or staged diagnostic changes survived. All eight named implementation/test files and three tracked patch chains below are RECOVERED; existing collectors, V2 comparator, certified publisher and Poly2 models are PRESENT_IN_MAIN. The deleted working directories are LOST, but the source is recoverable from records. Historical tests do not establish current readiness.
 
