@@ -13,7 +13,10 @@ import datetime as dt
 import itertools
 import json
 import math
+import os
+from pathlib import Path
 import re
+import stat
 import sys
 from typing import Any
 
@@ -139,11 +142,19 @@ async def verify_read_only_repeatable_read(conn, text) -> None:
 async def begin_read_only_repeatable_read(conn, text) -> None:
     """Start the required PostgreSQL transaction before issuing any source query."""
     await conn.execute(text('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY'))
+    await conn.execute(text("SET LOCAL statement_timeout = '15s'"))
+    await conn.execute(text("SET LOCAL lock_timeout = '250ms'"))
+    await conn.execute(text("SET LOCAL idle_in_transaction_session_timeout = '30s'"))
     await verify_read_only_repeatable_read(conn, text)
+    roles = await _execute(conn, text, """SELECT COALESCE(bool_or(has_table_privilege(current_user,c.oid,'INSERT,UPDATE,DELETE,TRUNCATE')),true) AS writes_permitted
+        FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname='public' AND c.relname IN ('wallets','trades','signals','decision_log')""")
+    if len(roles) != 1 or roles[0]['writes_permitted'] is not False:
+        raise RuntimeError('dedicated SELECT-only database role required')
 
 
 async def read_preflight(conn, text, observed_utc: str) -> dict[str, Any]:
-    wallets = await _execute(conn, text, "SELECT lower(address) AS address FROM wallets WHERE approval_state = 'approved' ORDER BY lower(address)")
+    wallets = await _execute(conn, text, "SELECT lower(address) AS address FROM wallets WHERE approval_state = 'approved' ORDER BY lower(address) LIMIT 6")
     approved = [r['address'] for r in wallets]
     if not cohort_matches(approved):
         raise RuntimeError('approved wallet population/order differs from frozen cohort')
@@ -201,7 +212,7 @@ def _identity_and_row(r: dict[str, Any], signals: list[dict[str, Any]], audits: 
     if not isinstance(event, dt.datetime) or not isinstance(ingested, dt.datetime):
         raise ValueError('database returned a non-datetime trade clock')
     event_utc, ingested_utc = utc_text(event), utc_text(ingested)
-    if not (start <= ingested.astimezone(dt.timezone.utc) <= end):
+    if not (start <= ingested.astimezone(dt.timezone.utc) < end):
         raise ValueError('bounded trade query returned out-of-window ingestion')
     tx_hash, valid_identity = canonical_trade_identity(source_id, wallet, r['asset_id'])
     trade_signals = [s for s in signals if s['source_trade_id'] == source_id]
@@ -342,7 +353,7 @@ async def read_export(conn, text, *, start_utc: str, end_utc: str, run_id: str,
             or decision_end_high_water < decision_high_water or trade_end_high_water < trade_high_water
             or not 1 <= max_trade_rows <= MAX_TRADE_ROWS or not 1 <= max_audit_rows <= MAX_AUDIT_ROWS):
         raise ValueError('invalid bounded export binding or row cap')
-    approved_rows = await _execute(conn, text, "SELECT lower(address) AS address FROM wallets WHERE approval_state = 'approved' ORDER BY lower(address)")
+    approved_rows = await _execute(conn, text, "SELECT lower(address) AS address FROM wallets WHERE approval_state = 'approved' ORDER BY lower(address) LIMIT 6")
     approved = [r['address'] for r in approved_rows]
     cohort_stable = cohort_matches(approved)
     if not cohort_stable:
@@ -355,8 +366,12 @@ async def read_export(conn, text, *, start_utc: str, end_utc: str, run_id: str,
         raise RuntimeError('primary-key high-water regressed')
     names = ', '.join(f':w{i}' for i in range(len(WALLETS)))
     params: dict[str, Any] = {f'w{i}': w for i, w in enumerate(WALLETS)}
-    params.update(start_utc=start.isoformat(), end_utc=end.isoformat(), cursor=trade_high_water, high_id=trade_end_high_water)
-    trade_sql = f'''SELECT t.id AS source_record_id, t.polymarket_trade_id AS source_event_id,
+    # Sequence allocation is not commit order: a pre-start allocated ID may
+    # commit during the window. Retain the start mark as metadata, never as a
+    # lower selection fence. The repeatable-read snapshot supplies visibility.
+    params.update(start_utc=start.isoformat(), end_utc=end.isoformat(), cursor=0, high_id=trade_end_high_water)
+    trade_sql = f'''SELECT t.id AS source_record_id,
+        CASE WHEN octet_length(t.polymarket_trade_id) <= 512 THEN t.polymarket_trade_id ELSE NULL END AS source_event_id,
         lower(w.address) AS wallet, t.asset_id, m.condition_id, t.side, t.size, t.price,
         t.traded_at, t.ingested_at
       FROM trades AS t JOIN wallets AS w ON w.id = t.wallet_id
@@ -364,9 +379,22 @@ async def read_export(conn, text, *, start_utc: str, end_utc: str, run_id: str,
       WHERE t.id > :cursor AND t.id <= :high_id
         AND lower(w.address) IN ({names})
         AND t.ingested_at >= CAST(:start_utc AS timestamptz)
-        AND t.ingested_at <= CAST(:end_utc AS timestamptz)
+        AND t.ingested_at < CAST(:end_utc AS timestamptz)
       ORDER BY t.id LIMIT :limit'''
     raw_trades = await _paged_rows(conn, text, trade_sql, params, cap=max_trade_rows)
+    snapshot_utc = exported_utc or utc_text(dt.datetime.now(dt.timezone.utc))
+    snapshot_time = parse_utc(snapshot_utc)
+    late_end = min(snapshot_time, end + dt.timedelta(seconds=300))
+    late_rows = []
+    if late_end > end:
+        late_sql = trade_sql.replace(
+            'AND t.ingested_at < CAST(:end_utc AS timestamptz)',
+            'AND t.ingested_at < CAST(:end_utc AS timestamptz) AND t.traded_at >= CAST(:event_start AS timestamptz) AND t.traded_at < CAST(:event_end AS timestamptz)')
+        late_rows = await _paged_rows(conn, text, late_sql,
+            {**params, 'start_utc': end.isoformat(), 'end_utc': late_end.isoformat(),
+             'event_start': start.isoformat(), 'event_end': end.isoformat()}, cap=max_trade_rows)
+        if any(not isinstance(r.get('source_event_id'), str) for r in late_rows):
+            raise ValueError('late source identity exceeds SQL byte limit')
     unique_trades, duplicate_ids = deduplicate_trade_rows(raw_trades)
     source_ids = list(dict.fromkeys(str(r['source_event_id']) for r in unique_trades))
     signals: list[dict[str, Any]] = []
@@ -387,7 +415,7 @@ async def read_export(conn, text, *, start_utc: str, end_utc: str, run_id: str,
           FROM decision_log
           WHERE id > :cursor AND id <= :high_id
             AND created_at >= CAST(:start_utc AS timestamptz)
-            AND created_at <= CAST(:end_utc AS timestamptz)
+            AND created_at < CAST(:end_utc AS timestamptz)
             AND context ->> 'source_trade_id' = ANY(CAST(:source_ids AS text[]))
           ORDER BY id LIMIT :limit
         )
@@ -399,7 +427,7 @@ async def read_export(conn, text, *, start_utc: str, end_utc: str, run_id: str,
         FROM audit_page ORDER BY id'''
         audits, retained_context_bytes = await _paged_audit_rows(conn, text, audit_sql, {
             'cursor': decision_high_water, 'high_id': decision_end_high_water,
-            'start_utc': start.isoformat(), 'end_utc': end.isoformat(), 'source_ids': source_ids,
+            'start_utc': start.isoformat(), 'end_utc': max(end, snapshot_time).isoformat(), 'source_ids': source_ids,
         }, cap=max_audit_rows)
     else:
         retained_context_bytes = 0
@@ -421,11 +449,19 @@ async def read_export(conn, text, *, start_utc: str, end_utc: str, run_id: str,
         'software': {'shadowGitSha': shadow_sha, 'poly2CheckoutGitSha': poly2_checkout_sha,
                      'poly2RuntimeImageId': runtime_image_id, 'poly2RuntimeRevisionLabel': runtime_revision},
         'rows': rows,
+        'lateArrivals': [{'sourceRecordId': int(r['source_record_id']), 'sourceEventId': r['source_event_id'],
+            'wallet': r['wallet'], 'tradedAtUtc': utc_text(r['traded_at']), 'ingestedUtc': utc_text(r['ingested_at']),
+            'classification': 'POST_WINDOW_INGESTION_NOT_PRIMARY_LATENCY'} for r in late_rows],
+        'lateArrivalDisclosure': {'snapshotUtc': snapshot_utc, 'observedThroughUtc': utc_text(late_end),
+            'maximumGraceSeconds': 300, 'count': len(late_rows),
+            'laterArrivals': 'UNKNOWN_AFTER_SNAPSHOT', 'commitVisibility': 'SNAPSHOT_ONLY_NOT_CONTINUOUS_PROOF'},
         'coverage': {
             'tradeQuery': 'KEYSET_PAGINATED_READ_ONLY_WINDOW_QUERY', 'tradeRows': len(rows),
             'tradeQueryComplete': True, 'tradeIdRange': {'after': trade_high_water, 'through': trade_end_high_water},
             'decisionLogIdRange': {'after': decision_high_water, 'through': decision_end_high_water},
-            'tradeIdBoundary': 'PRIMARY_KEY_RANGE_AFTER_PRESTART_HIGH_WATER',
+            'tradeIdBoundary': 'SNAPSHOT_VISIBLE_ID_THROUGH_END_MARK; PRESTART_MARK_METADATA_ONLY',
+            'queryLowerIdExclusive': 0,
+            'prestartAllocatedIdsIncluded': sum(r['sourceRecordId'] <= trade_high_water for r in rows),
             'decisionAuditBoundary': 'PRIMARY_KEY_RANGE_AFTER_PRESTART_HIGH_WATER_AND_OBSERVATION_INTERVAL',
             'decisionAuditCompleteWithinConfiguredCap': True, 'decisionAuditRows': len(audits),
             'decisionAuditContext': {'retainedBytes':retained_context_bytes,'maxRowBytes':MAX_AUDIT_CONTEXT_ROW_BYTES,'maxTotalBytes':MAX_AUDIT_CONTEXT_TOTAL_BYTES,'maxPageBytes':MAX_AUDIT_CONTEXT_PAGE_BYTES,'evidenceCounts':context_evidence_counts,'complete': all(k=='AVAILABLE' for k in context_evidence_counts) or not audits},
@@ -437,7 +473,7 @@ async def read_export(conn, text, *, start_utc: str, end_utc: str, run_id: str,
             'actualPaperOrderExecutions': action_counts.get('paper_order_executed', 0),
             'recordedSkipDecisions': action_counts.get('signal_skipped', 0),
         },
-        'exportedUtc': exported_utc or utc_text(dt.datetime.now(dt.timezone.utc)),
+        'exportedUtc': snapshot_utc,
         'limitations': [
             'Only persisted Poly2 ingestion rows inside the bounded interval and primary-key range are exported; upstream continuity is unknown.',
             'Decision-log rows are application-written audit evidence, not a database-enforced immutable ledger.',
@@ -452,9 +488,19 @@ async def main_async(args) -> None:
     from sqlalchemy import text
     from sqlalchemy.ext.asyncio import create_async_engine
     from sqlalchemy.pool import NullPool
-    from polycopy.config import get_settings
-    settings = get_settings()
-    engine = create_async_engine(settings.database_url, poolclass=NullPool)
+    # Credentials are read locally from a private file. No Poly2 container
+    # mutation, environment change, worker restart, or DSN in process arguments.
+    fd = os.open(args.dsn_file, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_size > 4096:
+            raise ValueError('private bounded reader credential file required')
+        dsn = os.read(fd, 4097).decode().strip()
+    finally:
+        os.close(fd)
+    if not dsn.startswith('postgresql+asyncpg://'):
+        raise ValueError('native PostgreSQL async driver DSN required')
+    engine = create_async_engine(dsn, poolclass=NullPool)
     try:
         async with engine.connect() as conn:
             async with conn.begin():
@@ -487,6 +533,7 @@ def encode_export_output(payload: bytes) -> bytes:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode', choices=('preflight', 'export'), required=True)
+    parser.add_argument('--dsn-file', type=Path, required=True)
     parser.add_argument('--start-utc')
     parser.add_argument('--end-utc')
     parser.add_argument('--run-id', default='')

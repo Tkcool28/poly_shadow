@@ -34,7 +34,8 @@ class OfflinePoly2:
         self.calls=[]
     async def execute(self,statement,params=None):
         sql=str(statement); params=params or {}; self.calls.append((sql,params))
-        if sql.startswith('SET TRANSACTION'): return Result([])
+        if sql.startswith(('SET TRANSACTION','SET LOCAL')): return Result([])
+        if 'AS writes_permitted' in sql: return Result([{'writes_permitted':False}])
         if 'current_setting' in sql: return Result([{'read_only':'on','isolation':'repeatable read'}])
         if 'FROM wallets' in sql: return Result([{'address':w} for w in exporter.WALLETS])
         if 'MAX(id)' in sql and 'FROM trades' in sql: return Result([{'max_id':3}])
@@ -94,7 +95,7 @@ class OfflineDiagnosticIntegration(unittest.TestCase):
                     if result.returncode:
                         run_dir=cmd[cmd.index('--run-directory')+1]; export_path=cmd[cmd.index('--poly2-export')+1]
                         debug_script=("import {readFileSync} from 'node:fs'; import {join} from 'node:path'; import {buildDiagnosticReport} from './src/compare/uncertified-diagnostic.ts'; const d="+json.dumps(run_dir)+",m=JSON.parse(readFileSync(join(d,'diagnostic-manifest.json'),'utf8')),e=JSON.parse(readFileSync("+json.dumps(export_path)+",'utf8')); void buildDiagnosticReport({shadowDataDirectory:join(d,'shadow-data'),manifest:m,poly2Export:e}).then(()=>console.log('OK')).catch(x=>{console.error(x?.stack??String(x));process.exitCode=2});")
-                        with patch.object(subprocess,'Popen',real_popen): debug=real_run([str(ROOT/'node_modules/.bin/tsx'),'-e',debug_script],cwd=ROOT,capture_output=True,text=True,timeout=60)
+                        with patch.object(subprocess,'Popen',real_popen): debug=real_run(['node','--import','tsx','--input-type=module','-e',debug_script],cwd=ROOT,capture_output=True,text=True,timeout=60)
                         report_results.append(debug)
                     return result
                 raise AssertionError(f'unexpected subprocess: {cmd}')
@@ -114,7 +115,7 @@ class OfflineDiagnosticIntegration(unittest.TestCase):
                 stack.enter_context(patch.object(runner.subprocess,'run',side_effect=report_only))
                 rc=runner.run(args)
             self.assertEqual(rc,0,[(r.returncode,r.stderr,r.stdout) for r in report_results])
-            run_dir=next(run_root.iterdir())
+            run_dir=next(p for p in run_root.iterdir() if p.is_dir())
             manifest=json.loads((run_dir/'diagnostic-manifest.json').read_text())
             report=json.loads((run_dir/'diagnostic-report.json').read_text())
             written_export=json.loads((run_dir/'poly2-export.json').read_text())
@@ -126,6 +127,14 @@ class OfflineDiagnosticIntegration(unittest.TestCase):
             self.assertEqual(written_export['coverage']['tradeIdRange'],{'after':0,'through':3})
             self.assertEqual(report['classification'],'UNCERTIFIED_DIAGNOSTIC')
             self.assertFalse(report['certified'])
+            self.assertEqual(report['priceOpportunity']['state'],'PRICE_ADVANTAGE_UNKNOWN')
+            self.assertEqual(report['discovery']['matchingConfidence']['high'],1)
+            self.assertEqual(len(report['examples']),1)
+            timing={x['method']:x for x in report['timing']}
+            self.assertEqual(timing['CHAIN']['signedShadowLead']['medianSeconds'],0.75)
+            self.assertEqual(timing['SHADOW_UNION']['detectionLatency']['p90Seconds'],1.25)
+            self.assertTrue((args.dashboard_summary.parent/'report.json').exists())
+            self.assertTrue((args.dashboard_summary.parent/'evidence-manifest.json').exists())
             self.assertEqual(report['comparison']['oneSidedAbsenceClassification'],'INDETERMINATE')
             self.assertEqual(report['overall']['matched'],1)
             self.assertEqual(report['overall']['indeterminate'],2)
@@ -151,9 +160,11 @@ class OfflineDiagnosticIntegration(unittest.TestCase):
             self.assertIsNone(report['comparison']['completenessProof'])
             # A redirected publication directory must fail before creating a file outside the diagnostic path.
             outside=temp/'outside';outside.mkdir()
-            linked_dir=temp/'diagnostic-comparison';args.dashboard_summary.unlink();linked_dir.rmdir();linked_dir.symlink_to(outside,target_is_directory=True)
+            linked_dir=temp/'diagnostic-comparison'
+            for generated in linked_dir.iterdir(): generated.unlink()
+            linked_dir.rmdir();linked_dir.symlink_to(outside,target_is_directory=True)
             (run_dir/'diagnostic-report.json').unlink()
-            rejected=subprocess.run([str(ROOT/'node_modules/.bin/tsx'),'src/compare/diagnostic-report-cli.ts','--run-directory',str(run_dir),'--poly2-export',str(run_dir/'poly2-export.json'),'--publish-summary',str(linked_dir/'summary.json')],cwd=ROOT,capture_output=True,text=True,timeout=60)
+            rejected=subprocess.run(['node','--import','tsx','src/compare/diagnostic-report-cli.ts','--run-directory',str(run_dir),'--poly2-export',str(run_dir/'poly2-export.json'),'--publish-summary',str(linked_dir/'summary.json')],cwd=ROOT,capture_output=True,text=True,timeout=60)
             self.assertEqual(rejected.returncode,2,rejected.stderr)
             self.assertFalse((outside/'summary.json').exists())
 

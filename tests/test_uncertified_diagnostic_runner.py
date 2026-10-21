@@ -70,7 +70,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_storage_preflight_accepts_only_green_gate(self):
         good = types.SimpleNamespace(returncode=0, stdout='{"state":"GREEN","gate":"PASS"}\n')
-        with patch.object(runner.subprocess, 'run', return_value=good):
+        with patch.object(runner.subprocess, 'run', return_value=good), patch.object(runner,'resource_envelope',return_value={'enforcement':'FIXTURE'}):
             state = runner.storage_preflight(Path('/fixture/repo'), Path('/fixture/run/data'))
         self.assertEqual(state['state'], 'GREEN')
         denied = types.SimpleNamespace(returncode=7, stdout='{"state":"DEGRADED","gate":"FAIL"}\n')

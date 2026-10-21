@@ -54,8 +54,9 @@ class FakeConnection:
         params = params or {}
         sql = str(statement)
         self.sql.append((sql, params))
-        if sql.startswith('SET TRANSACTION'):
+        if sql.startswith(('SET TRANSACTION','SET LOCAL')):
             return Result([])
+        if 'AS writes_permitted' in sql: return Result([{'writes_permitted':False}])
         if 'current_setting' in sql:
             return Result([{'read_only': self.read_only, 'isolation': self.isolation}])
         if 'FROM wallets' in sql:
@@ -66,7 +67,7 @@ class FakeConnection:
             return Result([{'max_id': max((r['id'] for r in self.audit_rows), default=0)}])
         if 'FROM trades AS t' in sql:
             cursor, high, limit = params['cursor'], params['high_id'], params['limit']
-            rows = [r for r in self.trade_rows if cursor < r['source_record_id'] <= high]
+            rows = [r for r in self.trade_rows if cursor < r['source_record_id'] <= high and exporter.parse_utc(params['start_utc'])<=r['ingested_at']<exporter.parse_utc(params['end_utc']) and ('event_start' not in params or exporter.parse_utc(params['event_start'])<=r['traded_at']<exporter.parse_utc(params['event_end']))]
             return Result(rows[:limit])
         if 'FROM signals' in sql:
             return Result([{'id': 7, 'source_trade_id': SOURCE_ID, 't1_detected_at': START + dt.timedelta(seconds=3)}])
@@ -135,7 +136,7 @@ class ExportTests(unittest.TestCase):
         self.assertTrue(trade_sql)
         self.assertIn('t.id > :cursor AND t.id <= :high_id', trade_sql[0])
         self.assertIn('t.ingested_at >=', trade_sql[0])
-        self.assertIn('t.ingested_at <=', trade_sql[0])
+        self.assertIn('t.ingested_at <', trade_sql[0])
         self.assertEqual([params['high_id'] for sql,params in conn.sql if 'FROM trades AS t' in sql], [2])
         audit_queries=[params for sql,params in conn.sql if 'FROM decision_log' in sql and 'MAX(id)' not in sql]
         self.assertEqual(audit_queries[0]['high_id'],9)
@@ -207,7 +208,7 @@ class ExportTests(unittest.TestCase):
         conn=FakeConnection()
         self.run_async(exporter.begin_read_only_repeatable_read(conn,lambda sql:sql))
         self.assertTrue(conn.sql[0][0].startswith('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY'))
-        self.assertIn('current_setting',conn.sql[1][0])
+        self.assertTrue(any('current_setting' in q for q,_ in conn.sql)); self.assertTrue(any('statement_timeout' in q for q,_ in conn.sql))
 
     def test_invalid_window_and_highwater_bounds_fail_before_source_queries(self):
         conn=FakeConnection()

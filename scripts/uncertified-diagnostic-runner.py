@@ -2,7 +2,9 @@
 """Run an isolated, bounded PAPER-only UNCERTIFIED_DIAGNOSTIC comparison."""
 from __future__ import annotations
 import argparse
+import hashlib
 import datetime as dt
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -10,6 +12,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -39,11 +42,11 @@ def parse_utc(v):
  return x.astimezone(dt.timezone.utc)
 def add_seconds(v,seconds): return (parse_utc(v)+dt.timedelta(seconds=seconds)).isoformat(timespec='microseconds').replace('+00:00','Z')
 
-def atomic_json(path:Path,value):
+def atomic_json(path:Path,value,mode=0o600):
  path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
  tmp=path.with_name('.'+path.name+'.'+uuid.uuid4().hex+'.tmp')
  data=(json.dumps(value,separators=(',',':'),allow_nan=False)+'\n').encode()
- fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+ fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,mode)
  try:
   with os.fdopen(fd,'wb') as f: f.write(data); f.flush(); os.fsync(f.fileno())
   os.replace(tmp,path)
@@ -88,7 +91,8 @@ def inspect_poly2(container:str,expected_sha:str):
  return {'imageId':parts[1],'revisionLabel':label,'flags':flags}
 
 def preflight(container:str,script:bytes):
- p=subprocess.run(['docker','exec','-i',container,'python','-','--mode','preflight'],input=script,capture_output=True,timeout=120)
+ cmd=([sys.executable,'-','--dsn-file',str(container)] if isinstance(container,Path) else ['docker','exec','-i',container,'python','-'])
+ p=subprocess.run(cmd+['--mode','preflight'],input=script,capture_output=True,timeout=120)
  if p.returncode: raise RuntimeError('POLY2_READ_ONLY_PREFLIGHT_FAILED')
  try: value=json.loads(p.stdout)
  except (ValueError,UnicodeError): raise RuntimeError('POLY2_PREFLIGHT_OUTPUT_INVALID')
@@ -104,7 +108,58 @@ def storage_preflight(repo:Path,data_dir:Path):
  try: value=json.loads(p.stdout.strip().splitlines()[-1])
  except (ValueError,IndexError): raise RuntimeError('STORAGE_PREFLIGHT_UNAVAILABLE')
  if p.returncode or value.get('gate')!='PASS' or value.get('state')!='GREEN': raise RuntimeError('STORAGE_PREFLIGHT_BLOCKED')
+ value['enforcedResourceEnvelope']=resource_envelope()
  return value
+
+def resource_envelope(root=Path('/sys/fs/cgroup'),membership=Path('/proc/self/cgroup')):
+ """Require operator-installed kernel limits; never create/change a cgroup."""
+ rows=membership.read_text().splitlines()
+ unified=[r.split(':',2)[2] for r in rows if r.startswith('0::')]
+ if len(unified)!=1 or '..' in Path(unified[0]).parts: raise RuntimeError('RESOURCE_CGROUP_UNVERIFIED')
+ path=root/unified[0].lstrip('/')
+ values={name:(path/name).read_text().strip() for name in ('memory.max','memory.swap.max','cpu.max','pids.max')}
+ try:
+  memory=int(values['memory.max']); swap=int(values['memory.swap.max']); pids=int(values['pids.max'])
+  quota,period=map(int,values['cpu.max'].split())
+  if not (0<memory<=4*1024**3 and 0<=swap<=512*1024**2 and 0<pids<=256 and 0<quota<=period): raise ValueError()
+ except ValueError: raise RuntimeError('FINITE_RESOURCE_LIMITS_REQUIRED')
+ return {'memoryMaxBytes':memory,'swapMaxBytes':swap,'cpuQuota':quota,'cpuPeriod':period,'pidsMax':pids,'enforcement':'KERNEL_CGROUP_V2'}
+
+def publish_progress(args,value):
+ if not args.publish_dashboard: return
+ path=assert_isolated_path(args.dashboard_summary)
+ if 'diagnostic-comparison' not in path.parts: raise ValueError('diagnostic public directory required')
+ path.parent.mkdir(parents=True,exist_ok=True,mode=0o755)
+ atomic_json(path,value,0o644)
+
+def evidence_inventory(run_dir):
+ files=[]
+ for path in sorted(run_dir.rglob('*')):
+  if path.is_symlink(): raise RuntimeError('EVIDENCE_SYMLINK_REFUSED')
+  if not path.is_file() or path.name in ('diagnostic-report.json','evidence-manifest.json','diagnostic-manifest.json'): continue
+  if len(files)>=128: raise RuntimeError('EVIDENCE_FILE_LIMIT')
+  digest=hashlib.sha256()
+  with path.open('rb') as f:
+   for block in iter(lambda:f.read(65536),b''): digest.update(block)
+  files.append({'file':str(path.relative_to(run_dir)),'bytes':path.stat().st_size,'sha256':digest.hexdigest()})
+ return {'classification':'UNCERTIFIED_DIAGNOSTIC','files':files,'rawEvidencePublic':False}
+
+def check_retained_limit(directory,cap=6*1024**3):
+ total=0
+ with os.scandir(directory) as entries:
+  for i,item in enumerate(entries):
+   if i>=128 or item.is_symlink(): raise RuntimeError('EVIDENCE_FILE_LIMIT')
+   if item.is_file(follow_symlinks=False): total+=item.stat(follow_symlinks=False).st_size
+   if total>cap: raise RuntimeError('RUN_EVIDENCE_DISK_CAP')
+ return total
+
+def progress_projection(base,state=None):
+ return {'classification':'UNCERTIFIED_DIAGNOSTIC','certified':False,'state':state or base['state'],
+  'runId':base['runId'],'window':base.get('window',{}),'plannedEndUtc':base.get('plannedEndUtc'),
+  'generatedUtc':now_utc(),'failureType':base.get('failureType'),
+  'overall':{},'wallets':[{'wallet':w,'counts':{}} for w in WALLETS],
+  'sources':[{'source':s,'state':'UNKNOWN_UNPROVEN','uncertainty':'No completed snapshot yet'} for s in ('CHAIN','REST_TRADES','REST_ACTIVITY')],
+  'priceOpportunity':{'state':'PRICE_ADVANTAGE_UNKNOWN'}}
 
 def storage_telemetry(repo:Path,data_dir:Path,elapsed_seconds:float):
  code="import {storageTelemetry} from './src/shadow/storage-budget.ts'; console.log(JSON.stringify(storageTelemetry("+json.dumps(str(data_dir))+","+str(max(0,elapsed_seconds))+")));"
@@ -116,7 +171,8 @@ def storage_telemetry(repo:Path,data_dir:Path,elapsed_seconds:float):
  return value
 
 def export_poly2(container:str,script:bytes,manifest:dict,output:Path):
- cmd=['docker','exec','-i',container,'python','-','--mode','export','--start-utc',manifest['window']['startUtc'],'--end-utc',manifest['window']['endUtc'],
+ cmd=([sys.executable,'-','--dsn-file',str(container)] if isinstance(container,Path) else ['docker','exec','-i',container,'python','-'])
+ cmd+=['--mode','export','--start-utc',manifest['window']['startUtc'],'--end-utc',manifest['window']['endUtc'],
       '--run-id',manifest['runId'],'--decision-log-high-water',str(manifest['poly2Preflight']['decisionLogIdHighWater']),
       '--decision-log-end-high-water',str(manifest['poly2EndPreflight']['decisionLogIdHighWater']),
       '--trade-id-high-water',str(manifest['poly2Preflight']['tradeIdHighWater']),'--trade-id-end-high-water',str(manifest['poly2EndPreflight']['tradeIdHighWater']),
@@ -186,40 +242,67 @@ def wait_for_window(child,duration_seconds,monotonic=time.monotonic,wall=now_utc
 def _run(args,signal_state):
  repo=no_symlink_path(args.repo); poly_repo=no_symlink_path(args.poly2_repo); root=assert_isolated_path(args.run_root)
  if not repo.is_dir() or not poly_repo.is_dir(): raise RuntimeError('REPOSITORY_PATH_MISSING')
- if git_value(repo,'rev-parse','--abbrev-ref','HEAD')!=EXPECTED_BRANCH: raise RuntimeError('SHADOW_BRANCH_MISMATCH')
  if git_value(repo,'status','--porcelain','--untracked-files=all'): raise RuntimeError('SHADOW_WORKTREE_NOT_CLEAN')
  shadow_sha=revision(repo); poly2_sha=revision(poly_repo)
  if poly2_sha!=EXPECTED_POLY2_SHA: raise RuntimeError('POLY2_CHECKOUT_REVISION_MISMATCH')
  before=inspect_poly2(args.poly2_container,poly2_sha)
  script=(repo/'scripts/poly2-diagnostic-export.py').read_bytes()
- start_pre=preflight(args.poly2_container,script)
+ export_source=getattr(args,'poly2_dsn_file',None) or args.poly2_container
+ start_pre=preflight(export_source,script)
  root.mkdir(parents=True,exist_ok=True,mode=0o700)
  run_id='diagnostic-'+dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')+'-'+uuid.uuid4().hex[:8]
  run_dir=assert_isolated_path(root/run_id); run_dir.mkdir(mode=0o700)
  data_dir=run_dir/'shadow-data'; data_dir.mkdir(mode=0o700)
- base={'schemaVersion':1,'classification':'UNCERTIFIED_DIAGNOSTIC','certified':False,'state':'PREPARING','runId':run_id,'cohort':list(WALLETS),'software':{'shadowGitSha':shadow_sha,'poly2CheckoutGitSha':poly2_sha,'poly2RuntimeImageId':before['imageId'],'poly2RuntimeRevisionLabel':before['revisionLabel'],'runtimeStable':False},'poly2Preflight':start_pre,'safety':{'paperMode':True,'liveTradingAllowed':False,'killSwitch':False,'captureEnabled':False,'workerRestarted':False,'databaseWrites':0,'certifiedPointerWritten':False}}
+ base={'schemaVersion':1,'classification':'UNCERTIFIED_DIAGNOSTIC','certified':False,'state':'READY','runId':run_id,'cohort':list(WALLETS),'software':{'shadowGitSha':shadow_sha,'poly2CheckoutGitSha':poly2_sha,'poly2RuntimeImageId':before['imageId'],'poly2RuntimeRevisionLabel':before['revisionLabel'],'runtimeStable':False},'poly2Preflight':start_pre,'safety':{'paperMode':True,'liveTradingAllowed':False,'killSwitch':False,'captureEnabled':False,'workerRestarted':False,'databaseWrites':0,'certifiedPointerWritten':False}}
  child=None; boundary_start=None; boundary_end=None; interrupted=False; exit_code=None
  try:
   storage=storage_preflight(repo,data_dir); base['resourcePreflight']=storage
-  env=os.environ.copy(); env.update(SHADOW_WATCHED_WALLETS=','.join(WALLETS),SHADOW_DATA_DIR=str(data_dir),SHADOW_V2_CURSOR='false')
+  env=os.environ.copy(); env.update(SHADOW_WATCHED_WALLETS=','.join(WALLETS),SHADOW_DATA_DIR=str(data_dir),SHADOW_V2_CURSOR='true')
   for key in list(env):
    if key in ('PRIVATE_KEY','CLOB_API_KEY','CLOB_API_SECRET','CLOB_API_PASSPHRASE','FUNDER_ADDRESS','RELAYER_API_KEY','RELAYER_API_KEY_ADDRESS') or key.startswith(('ARB_','SCALP_')): raise RuntimeError('SHADOW_CREDENTIAL_GUARD_FAILED')
   boundary_start=now_utc(); planned_end=add_seconds(boundary_start,args.duration_seconds)
-  base.update({'state':'RUNNING','startedUtc':boundary_start,'plannedEndUtc':planned_end,'durationSeconds':args.duration_seconds,'window':{'startUtc':boundary_start,'endUtc':planned_end}})
+  base.update({'state':'RUNNING','startedUtc':boundary_start,'plannedEndUtc':planned_end,'durationSeconds':args.duration_seconds,'window':{'startUtc':boundary_start,'endUtc':planned_end},'frozenWindow':{'startUtc':boundary_start,'endUtc':planned_end}})
   atomic_json(run_dir/'diagnostic-manifest.json',base)
-  child=subprocess.Popen([str(repo/'node_modules/.bin/tsx'),'src/shadow/main.ts'],cwd=repo,env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+  publish_progress(args,progress_projection(base))
+  child=subprocess.Popen(['node','--max-old-space-size=3072','--import','tsx','src/shadow/main.ts'],cwd=repo,env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+  # Independent deadline remains effective while live export/report work runs.
+  def deadline_stop():
+   try: os.killpg(child.pid,signal.SIGTERM)
+   except ProcessLookupError: pass
+  deadline_timer=threading.Timer(max(0,(parse_utc(planned_end)-parse_utc(now_utc())).total_seconds()),deadline_stop)
+  deadline_timer.daemon=True; deadline_timer.start()
   monitor_started=time.monotonic()
+  next_projection=monitor_started+60
   def check_disk():
+   nonlocal next_projection
    observed=storage_telemetry(repo,data_dir,time.monotonic()-monitor_started)
    if observed['disk']['state']!='GREEN': raise RuntimeError('STORAGE_BUDGET_EXHAUSTED')
+   check_retained_limit(data_dir)
+   wall_elapsed=(parse_utc(now_utc())-parse_utc(boundary_start)).total_seconds()
+   if abs(wall_elapsed-(time.monotonic()-monitor_started))>2: raise RuntimeError('WALL_CLOCK_DISCONTINUITY')
+   if args.publish_dashboard and time.monotonic()>=next_projection and parse_utc(now_utc())<parse_utc(planned_end):
+    next_projection=time.monotonic()+60
+    if inspect_poly2(args.poly2_container,poly2_sha)!=before: raise RuntimeError('POLY2_RUNTIME_CHANGED_DURING_OBSERVATION')
+    preview={**base,'state':'INCOMPLETE','window':{'startUtc':boundary_start,'endUtc':now_utc()},
+      'software':{**base['software'],'runtimeStable':True},'poly2EndPreflight':preflight(export_source,script)}
+    atomic_json(run_dir/'diagnostic-preview-manifest.json',preview)
+    export_poly2(export_source,script,preview,run_dir/'poly2-live-export.json')
+    cmd=['node','--max-old-space-size=384','--import','tsx','src/compare/diagnostic-report-cli.ts','--run-directory',str(run_dir),
+      '--manifest-name','diagnostic-preview-manifest.json','--poly2-export',str(run_dir/'poly2-live-export.json'),'--preview','--publish-summary',str(assert_isolated_path(args.dashboard_summary))]
+    result=subprocess.run(cmd,cwd=repo,capture_output=True,text=True,timeout=60)
+    if result.returncode: raise RuntimeError('LIVE_REPORT_FAILED')
+   atomic_json(run_dir/'diagnostic-checkpoint.json',{'observedUtc':now_utc(),'state':base['state'],'window':base['window'],'resource':observed})
   try:
-   waited=wait_for_window(child,args.duration_seconds,check_storage=check_disk,signal_state=signal_state)
+   waited=wait_for_window(child,max(0,(parse_utc(planned_end)-parse_utc(now_utc())).total_seconds()),check_storage=check_disk,signal_state=signal_state)
+   if waited['early'] and not waited.get('interrupted') and parse_utc(waited['endedUtc'])>=parse_utc(planned_end): waited['early']=False
    boundary_end=waited['endedUtc'] if waited['early'] else planned_end
    stop_process_group(child,grace_seconds=10,force_escalation=lambda:signal_state['count']>1)
    interrupted=bool(waited.get('interrupted') or signal_state['count'])
   except KeyboardInterrupt:
    interrupted=True; boundary_end=now_utc(); signal_state.update({'number':signal.SIGINT,'name':'SIGINT','count':max(1,signal_state['count'])}); stop_process_group(child,grace_seconds=10,force_escalation=lambda:signal_state['count']>1)
+  base['observedThroughUtc']=boundary_end
   exit_code=child.returncode
+  deadline_timer.cancel()
   if boundary_end is None: boundary_end=now_utc()
   if interrupted:
    signum=signal_state['number'] or signal.SIGINT
@@ -227,24 +310,45 @@ def _run(args,signal_state):
     'collectorShutdownCompletedUtc':now_utc(),'collectorExitCode':exit_code,'collectorEndedAtRequestedDuration':False,
     'interrupted':True,'terminationSignal':signal_state['name'] or 'SIGINT','failureType':signal_state['name'] or 'SIGINT'})
    atomic_json(run_dir/'diagnostic-manifest.json',base)
+   publish_progress(args,progress_projection(base))
    print(json.dumps({'classification':'UNCERTIFIED_DIAGNOSTIC','certified':False,'runId':run_id,'state':'INCOMPLETE','runDirectory':str(run_dir),'failureType':signal_state['name'] or 'SIGINT','result':'INTERRUPTED'},separators=(',',':')),file=sys.stderr)
    return 128+signum
   after=inspect_poly2(args.poly2_container,poly2_sha); stable=before==after
-  end_pre=preflight(args.poly2_container,script)
+  # Bounded lag horizon, distinct from the observation interval.
+  lag_seconds=getattr(args,'late_arrival_grace_seconds',0)
+  if lag_seconds: time.sleep(lag_seconds)
+  end_pre=preflight(export_source,script)
   base.update({'window':{'startUtc':boundary_start,'endUtc':boundary_end},'endedUtc':now_utc(),'plannedEndUtc':planned_end,'poly2EndPreflight':end_pre,'software':{**base['software'],'runtimeStable':stable},'collectorExitCode':exit_code,'collectorEndedAtRequestedDuration':boundary_end==planned_end,'interrupted':False,'poly2RuntimeStable':stable})
   complete=(not interrupted and boundary_end==planned_end and exit_code==0 and stable and end_pre['cohort']==list(WALLETS))
-  base['state']='COMPLETE' if complete else 'INCOMPLETE'; atomic_json(run_dir/'diagnostic-manifest.json',base)
+  base['state']='INCOMPLETE'; base['reportState']='FINALIZING'; atomic_json(run_dir/'diagnostic-manifest.json',base)
   if not stable: raise RuntimeError('POLY2_RUNTIME_CHANGED_DURING_OBSERVATION')
-  export_poly2(args.poly2_container,script,base,run_dir/'poly2-export.json')
-  cmd=[str(repo/'node_modules/.bin/tsx'),'src/compare/diagnostic-report-cli.ts','--run-directory',str(run_dir),'--poly2-export',str(run_dir/'poly2-export.json')]
+  export_poly2(export_source,script,base,run_dir/'poly2-export.json')
+  cmd=['node','--max-old-space-size=384','--import','tsx','src/compare/diagnostic-report-cli.ts','--run-directory',str(run_dir),'--poly2-export',str(run_dir/'poly2-export.json')]
   if args.publish_dashboard: cmd+=['--publish-summary',str(assert_isolated_path(args.dashboard_summary))]
   report=subprocess.run(cmd,cwd=repo,capture_output=True,text=True,timeout=300)
   if report.returncode: raise RuntimeError('DIAGNOSTIC_REPORT_FAILED')
+  # COMPLETE is written only after export and report successfully exist.
+  report_path=run_dir/'diagnostic-report.json'
+  if not report_path.is_file(): raise RuntimeError('REPORT_ARTIFACT_MISSING')
+  if report_path.exists():
+   final=json.loads(report_path.read_text()); final['state']='COMPLETE' if complete else 'INCOMPLETE'
+   atomic_json(report_path,final); publish_progress(args,final)
+   inventory=evidence_inventory(run_dir); atomic_json(run_dir/'evidence-manifest.json',inventory)
+   base['finalReportSha256']=hashlib.sha256(report_path.read_bytes()).hexdigest()
+   if args.publish_dashboard:
+    public=args.dashboard_summary.parent
+    atomic_json(assert_isolated_path(public/'report.json'),final,0o644)
+    atomic_json(assert_isolated_path(public/'evidence-manifest.json'),inventory,0o644)
+    atomic_json(assert_isolated_path(public/'report-sha256.json'),{'sha256':base['finalReportSha256']},0o644)
+  base['state']='COMPLETE' if complete else 'INCOMPLETE'; base['reportState']='AVAILABLE'
+  base['observationContinuity']='SOURCE_GAPS_DISCLOSED_NOT_PROVEN_CONTINUOUS'
+  atomic_json(run_dir/'diagnostic-manifest.json',base)
   print(json.dumps({'classification':'UNCERTIFIED_DIAGNOSTIC','certified':False,'runId':run_id,'state':base['state'],'runDirectory':str(run_dir),'report':str(run_dir/'diagnostic-report.json'),'dashboardPublished':bool(args.publish_dashboard)},separators=(',',':')))
   return 130 if interrupted else (0 if complete else 2)
  except Exception as exc:
-  failure=type(exc).__name__
-  if child is not None and child.poll() is None:
+  if 'deadline_timer' in locals(): deadline_timer.cancel()
+  failure=str(exc) if re.fullmatch(r'[A-Z][A-Z0-9_]{2,80}',str(exc)) else type(exc).__name__
+  if child is not None:
    try: boundary_end=boundary_end or now_utc(); stop_process_group(child,grace_seconds=10,force_escalation=lambda:signal_state['count']>1)
    except Exception: failure='CollectorStopFailed'
   base.update({'state':'FAILED' if child is None else 'INCOMPLETE','failureType':failure,'endedUtc':now_utc()})
@@ -259,6 +363,7 @@ def _run(args,signal_state):
     base['window']={'startUtc':boundary_start,'endUtc':boundary_end or now_utc()}
     base['collectorExitCode']=child.returncode
   atomic_json(run_dir/'diagnostic-manifest.json',base)
+  publish_progress(args,progress_projection(base))
   print(json.dumps({'classification':'UNCERTIFIED_DIAGNOSTIC','certified':False,'runId':run_id,'state':base['state'],'runDirectory':str(run_dir),'error':failure,'result':'FAILED_CLOSED'},separators=(',',':')),file=sys.stderr)
   return 2
 
@@ -271,18 +376,26 @@ def run(args):
    signal_state['number']=number; signal_state['name']=signal.Signals(number).name
  for number in (signal.SIGTERM,signal.SIGINT):
   previous[number]=signal.getsignal(number); signal.signal(number,record_signal)
+ fd=None
  try:
+  root=assert_isolated_path(args.run_root); root.mkdir(parents=True,exist_ok=True,mode=0o700)
+  fd=os.open(root/'diagnostic-owner.lock',os.O_CREAT|os.O_WRONLY|os.O_NOFOLLOW,0o600)
+  fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
   return _run(args,signal_state)
  finally:
+  if fd is not None: os.close(fd)
   for number,handler in previous.items(): signal.signal(number,handler)
 
 
 def main(argv=None):
  p=argparse.ArgumentParser(description=__doc__); sub=p.add_subparsers(dest='command',required=True); r=sub.add_parser('run')
  r.add_argument('--poly2-container',required=True); r.add_argument('--repo',type=Path,default=ROOT); r.add_argument('--poly2-repo',type=Path,default=POLY2_REPO); r.add_argument('--run-root',type=Path,default=DEFAULT_RUN_ROOT)
+ r.add_argument('--poly2-dsn-file',type=Path,required=True)
  r.add_argument('--duration-seconds',type=int,required=True); r.add_argument('--publish-dashboard',action='store_true'); r.add_argument('--dashboard-summary',type=Path,default=DEFAULT_DASHBOARD_SUMMARY)
+ r.add_argument('--late-arrival-grace-seconds',type=int,default=30)
  a=p.parse_args(argv)
  if not 60<=a.duration_seconds<=86400: p.error('--duration-seconds must be 60..86400')
+ if not 0<=a.late_arrival_grace_seconds<=60: p.error('--late-arrival-grace-seconds must be 0..60')
  try: return run(a)
  except Exception as exc:
   print(json.dumps({'classification':'UNCERTIFIED_DIAGNOSTIC','certified':False,'error':type(exc).__name__,'result':'FAILED_CLOSED'},separators=(',',':')),file=sys.stderr)

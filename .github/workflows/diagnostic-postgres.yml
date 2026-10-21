@@ -1,0 +1,37 @@
+name: diagnostic-native-postgres
+on:
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  native-export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: fixture_admin
+          POSTGRES_PASSWORD: fixture_password
+          POSTGRES_DB: shadow_diagnostic_fixture
+        ports:
+          - 55449:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+          --memory 512m
+          --cpus 1
+          --pids-limit 128
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install 'sqlalchemy==2.0.46' 'asyncpg==0.31.0'
+      - name: Required actual PostgreSQL driver evidence
+        env:
+          DIAGNOSTIC_NATIVE_POSTGRES: isolated-ci-fixture
+        run: python -B -m unittest discover -s tests -p diagnostic_postgres_test.py -v
