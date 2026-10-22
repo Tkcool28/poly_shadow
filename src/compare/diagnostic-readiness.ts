@@ -22,6 +22,7 @@ export async function diagnosticReadiness(dir:string,window:DiagnosticWindow,rea
  let chain:Record<string,any>|null=null;
  const tail=join(dir,'chain_tail_proofs.ndjson');
  if(existsSync(tail))for await(const r of read<Record<string,any>>(tail))chain=r;
+ if(chain){const stamp=Date.parse(chain.headObservedUtc);if(!Number.isFinite(stamp)||Date.parse(window.endUtc)-stamp>120000)chain={...chain,headState:'UNKNOWN_STALE_OR_UNMEASURED',coverage:'UNKNOWN_UNPROVEN'};}
  const samples:Record<string,any>[]=[];let clockSamples=0,unhealthy=0,last:number|null=null,maxGap=0,first:number|null=null;
  const clocks=join(dir,'clock_health.ndjson');
  if(existsSync(clocks))for await(const r of read<Record<string,any>>(clocks)){

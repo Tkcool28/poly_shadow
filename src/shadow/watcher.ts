@@ -137,6 +137,7 @@ export class ChainWatcher {
   private latestObservedHeadBlock:number|null=null;
   private headObservedUtc:string|null=null;
   private headState='UNKNOWN';
+  private headObservedAtMs:number|null=null;
   private lastScanBlockHash:string|null=null;
   private lastScanRange:{fromBlock:number;toBlock:number}|null=null;
   private contiguousFrom:number|null=null;
@@ -145,16 +146,18 @@ export class ChainWatcher {
   private reorgCount=0;
   private shutdownInterrupted=false;
   coverageEvidence(){
-    const gap=this.latestObservedHeadBlock!==null&&this.contiguousThrough!==null&&this.latestObservedHeadBlock>this.contiguousThrough?{fromBlock:this.contiguousThrough+1,toBlock:this.latestObservedHeadBlock}:null;
-    return {startingObservedHeadBlock:this.startingObservedHeadBlock,latestObservedHeadBlock:this.latestObservedHeadBlock,headObservedUtc:this.headObservedUtc,headState:this.headState,
+    const freshHead=this.headState==='OBSERVED'&&this.headObservedAtMs!==null&&Date.now()-this.headObservedAtMs>=0&&Date.now()-this.headObservedAtMs<=120000;
+    const headState=freshHead?'OBSERVED':this.headState==='OBSERVED'?'UNKNOWN_STALE':this.headState;
+    const gap=this.latestObservedHeadBlock!==null&&(this.contiguousThrough===null||this.latestObservedHeadBlock>this.contiguousThrough)?{fromBlock:this.contiguousThrough===null?null:this.contiguousThrough+1,toBlock:this.latestObservedHeadBlock}:null;
+    return {startingObservedHeadBlock:this.startingObservedHeadBlock,latestObservedHeadBlock:this.latestObservedHeadBlock,headObservedUtc:this.headObservedUtc,headState,
       lastSuccessfullyScannedBlock:this.lastScanRange?.toBlock??null,lastScanRange:this.lastScanRange,contiguousFrom:this.contiguousFrom,contiguousThrough:this.contiguousThrough,
       scanGapCount:this.scanGapCount,reorgCount:this.reorgCount,unscannedHeadGap:gap,recoveryRequired:this.recoveryRequired,
-      coverage:this.headState==='OBSERVED'&&this.contiguousThrough!==null&&this.contiguousThrough===this.latestObservedHeadBlock&&!this.scanGapCount&&!this.recoveryRequired?'CONTIGUOUS_SELECTED_TOPIC_RANGE':'UNKNOWN_UNPROVEN',
+      coverage:freshHead&&!this.shutdownInterrupted&&this.contiguousThrough!==null&&this.contiguousThrough===this.latestObservedHeadBlock&&!this.scanGapCount&&!this.recoveryRequired?'CONTIGUOUS_SELECTED_TOPIC_RANGE':'UNKNOWN_UNPROVEN',
       cursorBlockHash:this.lastScanBlockHash,shutdownInterrupted:this.shutdownInterrupted};
   }
   private observeHead(value:unknown){
     if(typeof value!=='string'||!/^0x[0-9a-f]+$/i.test(value)||!Number.isSafeInteger(Number(value)))throw Error('INVALID_CHAIN_HEAD');
-    const head=Number(value);this.startingObservedHeadBlock??=head;this.latestObservedHeadBlock=head;this.headObservedUtc=this.nowIso();this.headState='OBSERVED';
+    const head=Number(value);this.startingObservedHeadBlock??=head;this.latestObservedHeadBlock=head;this.headObservedUtc=this.nowIso();this.headObservedAtMs=Date.now();this.headState='OBSERVED';
     this.operational?.tailProof({component:'CHAIN',recordType:'CHAIN_HEAD',...this.coverageEvidence()});
   }
   memoryTelemetry() {
@@ -258,10 +261,10 @@ export class ChainWatcher {
     this.halt(); // cleanup must precede a possibly failing tail-proof append
     if (this.operational && !this.operational.isUsable()) return;
     const cursor=this.store.readCursor(this.cfg.polygonHttpRpcUrl);
-    this.operational?.tailProof({component:'CHAIN',...this.coverageEvidence(),finalObservedHeadBlock:this.shutdownInterrupted||this.headState!=='OBSERVED'?null:this.latestObservedHeadBlock,finalHeadEvidence:'LAST_OBSERVED_HEAD; NO EXTRA_SHUTDOWN_RPC',finalVerifiedBlock:cursor?.blockNumber ?? null,
+    this.operational?.tailProof({component:'CHAIN',...this.coverageEvidence(),finalObservedHeadBlock:this.shutdownInterrupted||this.coverageEvidence().headState!=='OBSERVED'?null:this.latestObservedHeadBlock,finalHeadEvidence:'LAST_OBSERVED_HEAD; NO EXTRA_SHUTDOWN_RPC',finalVerifiedBlock:cursor?.blockNumber ?? null,
       finalSuccessfulSelectedTopicScanRange:this.lastScanRange,
-      unresolvedTailRange:this.recoveryRequired||this.headState!=='OBSERVED'||this.shutdownInterrupted ? {fromBlock:(this.lastScanRange?.toBlock??cursor?.blockNumber??0)+1,toBlock:null} : this.coverageEvidence().unscannedHeadGap,
-      finalCursor:cursor ?? null,maximumRetainedRelevantRawBlock:cursor?.blockNumber ?? null,
+      unresolvedTailRange:this.recoveryRequired||this.coverageEvidence().headState!=='OBSERVED'||this.shutdownInterrupted ? {fromBlock:(this.lastScanRange?.toBlock??cursor?.blockNumber??0)+1,toBlock:null} : this.coverageEvidence().unscannedHeadGap,
+      finalCursor:cursor ?? null,maximumRetainedRelevantRawBlock:null,maximumRetainedRelevantRawBlockEvidence:'NOT_MEASURED; SCANNED_HEIGHT_IS_NOT_RAW_LOG_HEIGHT',
       finalVerificationTimestamp:this.nowIso(),recoveryRequired:this.recoveryRequired});
   }
 
@@ -732,7 +735,7 @@ export class ChainWatcher {
 
     if (ancestor === null) {
       // Fail closed: no provable ancestor within the supported window.
-      this.reorgCount++;this.contiguousThrough=null;
+      this.reorgCount++;this.contiguousThrough=null;this.contiguousFrom=null;this.lastScanRange=null;this.lastScanBlockHash=null;
       this.recoveryRequired = true;
       this.store.appendQuarantine({
         kind: 'REORG_ANOMALY',
@@ -749,7 +752,8 @@ export class ChainWatcher {
       return;
     }
 
-    this.reorgCount++;this.contiguousThrough=ancestor;
+    this.reorgCount++;this.contiguousThrough=ancestor;this.lastScanRange=null;this.lastScanBlockHash=null;
+    if(this.contiguousFrom!==null&&this.contiguousFrom>ancestor)this.contiguousFrom=null;
     const target = ancestor;
     const targetBlock = await this.providerBlock(target);
     this.operational?.assertUsable();
@@ -959,8 +963,9 @@ export class ChainWatcher {
       });
       if(requestId&&rangePublishable&&!this.recoveryRequired)this.operational?.confirmRpcPublication(requestId,{fromBlock:start,toBlock:end},head.hash,createHash('sha256').update(JSON.stringify(logs)).digest('hex'));
       if(rangePublishable&&!this.recoveryRequired){
-        if(this.contiguousThrough!==null&&start>this.contiguousThrough+1)this.scanGapCount++;
-        if(this.contiguousFrom===null||start>Number(this.contiguousThrough)+1){this.contiguousFrom=start;this.contiguousThrough=end;}
+        const disjoint=this.contiguousThrough!==null&&this.contiguousFrom!==null&&(start>this.contiguousThrough+1||end<this.contiguousFrom-1);
+        if(disjoint)this.scanGapCount++;
+        if(this.contiguousFrom===null||disjoint){this.contiguousFrom=start;this.contiguousThrough=end;}
         else {this.contiguousFrom=Math.min(this.contiguousFrom,start);this.contiguousThrough=Math.max(this.contiguousThrough??end,end);}
         this.lastScanRange={fromBlock:start,toBlock:end};this.lastScanBlockHash=head.hash;
         this.operational?.tailProof({component:'CHAIN',recordType:'CHAIN_COVERAGE',atUtc:this.nowIso(),...this.coverageEvidence()});

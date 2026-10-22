@@ -46,7 +46,7 @@ def measure_clock(phase,previous=None,command=None,wall=time.time,monotonic=time
   'providerClockOffset':'UNKNOWN_NOT_MEASURED','thresholdSeconds':{'absoluteHostOffset':MAX_OFFSET_SECONDS,'rootDistance':MAX_UNCERTAINTY_SECONDS}}
  if command is None:
   def command(args):
-   r=subprocess.run(args,capture_output=True,text=True,timeout=1,env={**os.environ,'LC_ALL':'C'})
+   r=subprocess.run(args,capture_output=True,text=True,timeout=1,env={'PATH':os.environ.get('PATH','/usr/bin:/bin'),'LC_ALL':'C'})
    if r.returncode or len(r.stdout)>16384: raise RuntimeError('CLOCK_COMMAND_UNAVAILABLE')
    return r.stdout
  try:

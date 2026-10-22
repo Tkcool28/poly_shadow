@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ChainWatcher, ReorgSignal } from '../src/shadow/watcher.js';
+import {RacingStore,Reconciler,publishChainObservation} from '../src/shadow/racing.js';
 import { ShadowStore } from '../src/shadow/storage.js';
 import { OperationalEvidence } from '../src/shadow/operational-evidence.js';
 import type { ShadowConfig } from '../src/shadow/config.js';
@@ -741,11 +742,12 @@ describe('diagnostic live-head and contiguous range evidence',()=>{
    if(method==='eth_getLogs')return (matchedOnly?[{...fillLog(101,BLOCK_A,8),topics:[TOPIC_ORDERS_MATCHED_V2,ORDER_HASH,addrTopic(WATCHED)],data:'0x'+[word(0),word(12345),word(381236800),word(680780000)].join('')}]:[fillLog(100,BLOCK_A)]) as T;
    return {hash:BLOCK_A,timestamp:'0x64'} as T;
   };
-  const published:unknown[]=[];const watcher=new ChainWatcher(cfg(store.dir),store,clock(),rpc,o=>published.push(o));
+  const racing=new RacingStore(store.dir);await racing.initializeIndex();const reconciler=new Reconciler(racing);
+  const published:unknown[]=[];const watcher=new ChainWatcher(cfg(store.dir),store,clock(),rpc,o=>{published.push(o);publishChainObservation(racing,reconciler,o);});
   await watcher.scanRange(100,100);await watcher.scanRange(100,100);
-  expect(store.observations()).toHaveLength(1);expect(published).toHaveLength(1);
+  expect(store.observations()).toHaveLength(1);expect(published).toHaveLength(1);expect(racing.sourceObservations()).toHaveLength(1);expect(racing.sourceObservations()[0]).toMatchObject({source:'CHAIN',wallet:WATCHED,asset:'12345'});
   expect(store.observations()[0]).toMatchObject({wallet:WATCHED,side:'BUY',tokenId:'12345',evidence:{txHash:TX,logIndex:7,blockHash:BLOCK_A}});
-  matchedOnly=true;await watcher.scanRange(101,101);expect(published).toHaveLength(1);watcher.stop();store.close();
+  matchedOnly=true;await watcher.scanRange(101,101);expect(published).toHaveLength(1);expect(racing.sourceObservations()).toHaveLength(1);watcher.stop();store.close();racing.close();
  });
 });
 
@@ -754,6 +756,14 @@ it('interrupted local shutdown never fabricates a final head',async()=>{
  const watcher=new ChainWatcher(cfg(store.dir),store,clock(),mockRpc(new Map([[100,{hash:BLOCK_A,timestamp:100}]])).rpc,undefined,op);
  (watcher as any).observeHead('0x64');(watcher as any).exclusive=new Promise(()=>{});
  const stopping=watcher.drainAndStop();await vi.advanceTimersByTimeAsync(3000);await stopping;
- expect(watcher.coverageEvidence().shutdownInterrupted).toBe(true);
+ expect(watcher.coverageEvidence().shutdownInterrupted).toBe(true);expect(watcher.coverageEvidence().coverage).toBe('UNKNOWN_UNPROVEN');
  const tail=JSON.parse(readFileSync(join(store.dir,'chain_tail_proofs.ndjson'),'utf8').trim().split('\n').at(-1)!);expect(tail.finalObservedHeadBlock).toBe(null);op.close();store.close();
+});
+it('stale head and disjoint backwards ranges never manufacture contiguous coverage',async()=>{
+ vi.useFakeTimers();const store=tempStore();
+ const rpc=async<T>(_url:string,method:string,_params:unknown[]):Promise<T>=>method==='eth_getLogs'?[] as T:{hash:BLOCK_A,timestamp:'0x64'} as T;
+ const watcher=new ChainWatcher(cfg(store.dir),store,clock(),rpc);
+ (watcher as any).observeHead('0x6e');await watcher.scanRange(100,110);expect(watcher.coverageEvidence().coverage).toBe('CONTIGUOUS_SELECTED_TOPIC_RANGE');
+ await vi.advanceTimersByTimeAsync(120001);expect(watcher.coverageEvidence()).toMatchObject({headState:'UNKNOWN_STALE',coverage:'UNKNOWN_UNPROVEN'});
+ await watcher.scanRange(10,20);expect(watcher.coverageEvidence()).toMatchObject({contiguousFrom:10,contiguousThrough:20,scanGapCount:1,coverage:'UNKNOWN_UNPROVEN'});watcher.stop();store.close();
 });

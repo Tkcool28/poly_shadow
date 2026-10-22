@@ -119,3 +119,14 @@ PAPER/live/V5 controls, current host headroom and bounded clock commands. Valida
 fresh discovery, checkpoint restart, final scan/head/clock evidence and real
 matched events or NO_MATCHED_EVENT_OBSERVED. A 24-hour launch requires a separate
 user decision after that evidence review. No past smoke evidence is rewritten.
+
+## Independent review corrections
+
+The first source review found false interval union for disjoint backward scans,
+stale-head qualification, old-fork scan metadata after reorg, interrupted-drain
+qualification and recovery corroboration suppressing a valid prospective match.
+Corrections retain only actual contiguous intervals, invalidate head quality after
+120s, clear superseded scan metadata at rewind, and separate recovery members
+from independently prospective groups. The diagnostic adapter retains original
+native identities/group references; certified matching is unchanged. Host clock
+wording now distinguishes measured synchronization from unknown provider offsets.

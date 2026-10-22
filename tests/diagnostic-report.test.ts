@@ -56,3 +56,9 @@ it('excludes explicitly recovered in-window records from prospective matching an
  expect(r.timing.every(x=>x.detectionLatency.samples===0)).toBe(true);expect(r.sources.find(x=>x.source==='REST_TRADES')!.acquisitionCounts).toMatchObject({prospective:0,retrospective:1});
  expect(r.acquisitionReadiness.matchedEventTimingSupport).toBe('UNKNOWN');
 });
+it('recovery corroboration cannot remove an independently prospective CHAIN match or enter its lane timing',async()=>{
+ const r=await run([row()],[obs('CHAIN',2,3),obs('REST_TRADES',5,6,{acquisitionMode:'HISTORICAL_CONTINUATION'})]);
+ expect(r.discovery.shadowUnionUnique).toBe(1);expect(r.discovery.matchingConfidence.high).toBe(1);
+ const methods=Object.fromEntries(r.timing.map(x=>[x.method,x]));expect(methods.CHAIN!.detectionLatency.samples).toBe(1);expect(methods.REST_TRADES!.detectionLatency.samples).toBe(0);expect(methods.SHADOW_UNION!.signedShadowLead.medianSeconds).toBe(1);
+ expect(r.retrospectiveAndUnknown.shadow).toHaveLength(1);
+});

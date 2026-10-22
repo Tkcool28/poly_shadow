@@ -137,6 +137,7 @@ class RunnerTests(unittest.TestCase):
              patch.object(runner,'inspect_poly2',return_value=before), \
              patch.object(runner,'preflight',side_effect=highs), \
              patch.object(runner,'storage_preflight',return_value={'state':'GREEN','gate':'PASS'}), \
+             patch.object(runner,'retain_clock',return_value={'state':'UNKNOWN','monotonicSeconds':0,'hostEpochSeconds':0}) as clock_evidence, \
              patch.object(runner,'now_utc',side_effect=lambda:next(now_values,'2026-10-19T00:01:02.000000Z')), \
              patch.object(runner.subprocess,'Popen',side_effect=fake_launch), \
              patch.object(runner,'wait_for_window',side_effect=wait_effect), \
@@ -150,6 +151,9 @@ class RunnerTests(unittest.TestCase):
                     rc=runner.run(args)
             else:
                 rc=runner.run(args)
+        self.assertGreaterEqual(clock_evidence.call_count,2)
+        self.assertEqual(clock_evidence.call_args_list[0].args[1],'START')
+        self.assertTrue(clock_evidence.call_args_list[-1].args[1].startswith('TERMINATION'))
         manifests=list(run_root.glob('*/diagnostic-manifest.json'))
         self.assertEqual(len(manifests),1)
         import json
