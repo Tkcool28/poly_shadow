@@ -50,3 +50,21 @@ it('scopes economic candidate groups by wallet while retaining original source g
  expect(r.wallets[0]!.counts.matched).toBe(1);expect(r.wallets[1]!.counts.matched).toBe(1);
  expect(r.examples[0]!.sourceGroupReferences).toEqual(r.examples[1]!.sourceGroupReferences);
 });
+it('excludes explicitly recovered in-window records from prospective matching and timing without rewriting clocks',async()=>{
+ const recovered=obs('REST_TRADES',2,3,{acquisitionMode:'HISTORICAL_CONTINUATION'});
+ const r=await run([row()],[recovered]);expect(r.discovery.shadowUnionUnique).toBe(0);expect(r.discovery.matchingConfidence.high).toBe(0);
+ expect(r.timing.every(x=>x.detectionLatency.samples===0)).toBe(true);expect(r.sources.find(x=>x.source==='REST_TRADES')!.acquisitionCounts).toMatchObject({prospective:0,retrospective:1});
+ expect(r.acquisitionReadiness.matchedEventTimingSupport).toBe('UNKNOWN');
+});
+it('recovery corroboration cannot remove an independently prospective CHAIN match or enter its lane timing',async()=>{
+ const r=await run([row()],[obs('CHAIN',2,3),obs('REST_TRADES',5,6,{acquisitionMode:'HISTORICAL_CONTINUATION'})]);
+ expect(r.discovery.shadowUnionUnique).toBe(1);expect(r.discovery.matchingConfidence.high).toBe(1);
+ const methods=Object.fromEntries(r.timing.map(x=>[x.method,x]));expect(methods.CHAIN!.detectionLatency.samples).toBe(1);expect(methods.REST_TRADES!.detectionLatency.samples).toBe(0);expect(methods.SHADOW_UNION!.signedShadowLead.medianSeconds).toBe(1);
+ expect(r.retrospectiveAndUnknown.shadow).toHaveLength(1);
+});
+it('retains nontrade activity as evidence without inventing prospective trades or false same-transaction matches',async()=>{
+ const nontrade=obs('REST_ACTIVITY',2,3,{identity:`rest-activity:REDEEM:${tx}:${WALLETS[0]}:7:2.000000:1`});
+ const r=await run([row()],[nontrade]);expect(r.discovery.shadowUnionUnique).toBe(0);expect(r.discovery.matchingConfidence.high).toBe(0);expect(r.overall.shadowOnlyObserved).toBe(0);
+ const activity=r.sources.find(x=>x.source==='REST_ACTIVITY')!;expect(activity.observations).toBe(1);expect(activity.acquisitionCounts).toMatchObject({prospective:0,retrospective:0,nonTradeActivities:1});expect(activity.acquisitionCounts!.latestEventTimestamp).not.toBe(null);
+ const trade=await run([row()],[{...nontrade,identity:nontrade.identity.replace('REDEEM','TRADE')}]);expect(trade.discovery.matchingConfidence.high).toBe(1);expect(trade.sources.find(x=>x.source==='REST_ACTIVITY')!.acquisitionCounts!.nonTradeActivities).toBe(0);
+});

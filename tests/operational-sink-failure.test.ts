@@ -268,9 +268,9 @@ it.each(['null-block','invalid-range'] as const)('CHAIN shared sink break cancel
  const {watcher}=await chain(d,e,rpc);
  const pending=kind==='null-block'?watcher.handleLog(log()):watcher.scanRange(1,2);
  const rejected=expect(pending).rejects.toBe(failure);await vi.advanceTimersByTimeAsync(1);
- expect(vi.getTimerCount()).toBe(1);const count=rpc.mock.calls.length;arm();expect(()=>e.telemetry({})).toThrow(failure);
+ expect(vi.getTimerCount()).toBe(1);const count=rpc.mock.calls.length;const priorHeadEvidence=bytes(d,'chain_tail_proofs.ndjson');arm();expect(()=>e.telemetry({})).toThrow(failure);
  expect(vi.getTimerCount()).toBe(0);await rejected;await vi.advanceTimersByTimeAsync(5000);expect(rpc).toHaveBeenCalledTimes(count);
- expect(bytes(d,'quarantine_v2.ndjson')).toBe('');expect(bytes(d,'chain_tail_proofs.ndjson')).toBe('');
+ expect(bytes(d,'quarantine_v2.ndjson')).toBe('');expect(bytes(d,'chain_tail_proofs.ndjson')).toBe(priorHeadEvidence);
 });
 it.each(['initial','periodic'] as const)('publisher %s snapshot failure with broken quarantine reporter retires without rearming a timer',async(stage)=>{
  vi.useFakeTimers();const {d,e,failure,arm}=fixture('quarantine_v2.ndjson');let failSnapshot=stage==='initial';

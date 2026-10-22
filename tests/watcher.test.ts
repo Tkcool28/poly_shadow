@@ -10,12 +10,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ChainWatcher, ReorgSignal } from '../src/shadow/watcher.js';
+import {RacingStore,Reconciler,publishChainObservation} from '../src/shadow/racing.js';
 import { ShadowStore } from '../src/shadow/storage.js';
 import { OperationalEvidence } from '../src/shadow/operational-evidence.js';
 import type { ShadowConfig } from '../src/shadow/config.js';
 import {
   EXCHANGE_V2_STANDARD,
   TOPIC_ORDER_FILLED_V2,
+  TOPIC_ORDERS_MATCHED_V2,
 } from '../src/shadow/v2constants.js';
 
 const WATCHED = '0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029';
@@ -705,4 +707,63 @@ describe('watcher evidence safety', () => {
     expect(obs.sourceFirstSeenUtc).toBe(arrival); // discovery latency preserved
     expect(obs.firstSeenUtc > obs.sourceFirstSeenUtc).toBe(true); // completed later
   });
+});
+
+describe('diagnostic live-head and contiguous range evidence',()=>{
+ it('retains starting/live/final heads and contiguous empty scans; RPC success alone is not a range',async()=>{
+  const store=tempStore(),op=new OperationalEvidence(store.dir);let head=100;
+  const rpc=async<T>(_url:string,method:string,_params:unknown[]):Promise<T>=>{
+   if(method==='eth_blockNumber')return ('0x'+head.toString(16)) as T;
+   if(method==='eth_getLogs')return [] as T;
+   return {hash:BLOCK_A,timestamp:'0x64'} as T;
+  };
+  const watcher=new ChainWatcher(cfg(store.dir),store,clock(),rpc,undefined,op);
+  try{
+   await watcher.backfillFromCursor();expect(watcher.coverageEvidence()).toMatchObject({startingObservedHeadBlock:100,latestObservedHeadBlock:100,lastSuccessfullyScannedBlock:100,contiguousFrom:36,contiguousThrough:100,coverage:'CONTIGUOUS_SELECTED_TOPIC_RANGE'});
+   head=102;await watcher.backfillFromCursor();expect(watcher.coverageEvidence()).toMatchObject({startingObservedHeadBlock:100,latestObservedHeadBlock:102,contiguousThrough:102,scanGapCount:0});
+   await watcher.drainAndStop();
+   const tail=JSON.parse(readFileSync(join(store.dir,'chain_tail_proofs.ndjson'),'utf8').trim().split('\n').at(-1)!);
+   expect(tail).toMatchObject({finalObservedHeadBlock:102,finalVerifiedBlock:102,finalSuccessfulSelectedTopicScanRange:{fromBlock:101,toBlock:102},unresolvedTailRange:null});
+  }finally{watcher.stop();op.close();store.close();}
+ });
+ it('reports missing ranges and unavailable head as unknown, including interrupted shutdown',async()=>{
+  const store=tempStore(),op=new OperationalEvidence(store.dir);
+  const rpc=async<T>(_url:string,method:string,_params:unknown[]):Promise<T>=>{if(method==='eth_getLogs')return [] as T;if(method==='eth_blockNumber')throw Error('head unavailable');return {hash:BLOCK_A,timestamp:'0x64'} as T;};
+  const watcher=new ChainWatcher(cfg(store.dir),store,clock(),rpc,undefined,op);
+  try{
+   await watcher.scanRange(10,11);await watcher.scanRange(13,14);expect(watcher.coverageEvidence()).toMatchObject({scanGapCount:1,coverage:'UNKNOWN_UNPROVEN',headState:'UNKNOWN'});
+   await expect(watcher.backfillFromCursor()).rejects.toThrow('head unavailable');watcher.stop();
+   const tail=JSON.parse(readFileSync(join(store.dir,'chain_tail_proofs.ndjson'),'utf8').trim().split('\n').at(-1)!);expect(tail.finalObservedHeadBlock).toBe(null);expect(tail.unresolvedTailRange).not.toBe(null);
+  }finally{watcher.stop();op.close();store.close();}
+ });
+ it('positive eligible OrderFilled scans publish one native observation across overlapping replay; OrdersMatched alone publishes zero',async()=>{
+  const store=tempStore();let matchedOnly=false;
+  const rpc=async<T>(_url:string,method:string,_params:unknown[]):Promise<T>=>{
+   if(method==='eth_getLogs')return (matchedOnly?[{...fillLog(101,BLOCK_A,8),topics:[TOPIC_ORDERS_MATCHED_V2,ORDER_HASH,addrTopic(WATCHED)],data:'0x'+[word(0),word(12345),word(381236800),word(680780000)].join('')}]:[fillLog(100,BLOCK_A)]) as T;
+   return {hash:BLOCK_A,timestamp:'0x64'} as T;
+  };
+  const racing=new RacingStore(store.dir);await racing.initializeIndex();const reconciler=new Reconciler(racing);
+  const published:unknown[]=[];const watcher=new ChainWatcher(cfg(store.dir),store,clock(),rpc,o=>{published.push(o);publishChainObservation(racing,reconciler,o);});
+  await watcher.scanRange(100,100);await watcher.scanRange(100,100);
+  expect(store.observations()).toHaveLength(1);expect(published).toHaveLength(1);expect(racing.sourceObservations()).toHaveLength(1);expect(racing.sourceObservations()[0]).toMatchObject({source:'CHAIN',wallet:WATCHED,asset:'12345'});
+  expect(store.observations()[0]).toMatchObject({wallet:WATCHED,side:'BUY',tokenId:'12345',evidence:{txHash:TX,logIndex:7,blockHash:BLOCK_A}});
+  matchedOnly=true;await watcher.scanRange(101,101);expect(published).toHaveLength(1);expect(racing.sourceObservations()).toHaveLength(1);watcher.stop();store.close();racing.close();
+ });
+});
+
+it('interrupted local shutdown never fabricates a final head',async()=>{
+ vi.useFakeTimers();const store=tempStore(),op=new OperationalEvidence(store.dir);
+ const watcher=new ChainWatcher(cfg(store.dir),store,clock(),mockRpc(new Map([[100,{hash:BLOCK_A,timestamp:100}]])).rpc,undefined,op);
+ (watcher as any).observeHead('0x64');(watcher as any).exclusive=new Promise(()=>{});
+ const stopping=watcher.drainAndStop();await vi.advanceTimersByTimeAsync(3000);await stopping;
+ expect(watcher.coverageEvidence().shutdownInterrupted).toBe(true);expect(watcher.coverageEvidence().coverage).toBe('UNKNOWN_UNPROVEN');
+ const tail=JSON.parse(readFileSync(join(store.dir,'chain_tail_proofs.ndjson'),'utf8').trim().split('\n').at(-1)!);expect(tail.finalObservedHeadBlock).toBe(null);op.close();store.close();
+});
+it('stale head and disjoint backwards ranges never manufacture contiguous coverage',async()=>{
+ vi.useFakeTimers();const store=tempStore();
+ const rpc=async<T>(_url:string,method:string,_params:unknown[]):Promise<T>=>method==='eth_getLogs'?[] as T:{hash:BLOCK_A,timestamp:'0x64'} as T;
+ const watcher=new ChainWatcher(cfg(store.dir),store,clock(),rpc);
+ (watcher as any).observeHead('0x6e');await watcher.scanRange(100,110);expect(watcher.coverageEvidence().coverage).toBe('CONTIGUOUS_SELECTED_TOPIC_RANGE');
+ await vi.advanceTimersByTimeAsync(120001);expect(watcher.coverageEvidence()).toMatchObject({headState:'UNKNOWN_STALE',coverage:'UNKNOWN_UNPROVEN'});
+ await watcher.scanRange(10,20);expect(watcher.coverageEvidence()).toMatchObject({contiguousFrom:10,contiguousThrough:20,scanGapCount:1,scanGaps:[{fromBlock:21,toBlock:99}],coverage:'UNKNOWN_UNPROVEN'});watcher.stop();store.close();
 });
