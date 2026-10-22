@@ -26,6 +26,8 @@ import { activityIdentity, normalizeRestRaw, tradesIdentity } from './racing.js'
 import { OperationalEvidence } from './operational-evidence.js';
 import type { TradesPayload } from './racing.js';
 
+import {readContinuation,saveContinuation,queryBinding,type Continuation,type RestAcquisitionMode} from './rest-continuation.js';
+
 type FetchFn = typeof restGet;
 
 /** Only bounded page validation failures qualify for wallet-local isolation.
@@ -43,6 +45,8 @@ export interface RestPollerOpts {
   pagination?: { maxPages: number; overlap: number };
   /** Prospective cursor acquisition; source identities and journals stay unchanged. */
   v2?: boolean;
+  /** Diagnostic-only; frozen run boundary, not a source watermark. */
+  discoveryStartUtc?: string;
 }
 
 export class RestPoller {
@@ -66,6 +70,7 @@ export class RestPoller {
     const paging=opts.pagination;
     if(paging&&(!Number.isInteger(paging.maxPages)||paging.maxPages<1||paging.maxPages>16||!Number.isInteger(paging.overlap)||paging.overlap<1||paging.overlap>=limit))throw Error('invalid bounded REST pagination budget');
     if(opts.v2 && (opts.pagination || limit!==LIMITS.records || [...opts.wallets].some(w=>!WALLETS.includes(w)))) throw Error('invalid v2 cohort or bounds');
+    if(opts.discoveryStartUtc && (!opts.v2 || !Number.isFinite(Date.parse(opts.discoveryStartUtc)) || !operational))throw Error('invalid diagnostic discovery configuration');
     const sink=this.operational;
     if(sink){this.store.gatePublications(()=>sink.assertUsable());sink.onBroken(() => this.stop());}
     // Restart idempotence: previously committed identities are never
@@ -94,10 +99,10 @@ export class RestPoller {
   /** Number of source-native identities already committed (tests). */
   get seenCount(): number { return this.store.identityCount(this.opts.source); }
 
-  private url(wallet: string, offset=0, cursor:string|null=null, end=0): string {
+  private url(wallet: string, offset=0, cursor:string|null=null, end=0, query?:Record<string,string>): string {
     if(this.opts.v2){
       const u=new URL(`https://data-api.polymarket.com/v2/${this.opts.endpoint}`);
-      for(const [k,v] of Object.entries(v2Filters(this.opts.endpoint,wallet,end)))u.searchParams.set(k,v);
+      for(const [k,v] of Object.entries(query??v2Filters(this.opts.endpoint,wallet,end)))u.searchParams.set(k,v);
       if(cursor!==null)u.searchParams.set('cursor',cursor);
       return u.href;
     }
@@ -109,7 +114,7 @@ export class RestPoller {
     return this.opts.pagination ? `${legacy}&offset=${offset}` : legacy;
   }
 
-  async pollAll(startAt=0): Promise<void> {
+  async pollAll(startAt=0,mode:RestAcquisitionMode='FRESH_DISCOVERY'): Promise<void> {
     this.operational?.assertUsable();
     if (this.polling) {
       for(const wallet of this.opts.wallets)this.skipped(wallet.toLowerCase(), 'SOURCE_POLL_IN_FLIGHT');
@@ -121,7 +126,7 @@ export class RestPoller {
       if(!Number.isInteger(startAt)||startAt<0||startAt>=wallets.length)throw Error('invalid REST cohort rotation');
       for (let i=0;i<wallets.length;i++) {
         const wallet=wallets[(i+startAt)%wallets.length]!;
-        try { await this.pollWallet(wallet.toLowerCase()); }
+        try { await this.pollWallet(wallet.toLowerCase(),mode); }
         catch (err) {
           // Rejection arrives only after the page and final-poll receipts have
           // succeeded. No sink means no durable receipt proof; fail closed.
@@ -146,7 +151,7 @@ export class RestPoller {
 
   /** Bounded legacy offset traversal. Observed overlap is diagnostic, never a
    * snapshot/watermark proof. No source timestamp is used to backdate arrival. */
-  async pollWallet(wallet: string): Promise<void> {
+  async pollWallet(wallet: string,mode:RestAcquisitionMode='FRESH_DISCOVERY'): Promise<void> {
     this.operational?.assertUsable();
     wallet=wallet.toLowerCase();
     let configured=false;for(const member of this.opts.wallets)if(member.toLowerCase()===wallet)configured=true;
@@ -157,6 +162,25 @@ export class RestPoller {
     let pages=0,totalItems=0,totalNew=0,totalSeen=0,offset=0;
     const began=Date.now(),end=Math.floor(began/1000),deadline=began+LIMITS.traversalMs;
     let cursor:string|null=null,lastTimestamp:number|null=null;
+    let continuation:Continuation|null=null,query:Record<string,string>|undefined;
+    let cursorInvalidation:string|null=null;
+    const diagnostic=!!this.opts.discoveryStartUtc;
+    if(diagnostic){
+      query={...v2Filters(this.opts.endpoint,wallet,end)};
+      if(mode==='FRESH_DISCOVERY')query.start=String(Math.max(1,Math.floor(Date.parse(this.opts.discoveryStartUtc!)/1000)-120));
+      else {
+        try{
+          continuation=readContinuation(this.store.dir,this.opts.source,wallet);
+          if(continuation){
+            const c=continuation;
+            if(c.binding!==queryBinding(this.opts.endpoint,c.query)||c.query.user!==wallet||JSON.stringify(c.query)!==JSON.stringify(v2Filters(this.opts.endpoint,wallet,Number(c.query.end))))throw Error('CURSOR_QUERY_BINDING');
+            if(Date.now()-Date.parse(c.savedUtc)>3600000||Date.parse(c.savedUtc)>Date.now()+1000)throw Error('CURSOR_AGE_UNPROVEN');
+            if(c.boundary.some(id=>!this.store.hasRestPublication(this.opts.source,id)))throw Error('CURSOR_PUBLICATION_BOUNDARY_MISSING');
+            if(!c.exhausted){query=c.query;cursor=c.cursor;lastTimestamp=c.lastTimestamp;}else continuation=null;
+          }
+        }catch(e){cursorInvalidation=String(e);continuation=null;}
+      }
+    }
     const seenCursors=new Set<string>();
     let outcome='SKIPPED',stopReason='INDEX_PREFLIGHT',pollError:unknown=null;
     let previousTail:string[]=[];
@@ -167,7 +191,8 @@ export class RestPoller {
       try { this.store.assertUsable(); await this.store.initializeIndex(); }
       catch(err){outcome='PUBLICATION_FAILURE';recordQuarantine(null,'INDEX_ERROR',`index preflight: ${String(err)}`,pollId);throw err;}
       this.operational?.assertUsable();
-      const budget=this.opts.v2 ? LIMITS.pages : paging?.maxPages ?? 1,overlap=paging?.overlap ?? 0;
+      if(cursorInvalidation)this.operational?.restReceipt({recordType:'REST_CURSOR_INVALIDATION',source:this.opts.source,wallet,pollId,atUtc:this.nowIso(),reason:cursorInvalidation,unvisitedRange:'UNKNOWN_UNPROVEN'});
+      const budget=diagnostic ? 1 : this.opts.v2 ? LIMITS.pages : paging?.maxPages ?? 1,overlap=paging?.overlap ?? 0;
       for(let page=0;page<budget;page++){
         this.operational?.assertUsable();
         const quarantineStart=quarantineIds.length;
@@ -182,7 +207,7 @@ export class RestPoller {
           }catch(error){outcome='PUBLICATION_FAILURE';stopReason='V2_RESOURCE_GATE';recordQuarantine(null,'PUBLICATION_ERROR',String(error),pollId);throw error;}
         }
         if(this.opts.v2 && Date.now()+LIMITS.requestMs>deadline){stopReason='TIME_BUDGET';break;}
-        const requestUrl=this.url(wallet,offset,cursor,end),queueIntentUtc=this.nowIso();let requestStartUtc=queueIntentUtc;
+        const requestUrl=this.url(wallet,offset,cursor,end,query),queueIntentUtc=this.nowIso();let requestStartUtc=queueIntentUtc;
         let scheduling:unknown=null,rateLimitHeaders:Record<string,string>={},requestStartEvidence='FETCH_BOUNDARY_FALLBACK';
         const requestParams=Object.fromEntries(new URL(requestUrl).searchParams);
         let status:number|null=null,responseUtc:string|null=null;
@@ -205,9 +230,9 @@ export class RestPoller {
             if(Date.now()>deadline)throw Error('TIME_BUDGET');
             if(!Number.isFinite(Date.parse(requestStartUtc)) || !Number.isFinite(Date.parse(responseUtc)) || Date.parse(responseUtc)<Date.parse(requestStartUtc))throw Error('REQUEST_RESPONSE_CLOCK_INVALID');
             const decoded=decodeV2Page(this.opts.endpoint,res.body,wallet);
-            if(decoded.next!==null && (decoded.next===cursor || seenCursors.has(decoded.next)))throw Error('REPEATED_CURSOR');
+            if(decoded.next!==null && (decoded.next===cursor || seenCursors.has(decoded.next) || diagnostic&&decoded.next===continuation?.previousCursor))throw Error('REPEATED_CURSOR');
             let last:number|null=lastTimestamp;
-            for(const item of decoded.rows){if(item.timestamp>end || item.timestamp<end-3*365*86400 || last!==null&&item.timestamp>last)throw Error('ORDER_OR_WINDOW_ANOMALY');last=item.timestamp;}
+            for(const item of decoded.rows){if(item.timestamp>Number(query?.end??end) || item.timestamp<Number(query?.start??end-3*365*86400) || last!==null&&item.timestamp>last)throw Error('ORDER_OR_WINDOW_ANOMALY');last=item.timestamp;}
             lastTimestamp=last;v2Next=decoded.next;items=decoded.rows;wireItems=(res.body as {data:unknown[]}).data;
             pageOutcome=items.length?'SUCCESS_NONEMPTY':'SUCCESS_EMPTY';
           }
@@ -250,7 +275,7 @@ export class RestPoller {
               if(this.store.hasRestPublication(this.opts.source,identity))dupCount++;
               else {
                 this.commit(wallet,identity,item,typeof item.timestamp==='number'?item.timestamp:null,
-                  {requestStartUtc,responseUtc:responseUtc!,httpStatus:status!,ageHeader:headers.age as string|null,cacheControl:headers.cacheControl as string|null}, this.opts.v2 ? wireItems[i] as Record<string,unknown> : undefined);
+                  {requestStartUtc,responseUtc:responseUtc!,httpStatus:status!,ageHeader:headers.age as string|null,cacheControl:headers.cacheControl as string|null}, this.opts.v2 ? wireItems[i] as Record<string,unknown> : undefined,diagnostic?mode:undefined);
                 newCount++;published++;
               }
               // A durable exact publication is the only recovery authority,
@@ -290,8 +315,18 @@ export class RestPoller {
           firstTimestamp:(items[0] as Record<string,unknown>|null)?.timestamp??null,lastTimestamp:(items.at(-1) as Record<string,unknown>|null)?.timestamp??null,
           identityVectorComplete,identityVectorSha256:createHash('sha256').update(ids.join('\n')).digest('hex'),
           alreadySeen:dupCount,newIdentities:newCount,published,publication,nextCursor,nextOffset,acquisition:this.opts.v2?'V2_CURSOR':'LEGACY_OFFSET',
+          ...(diagnostic?{acquisitionMode:mode,cursorInvalidation,queryBinding:queryBinding(this.opts.endpoint,query!),continuationAvailable:!error&&v2Next!==null,unvisitedRange:'UNKNOWN_UNPROVEN',returnedNextCursor:v2Next,cumulativePages:(continuation?.pages??0)+pages}:{}),
           quarantineIds:quarantineIds.slice(quarantineStart),pagination:'UNKNOWN_UNPROVEN',stopReason};
         this.operational?.restReceipt(lastReceipt);
+        if(diagnostic&&mode==='HISTORICAL_CONTINUATION'){
+          if(!error){
+            saveContinuation(this.store.dir,this.opts.source,wallet,{version:1,binding:queryBinding(this.opts.endpoint,query!),query:query!,cursor:v2Next,previousCursor:cursor,pages:(continuation?.pages??0)+1,lastTimestamp,boundary:ids,savedUtc:this.nowIso(),exhausted:v2Next===null});
+          }else if(status===400||status===410||pageOutcome==='PARSE_FAILURE'){
+            // Invalidate explicitly; next recovery turn re-anchors, never skips.
+            saveContinuation(this.store.dir,this.opts.source,wallet,{version:1,binding:queryBinding(this.opts.endpoint,query!),query:query!,cursor:null,previousCursor:null,pages:continuation?.pages??1,lastTimestamp:null,boundary:[],savedUtc:this.nowIso(),exhausted:true});
+            this.operational?.restReceipt({recordType:'REST_CURSOR_INVALIDATION',source:this.opts.source,wallet,pollId,atUtc:this.nowIso(),reason:error,unvisitedRange:'UNKNOWN_UNPROVEN'});
+          }
+        }
         if(thrown)throw thrown;
         if(this.opts.v2){if(nextCursor===null)break;seenCursors.add(nextCursor);cursor=nextCursor;continue;}
         if(nextOffset===null)break;
@@ -326,6 +361,7 @@ export class RestPoller {
     sourceTs: number | null,
     http: { requestStartUtc: string; responseUtc: string; httpStatus: number; ageHeader: string | null; cacheControl: string | null },
     sourcePayload?: Record<string,unknown>,
+    acquisitionMode?:RestAcquisitionMode,
   ): void {
     this.operational?.assertUsable();
     const firstSeenUtc = this.opts.v2 ? http.responseUtc : this.nowIso();
@@ -336,6 +372,7 @@ export class RestPoller {
       ageHeader: http.ageHeader, cacheControl: http.cacheControl,
       sourceTs, firstSeenUtc, completedUtc:firstSeenUtc,
       ...(sourcePayload ? {sourcePayload} : {}),
+      ...(acquisitionMode?{acquisitionMode}:{}),
     };
     // Sample completion only after the frozen normalizer has finished. Persist
     // both clocks before any publication; restart repair reuses these bytes.

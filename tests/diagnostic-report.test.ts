@@ -50,3 +50,9 @@ it('scopes economic candidate groups by wallet while retaining original source g
  expect(r.wallets[0]!.counts.matched).toBe(1);expect(r.wallets[1]!.counts.matched).toBe(1);
  expect(r.examples[0]!.sourceGroupReferences).toEqual(r.examples[1]!.sourceGroupReferences);
 });
+it('excludes explicitly recovered in-window records from prospective matching and timing without rewriting clocks',async()=>{
+ const recovered=obs('REST_TRADES',2,3,{acquisitionMode:'HISTORICAL_CONTINUATION'});
+ const r=await run([row()],[recovered]);expect(r.discovery.shadowUnionUnique).toBe(0);expect(r.discovery.matchingConfidence.high).toBe(0);
+ expect(r.timing.every(x=>x.detectionLatency.samples===0)).toBe(true);expect(r.sources.find(x=>x.source==='REST_TRADES')!.acquisitionCounts).toMatchObject({prospective:0,retrospective:1});
+ expect(r.acquisitionReadiness.matchedEventTimingSupport).toBe('UNKNOWN');
+});

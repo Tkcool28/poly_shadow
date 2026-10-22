@@ -133,13 +133,37 @@ export class ChainWatcher {
   private replayRows=0;
   private lastProgressUtc: string | null=null;
   private filteredLogs=0;
+  private startingObservedHeadBlock:number|null=null;
+  private latestObservedHeadBlock:number|null=null;
+  private headObservedUtc:string|null=null;
+  private headState='UNKNOWN';
+  private lastScanBlockHash:string|null=null;
+  private lastScanRange:{fromBlock:number;toBlock:number}|null=null;
+  private contiguousFrom:number|null=null;
+  private contiguousThrough:number|null=null;
+  private scanGapCount=0;
+  private reorgCount=0;
+  private shutdownInterrupted=false;
+  coverageEvidence(){
+    const gap=this.latestObservedHeadBlock!==null&&this.contiguousThrough!==null&&this.latestObservedHeadBlock>this.contiguousThrough?{fromBlock:this.contiguousThrough+1,toBlock:this.latestObservedHeadBlock}:null;
+    return {startingObservedHeadBlock:this.startingObservedHeadBlock,latestObservedHeadBlock:this.latestObservedHeadBlock,headObservedUtc:this.headObservedUtc,headState:this.headState,
+      lastSuccessfullyScannedBlock:this.lastScanRange?.toBlock??null,lastScanRange:this.lastScanRange,contiguousFrom:this.contiguousFrom,contiguousThrough:this.contiguousThrough,
+      scanGapCount:this.scanGapCount,reorgCount:this.reorgCount,unscannedHeadGap:gap,recoveryRequired:this.recoveryRequired,
+      coverage:this.headState==='OBSERVED'&&this.contiguousThrough!==null&&this.contiguousThrough===this.latestObservedHeadBlock&&!this.scanGapCount&&!this.recoveryRequired?'CONTIGUOUS_SELECTED_TOPIC_RANGE':'UNKNOWN_UNPROVEN',
+      cursorBlockHash:this.lastScanBlockHash,shutdownInterrupted:this.shutdownInterrupted};
+  }
+  private observeHead(value:unknown){
+    if(typeof value!=='string'||!/^0x[0-9a-f]+$/i.test(value)||!Number.isSafeInteger(Number(value)))throw Error('INVALID_CHAIN_HEAD');
+    const head=Number(value);this.startingObservedHeadBlock??=head;this.latestObservedHeadBlock=head;this.headObservedUtc=this.nowIso();this.headState='OBSERVED';
+    this.operational?.tailProof({component:'CHAIN',recordType:'CHAIN_HEAD',...this.coverageEvidence()});
+  }
   memoryTelemetry() {
     const m=process.memoryUsage();
     return {pid:process.pid, atUtc:this.nowIso(), rssBytes:m.rss, heapUsedBytes:m.heapUsed,
       heapTotalBytes:m.heapTotal, externalBytes:m.external, ...cgroupMemory(), ...this.store.indexTelemetry(),
       inflight:this.inflight.size, retryQueue:this.retryQueue.length, exclusiveDepth:this.exclusiveDepth, replayActive:this.replayActive,
       replayRows:this.replayRows, lastProgressUtc:this.lastProgressUtc,
-      filteredLogs:this.filteredLogs, recoveryRequired:this.recoveryRequired,
+      chainCoverage:this.coverageEvidence(),filteredLogs:this.filteredLogs, recoveryRequired:this.recoveryRequired,
       rpcParentLineages:this.rpcParents.size,rpcParentLineageCapacity:RPC_PARENT_LINEAGE_MAX,
       rpcParentLineageEvictions:this.rpcParentLineageEvictions,rpcParentHistoryTruncated:this.rpcParentHistoryTruncated,
       blockCache:this.blockCache.size, matchedCache:this.matchedByHash.size, aggregateCache:this.aggregateByHash.size};
@@ -187,15 +211,16 @@ export class ChainWatcher {
   });
   private async rpcObserved<T>(method: string, params: unknown[], reason: import('./operational-evidence.js').RpcReason = 'other', attempt = 1, retryParentRequestId: string | null = null, onSuccess?: (requestId:string)=>void): Promise<T> {
     this.operational?.assertUsable();
-    if (!this.operational) return this.rpc<T>(this.cfg.polygonHttpRpcUrl, method, params);
+    if (!this.operational) {const value=await this.rpc<T>(this.cfg.polygonHttpRpcUrl,method,params);if(method==='eth_blockNumber')this.observeHead(value);return value;}
     const key=`${method}:${JSON.stringify(params)}`;
     const parent=retryParentRequestId ?? this.rpcParents.get(key) ?? null;
     try {
       const value=await this.operational.rpc(() => this.rpc<T>(this.cfg.polygonHttpRpcUrl, method, params), {
         family: method, method, params, component: 'CHAIN', reason, attempt, retryParentRequestId:parent, timeoutMs: 15_000,
       }, onSuccess);
+      if(method==='eth_blockNumber')this.observeHead(value);
       this.rpcParents.delete(key); return value;
-    } catch (err) { const id=rpcRequestId(err); if(id) this.rpcParents.set(key,id); throw err; }
+    } catch (err) { if(method==='eth_blockNumber')this.headState='UNKNOWN';const id=rpcRequestId(err); if(id) this.rpcParents.set(key,id); throw err; }
   }
 
   start(): void {
@@ -233,11 +258,18 @@ export class ChainWatcher {
     this.halt(); // cleanup must precede a possibly failing tail-proof append
     if (this.operational && !this.operational.isUsable()) return;
     const cursor=this.store.readCursor(this.cfg.polygonHttpRpcUrl);
-    this.operational?.tailProof({component:'CHAIN',finalObservedHeadBlock:null,finalVerifiedBlock:cursor?.blockNumber ?? null,
-      finalSuccessfulSelectedTopicScanRange:cursor ? {fromBlock:cursor.blockNumber,toBlock:cursor.blockNumber} : null,
-      unresolvedTailRange:this.recoveryRequired ? {fromBlock:(cursor?.blockNumber ?? 0)+1,toBlock:null} : null,
+    this.operational?.tailProof({component:'CHAIN',...this.coverageEvidence(),finalObservedHeadBlock:this.shutdownInterrupted||this.headState!=='OBSERVED'?null:this.latestObservedHeadBlock,finalHeadEvidence:'LAST_OBSERVED_HEAD; NO EXTRA_SHUTDOWN_RPC',finalVerifiedBlock:cursor?.blockNumber ?? null,
+      finalSuccessfulSelectedTopicScanRange:this.lastScanRange,
+      unresolvedTailRange:this.recoveryRequired||this.headState!=='OBSERVED'||this.shutdownInterrupted ? {fromBlock:(this.lastScanRange?.toBlock??cursor?.blockNumber??0)+1,toBlock:null} : this.coverageEvidence().unscannedHeadGap,
       finalCursor:cursor ?? null,maximumRetainedRelevantRawBlock:cursor?.blockNumber ?? null,
       finalVerificationTimestamp:this.nowIso(),recoveryRequired:this.recoveryRequired});
+  }
+
+  /** Bounded local drain, no additional provider call at shutdown. */
+  async drainAndStop():Promise<void>{
+    this.halt();let timer:ReturnType<typeof setTimeout>|undefined;
+    try{await Promise.race([Promise.all([this.exclusive,...this.inflight.values()]),new Promise<void>(resolve=>{timer=setTimeout(()=>{this.shutdownInterrupted=true;resolve();},3000);})]);}
+    finally{if(timer)clearTimeout(timer);this.stop();}
   }
 
   /** Serialize scan/validate/replay/recovery: one transition at a time. */
@@ -700,6 +732,7 @@ export class ChainWatcher {
 
     if (ancestor === null) {
       // Fail closed: no provable ancestor within the supported window.
+      this.reorgCount++;this.contiguousThrough=null;
       this.recoveryRequired = true;
       this.store.appendQuarantine({
         kind: 'REORG_ANOMALY',
@@ -716,6 +749,7 @@ export class ChainWatcher {
       return;
     }
 
+    this.reorgCount++;this.contiguousThrough=ancestor;
     const target = ancestor;
     const targetBlock = await this.providerBlock(target);
     this.operational?.assertUsable();
@@ -789,6 +823,7 @@ export class ChainWatcher {
   /** Resume from durable cursor; then periodic verification backfill.
    *  Public for tests; production entry is the subscription-ack handler. */
   async backfillFromCursor(): Promise<void> {
+   try {
     try {
       await this.validateCursor();
     } catch (err) {
@@ -811,6 +846,7 @@ export class ChainWatcher {
     await this.scanRange(from, latest);
     this.operational?.assertUsable();
     this.startVerifier();
+   }catch(error){if(!this.recoveryRequired&&this.shouldReconnect)this.startVerifier(true);throw error;}
   }
 
   private startVerifier(retryStartup = false): void {
@@ -922,6 +958,13 @@ export class ChainWatcher {
         updatedAtUtc: this.nowIso(),
       });
       if(requestId&&rangePublishable&&!this.recoveryRequired)this.operational?.confirmRpcPublication(requestId,{fromBlock:start,toBlock:end},head.hash,createHash('sha256').update(JSON.stringify(logs)).digest('hex'));
+      if(rangePublishable&&!this.recoveryRequired){
+        if(this.contiguousThrough!==null&&start>this.contiguousThrough+1)this.scanGapCount++;
+        if(this.contiguousFrom===null||start>Number(this.contiguousThrough)+1){this.contiguousFrom=start;this.contiguousThrough=end;}
+        else {this.contiguousFrom=Math.min(this.contiguousFrom,start);this.contiguousThrough=Math.max(this.contiguousThrough??end,end);}
+        this.lastScanRange={fromBlock:start,toBlock:end};this.lastScanBlockHash=head.hash;
+        this.operational?.tailProof({component:'CHAIN',recordType:'CHAIN_COVERAGE',atUtc:this.nowIso(),...this.coverageEvidence()});
+      }
       // Clamping may shorten a chunk: continue at its actual committed end.
       start = end + 1;
     }

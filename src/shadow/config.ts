@@ -68,6 +68,7 @@ export interface ShadowConfig {
   tradesPollMs: number;
   activityPollMs: number;
   v2Cursor?: boolean;
+  diagnosticStartUtc?: string;
 }
 
 function parseWallets(csv: string | undefined): Set<string> {
@@ -93,8 +94,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ShadowConfig {
   const v2Cursor = env.SHADOW_V2_CURSOR === 'true';
   if (v2Cursor && (watchedWallets.size !== WALLETS.length || WALLETS.some(w => !watchedWallets.has(w)))) throw Error('V2 requires exact approved five-wallet cohort');
 
+  const diagnosticStartUtc=env.SHADOW_DIAGNOSTIC_START_UTC;
+  if(diagnosticStartUtc && (!v2Cursor||!Number.isFinite(Date.parse(diagnosticStartUtc))))throw Error('Invalid diagnostic start boundary');
   return {
-    v2Cursor,
+    v2Cursor,diagnosticStartUtc,
     chainId: 137,
     polygonHttpRpcUrl: env.POLYGON_HTTP_RPC_URL ?? 'https://polygon-bor-rpc.publicnode.com',
     polygonWsRpcUrl: env.POLYGON_WS_RPC_URL ?? 'wss://polygon-bor-rpc.publicnode.com',

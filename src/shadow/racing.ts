@@ -44,6 +44,7 @@ export interface RestRawRow {
   completedUtc?: string;
   /** Original v2 wire row, before reviewed snake_case field mapping. */
   sourcePayload?: Record<string, unknown>;
+  acquisitionMode?: import('./rest-continuation.js').RestAcquisitionMode;
 }
 
 /** One poll cycle's measured behavior (freshness is measured, not assumed). */
@@ -88,6 +89,7 @@ export interface SourceObservationRow {
   /** Metadata hydration state — raw observation survives regardless. */
   hydration: 'FULL' | 'PARTIAL';
   clockEvidence?: ReturnType<typeof clockEvidence>;
+  acquisitionMode?: import('./rest-continuation.js').RestAcquisitionMode;
 }
 
 export interface ReconciliationRow {
@@ -187,6 +189,7 @@ export function normalizeRestRaw(raw:RestRawRow):SourceObservationRow {
     side:item['side']==='BUY' || item['side']==='SELL' ? item['side'] : null,
     asset,size,price:typeof item['price']==='number' ? item['price'].toFixed(4) : null,
     sourceTs:raw.sourceTs,blockTimestamp:null,sourceFirstSeenUtc:raw.firstSeenUtc,
+    ...(raw.acquisitionMode?{acquisitionMode:raw.acquisitionMode}:{}),
     completedUtc:raw.completedUtc,role:'UNKNOWN',
     groupKey:tx && asset && size ? tradeGroupKey(tx,asset,size) : `ungrouped:${raw.identity}`,
     hydration:item['title'] && item['conditionId'] ? 'FULL' : 'PARTIAL',

@@ -18,6 +18,8 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT/'scripts'))
+from diagnostic_clock import retain_clock
 POLY2_REPO = Path('/opt/poly2')
 DEFAULT_RUN_ROOT = Path('/var/lib/poly-shadow/diagnostics')
 DEFAULT_DASHBOARD_SUMMARY = Path('/var/www/poly-shadow-status/diagnostic-comparison/summary.json')
@@ -292,6 +294,7 @@ def _run(args,signal_state):
  run_dir=assert_isolated_path(root/run_id); run_dir.mkdir(mode=0o700)
  data_dir=run_dir/'shadow-data'; data_dir.mkdir(mode=0o700)
  base={'schemaVersion':1,'classification':'UNCERTIFIED_DIAGNOSTIC','certified':False,'state':'READY','runId':run_id,'cohort':list(WALLETS),'software':{'shadowGitSha':shadow_sha,'poly2CheckoutGitSha':poly2_sha,'poly2RuntimeImageId':before['imageId'],'poly2RuntimeRevisionLabel':before['revisionLabel'],'runtimeStable':False},'poly2Preflight':start_pre,'safety':{'paperMode':True,'liveTradingAllowed':False,'killSwitch':False,'captureEnabled':False,'workerRestarted':False,'databaseWrites':0,'certifiedPointerWritten':False}}
+ clock_last=retain_clock(data_dir/'clock_health.ndjson','START')
  child=None; boundary_start=None; boundary_end=None; interrupted=False; exit_code=None
  try:
   storage=storage_preflight(repo,data_dir); base['resourcePreflight']=storage
@@ -303,6 +306,7 @@ def _run(args,signal_state):
   if signal_state['count']: raise RuntimeError('INTERRUPTED_BEFORE_LAUNCH')
   boundary_start=now_utc(); planned_end=add_seconds(boundary_start,args.duration_seconds)
   base.update({'state':'RUNNING','startedUtc':boundary_start,'plannedEndUtc':planned_end,'durationSeconds':args.duration_seconds,'window':{'startUtc':boundary_start,'endUtc':planned_end},'frozenWindow':{'startUtc':boundary_start,'endUtc':planned_end}})
+  env['SHADOW_DIAGNOSTIC_START_UTC']=boundary_start
   atomic_json(run_dir/'diagnostic-manifest.json',base)
   publish_progress(args,progress_projection(base))
   child=subprocess.Popen(['node','--max-old-space-size=3072','--import','tsx','src/shadow/main.ts'],cwd=repo,env=env,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
@@ -326,8 +330,11 @@ def _run(args,signal_state):
   deadline_timer.daemon=True; deadline_timer.start()
   monitor_started=time.monotonic()
   next_projection=monitor_started+60
+  next_clock=monitor_started+60
   def check_disk():
-   nonlocal next_projection
+   nonlocal next_projection,next_clock,clock_last
+   if time.monotonic()>=next_clock:
+    clock_last=retain_clock(data_dir/'clock_health.ndjson','PERIODIC',clock_last); next_clock=time.monotonic()+60
    observed=storage_telemetry(repo,data_dir,time.monotonic()-monitor_started)
    observed['resourceUsage']=resource_usage()
    if observed['disk']['state']!='GREEN': raise RuntimeError('STORAGE_BUDGET_EXHAUSTED')
@@ -355,6 +362,7 @@ def _run(args,signal_state):
    interrupted=bool(waited.get('interrupted') or signal_state['count'])
   except KeyboardInterrupt:
    interrupted=True; boundary_end=now_utc(); signal_state.update({'number':signal.SIGINT,'name':'SIGINT','count':max(1,signal_state['count'])}); stop_process_group(child,grace_seconds=10,force_escalation=lambda:signal_state['count']>1,initial_signal_sent=bool(signal_state.get('terminationForwarded') or deadline_state['terminationForwarded']))
+  clock_last=retain_clock(data_dir/'clock_health.ndjson','TERMINATION',clock_last)
   base['observedThroughUtc']=boundary_end
   exit_code=child.returncode
   deadline_timer.cancel()
@@ -411,6 +419,8 @@ def _run(args,signal_state):
   if child is not None:
    try: boundary_end=boundary_end or now_utc(); stop_process_group(child,grace_seconds=10,force_escalation=lambda:signal_state['count']>1,initial_signal_sent=bool(signal_state.get('terminationForwarded') or locals().get('deadline_state',{}).get('terminationForwarded')))
    except Exception: failure='CollectorStopFailed'
+  try: clock_last=retain_clock(data_dir/'clock_health.ndjson','TERMINATION_FAILURE',clock_last)
+  except Exception: base['clockEvidenceFailure']='TERMINATION_MEASUREMENT_NOT_RETAINED'
   base.update({'state':'FAILED' if child is None else 'INCOMPLETE','failureType':failure,'endedUtc':now_utc()})
   if signal_state['count']:
    base.update({'interrupted':True,'terminationSignal':signal_state['name'],'failureType':signal_state['name']})

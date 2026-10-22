@@ -71,8 +71,8 @@ async function main(): Promise<void> {
       intervalMs: cfg.activityPollMs,
     }, racing, reconciler, undefined, fetchRest, operational);
     if(cfg.v2Cursor){
-      v2Trades=new RestPoller({source:'REST_TRADES',endpoint:'trades',baseUrl:cfg.dataApiBaseUrl,wallets:cfg.watchedWallets,intervalMs:60000,v2:true},racing,reconciler,undefined,fetchRest,operational);
-      v2Activity=new RestPoller({source:'REST_ACTIVITY',endpoint:'activity',baseUrl:cfg.dataApiBaseUrl,wallets:cfg.watchedWallets,intervalMs:60000,v2:true},racing,reconciler,undefined,fetchRest,operational);
+      v2Trades=new RestPoller({source:'REST_TRADES',endpoint:'trades',baseUrl:cfg.dataApiBaseUrl,wallets:cfg.watchedWallets,intervalMs:60000,v2:true,...(cfg.diagnosticStartUtc?{discoveryStartUtc:cfg.diagnosticStartUtc}:{})},racing,reconciler,undefined,fetchRest,operational);
+      v2Activity=new RestPoller({source:'REST_ACTIVITY',endpoint:'activity',baseUrl:cfg.dataApiBaseUrl,wallets:cfg.watchedWallets,intervalMs:60000,v2:true,...(cfg.diagnosticStartUtc?{discoveryStartUtc:cfg.diagnosticStartUtc}:{})},racing,reconciler,undefined,fetchRest,operational);
     }
   };
 
@@ -92,7 +92,11 @@ async function main(): Promise<void> {
   stopMemory=memoryPublisher.stop;
   const publishMemory=memoryPublisher.publish;
 
-  const shutdown = () => {
+  let shuttingDown=false;
+  const shutdown = async () => {
+    if(shuttingDown)return;shuttingDown=true;
+    stopRest();
+    await watcher.drainAndStop();
     try {
       memoryPublisher.finish(()=>{stopRest();watcher.stop();});
     } finally { process.exit(operational.isUsable()?0:74); }
@@ -108,7 +112,7 @@ async function main(): Promise<void> {
     initializePollers();
     publishMemory();
     watcher.start();
-    trades!.start();activity!.start();
+    if(!cfg.diagnosticStartUtc){trades!.start();activity!.start();}
     if(cfg.v2Cursor){
       // A single sequential supplemental cohort cycle bounds both sources together. Each
       // wallet/source retains an independent <=3-page, <=8-second traversal.
@@ -119,6 +123,9 @@ async function main(): Promise<void> {
         try{
           const first=tradesFirst?v2Trades!:v2Activity!,second=tradesFirst?v2Activity!:v2Trades!;
           await first.pollAll(offset);if(!stopped)await second.pollAll(offset);
+          // Each fresh cohort turn precedes historical work. Ten single-page
+          // recovery turns share the SAME twenty-start/minute V2 ceiling.
+          if(cfg.diagnosticStartUtc&&!stopped){await first.pollAll(offset,'HISTORICAL_CONTINUATION');if(!stopped)await second.pollAll(offset,'HISTORICAL_CONTINUATION');}
         }
         catch{stopRest();}
         finally{busy=false;offset=(offset+1)%cfg.watchedWallets.size;tradesFirst=!tradesFirst;}
