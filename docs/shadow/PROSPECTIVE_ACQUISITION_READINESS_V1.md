@@ -130,3 +130,11 @@ Corrections retain only actual contiguous intervals, invalidate head quality aft
 from independently prospective groups. The diagnostic adapter retains original
 native identities/group references; certified matching is unchanged. Host clock
 wording now distinguishes measured synchronization from unknown provider offsets.
+
+A subsequent reviewer-confirmed adapter defect allowed explicitly typed nontrade
+activity with an asset to become an economic trade candidate. The diagnostic now
+retains those native observations, latest event clocks and transport metrics in a
+separate nonTradeActivities count, excluding them from trade groups and timing.
+REDEEM with the same transaction/asset/size as a baseline trade cannot manufacture
+a match; an explicit TRADE fixture still matches. The frozen normalizer and
+certified comparator are unchanged.

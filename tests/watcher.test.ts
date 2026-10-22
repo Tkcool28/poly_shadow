@@ -765,5 +765,5 @@ it('stale head and disjoint backwards ranges never manufacture contiguous covera
  const watcher=new ChainWatcher(cfg(store.dir),store,clock(),rpc);
  (watcher as any).observeHead('0x6e');await watcher.scanRange(100,110);expect(watcher.coverageEvidence().coverage).toBe('CONTIGUOUS_SELECTED_TOPIC_RANGE');
  await vi.advanceTimersByTimeAsync(120001);expect(watcher.coverageEvidence()).toMatchObject({headState:'UNKNOWN_STALE',coverage:'UNKNOWN_UNPROVEN'});
- await watcher.scanRange(10,20);expect(watcher.coverageEvidence()).toMatchObject({contiguousFrom:10,contiguousThrough:20,scanGapCount:1,coverage:'UNKNOWN_UNPROVEN'});watcher.stop();store.close();
+ await watcher.scanRange(10,20);expect(watcher.coverageEvidence()).toMatchObject({contiguousFrom:10,contiguousThrough:20,scanGapCount:1,scanGaps:[{fromBlock:21,toBlock:99}],coverage:'UNKNOWN_UNPROVEN'});watcher.stop();store.close();
 });

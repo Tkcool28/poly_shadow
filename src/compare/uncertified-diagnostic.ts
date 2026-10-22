@@ -48,7 +48,7 @@ export async function buildDiagnosticReport(a:{shadowDataDirectory:string;manife
  const evidenceUsage={bytes:0,rows:0};
  const readEvidence=<T>(path:string)=>readNdjson<T>(path,64*1024,{maxBytes:MAX_DIAGNOSTIC_EVIDENCE_BYTES,maxRows:MAX_DIAGNOSTIC_EVIDENCE_ROWS,maxLineBytes:MAX_DIAGNOSTIC_LINE_BYTES,allowIncompleteTail:a.live===true,freezeAtOpen:a.live===true,onBytes:n=>{evidenceUsage.bytes+=n;if(evidenceUsage.bytes>MAX_DIAGNOSTIC_EVIDENCE_BYTES)throw Error('diagnostic: total evidence byte cap exceeded')},onRecord:()=>{evidenceUsage.rows++;if(evidenceUsage.rows>MAX_DIAGNOSTIC_EVIDENCE_ROWS)throw Error('diagnostic: total evidence row cap exceeded')}});
  const readiness=await diagnosticReadiness(a.shadowDataDirectory,w,readEvidence);
- const acquisitionCounts=Object.fromEntries(sources.map(s=>[s,{prospective:0,retrospective:0,unknownOrigin:0,outsideWindow:0,latestEventTimestamp:null as number|null}]));
+ const acquisitionCounts=Object.fromEntries(sources.map(s=>[s,{prospective:0,retrospective:0,unknownOrigin:0,outsideWindow:0,nonTradeActivities:0,latestEventTimestamp:null as number|null}]));
  const sourceRows=e.rows as ExportRow[];
  const rows:ExportRow[]=sourceRows.map(r=>r.sourceIdentityValidity==='INVALID'?{...r,txHash:null,asset:null,conditionId:null,side:null,size:null,price:null}:r);
  const prospectiveRows=rows.filter(r=>inWindow(r.ingestedUtc,w)&&r.tradedAtUtc!=null&&inWindow(r.tradedAtUtc,w));
@@ -68,6 +68,10 @@ export async function buildDiagnosticReport(a:{shadowDataDirectory:string;manife
   const t=eventClock(o);
   const ac=acquisitionCounts[o.source]!;
   if(t!==null)ac.latestEventTimestamp=Math.max(ac.latestEventTimestamp??t,t);
+  // Native activity type is retained by the frozen identity. Keep nontrade
+  // observations visible, but never invent an economic trade from them.
+  const activityType=o.source==='REST_ACTIVITY'?/^rest-activity:([A-Z_]+):/.exec(o.identity)?.[1]:null;
+  if(activityType&&activityType!=='TRADE'){ac.nonTradeActivities++;continue;}
   const observedOrigin=o.acquisitionMode==='HISTORICAL_CONTINUATION'?'RETROSPECTIVE_RECOVERY':origin([t],w);
   if(observedOrigin==='PROSPECTIVE')ac.prospective++;else if(observedOrigin==='RETROSPECTIVE_RECOVERY')ac.retrospective++;else if(t!==null&&secondsMicros(t)>=epochMicros(w.endUtc))ac.outsideWindow++;else ac.unknownOrigin++;
   const scoped={...o,groupKey:o.groupKey+':wallet:'+o.wallet.toLowerCase()+(o.acquisitionMode==='HISTORICAL_CONTINUATION'?':recovery':''),diagnosticOriginalGroupKey:o.groupKey};const before=groups.get(scoped.groupKey);addShadowObservation(groups,scoped,cohort,w,true);const g=groups.get(scoped.groupKey)!;const kind=o.acquisitionMode==='HISTORICAL_CONTINUATION'?'RETROSPECTIVE_RECOVERY':t!==null&&secondsMicros(t)>=epochMicros(w.endUtc)?'EVENT_OUTSIDE_WINDOW':origin([t],w);const priority:Origin[]=['ORIGIN_UNKNOWN','PROSPECTIVE','EVENT_OUTSIDE_WINDOW','RETROSPECTIVE_RECOVERY'];if(!g.originClass||priority.indexOf(kind)>priority.indexOf(g.originClass))g.originClass=kind;

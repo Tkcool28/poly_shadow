@@ -143,6 +143,7 @@ export class ChainWatcher {
   private contiguousFrom:number|null=null;
   private contiguousThrough:number|null=null;
   private scanGapCount=0;
+  private scanGaps:{fromBlock:number;toBlock:number}[]=[];
   private reorgCount=0;
   private shutdownInterrupted=false;
   coverageEvidence(){
@@ -151,8 +152,8 @@ export class ChainWatcher {
     const gap=this.latestObservedHeadBlock!==null&&(this.contiguousThrough===null||this.latestObservedHeadBlock>this.contiguousThrough)?{fromBlock:this.contiguousThrough===null?null:this.contiguousThrough+1,toBlock:this.latestObservedHeadBlock}:null;
     return {startingObservedHeadBlock:this.startingObservedHeadBlock,latestObservedHeadBlock:this.latestObservedHeadBlock,headObservedUtc:this.headObservedUtc,headState,
       lastSuccessfullyScannedBlock:this.lastScanRange?.toBlock??null,lastScanRange:this.lastScanRange,contiguousFrom:this.contiguousFrom,contiguousThrough:this.contiguousThrough,
-      scanGapCount:this.scanGapCount,reorgCount:this.reorgCount,unscannedHeadGap:gap,recoveryRequired:this.recoveryRequired,
-      coverage:freshHead&&!this.shutdownInterrupted&&this.contiguousThrough!==null&&this.contiguousThrough===this.latestObservedHeadBlock&&!this.scanGapCount&&!this.recoveryRequired?'CONTIGUOUS_SELECTED_TOPIC_RANGE':'UNKNOWN_UNPROVEN',
+      scanGapCount:this.scanGapCount,scanGaps:this.scanGaps,scanGapHistoryTruncated:this.scanGapCount>this.scanGaps.length,reorgCount:this.reorgCount,unscannedHeadGap:gap,recoveryRequired:this.recoveryRequired,
+      coverage:freshHead&&!this.shutdownInterrupted&&this.contiguousFrom!==null&&this.contiguousThrough!==null&&this.contiguousThrough===this.latestObservedHeadBlock&&!this.scanGapCount&&!this.recoveryRequired?'CONTIGUOUS_SELECTED_TOPIC_RANGE':'UNKNOWN_UNPROVEN',
       cursorBlockHash:this.lastScanBlockHash,shutdownInterrupted:this.shutdownInterrupted};
   }
   private observeHead(value:unknown){
@@ -753,7 +754,7 @@ export class ChainWatcher {
     }
 
     this.reorgCount++;this.contiguousThrough=ancestor;this.lastScanRange=null;this.lastScanBlockHash=null;
-    if(this.contiguousFrom!==null&&this.contiguousFrom>ancestor)this.contiguousFrom=null;
+    if(this.contiguousFrom!==null&&this.contiguousFrom>ancestor){this.contiguousFrom=null;this.contiguousThrough=null;}
     const target = ancestor;
     const targetBlock = await this.providerBlock(target);
     this.operational?.assertUsable();
@@ -964,7 +965,7 @@ export class ChainWatcher {
       if(requestId&&rangePublishable&&!this.recoveryRequired)this.operational?.confirmRpcPublication(requestId,{fromBlock:start,toBlock:end},head.hash,createHash('sha256').update(JSON.stringify(logs)).digest('hex'));
       if(rangePublishable&&!this.recoveryRequired){
         const disjoint=this.contiguousThrough!==null&&this.contiguousFrom!==null&&(start>this.contiguousThrough+1||end<this.contiguousFrom-1);
-        if(disjoint)this.scanGapCount++;
+        if(disjoint){this.scanGapCount++;this.scanGaps.push(start>this.contiguousThrough!+1?{fromBlock:this.contiguousThrough!+1,toBlock:start-1}:{fromBlock:end+1,toBlock:this.contiguousFrom!-1});if(this.scanGaps.length>16)this.scanGaps.shift();}
         if(this.contiguousFrom===null||disjoint){this.contiguousFrom=start;this.contiguousThrough=end;}
         else {this.contiguousFrom=Math.min(this.contiguousFrom,start);this.contiguousThrough=Math.max(this.contiguousThrough??end,end);}
         this.lastScanRange={fromBlock:start,toBlock:end};this.lastScanBlockHash=head.hash;
