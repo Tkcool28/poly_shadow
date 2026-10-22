@@ -65,6 +65,6 @@ it('recovery corroboration cannot remove an independently prospective CHAIN matc
 it('retains nontrade activity as evidence without inventing prospective trades or false same-transaction matches',async()=>{
  const nontrade=obs('REST_ACTIVITY',2,3,{identity:`rest-activity:REDEEM:${tx}:${WALLETS[0]}:7:2.000000:1`});
  const r=await run([row()],[nontrade]);expect(r.discovery.shadowUnionUnique).toBe(0);expect(r.discovery.matchingConfidence.high).toBe(0);expect(r.overall.shadowOnlyObserved).toBe(0);
- const activity=r.sources.find(x=>x.source==='REST_ACTIVITY')!;expect(activity.observations).toBe(1);expect(activity.acquisitionCounts).toMatchObject({prospective:0,retrospective:0,nonTradeActivities:1});expect(activity.acquisitionCounts.latestEventTimestamp).not.toBe(null);
- const trade=await run([row()],[{...nontrade,identity:nontrade.identity.replace('REDEEM','TRADE')}]);expect(trade.discovery.matchingConfidence.high).toBe(1);expect(trade.sources.find(x=>x.source==='REST_ACTIVITY')!.acquisitionCounts.nonTradeActivities).toBe(0);
+ const activity=r.sources.find(x=>x.source==='REST_ACTIVITY')!;expect(activity.observations).toBe(1);expect(activity.acquisitionCounts).toMatchObject({prospective:0,retrospective:0,nonTradeActivities:1});expect(activity.acquisitionCounts!.latestEventTimestamp).not.toBe(null);
+ const trade=await run([row()],[{...nontrade,identity:nontrade.identity.replace('REDEEM','TRADE')}]);expect(trade.discovery.matchingConfidence.high).toBe(1);expect(trade.sources.find(x=>x.source==='REST_ACTIVITY')!.acquisitionCounts!.nonTradeActivities).toBe(0);
 });
